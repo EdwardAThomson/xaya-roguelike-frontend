@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Xaya Roguelike</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <div id="game-area">
+      <canvas id="game-canvas"></canvas>
+    </div>
+    <div id="sidebar">
+      <div id="stats-panel" class="panel">
+        <h3>Player</h3>
+        <div id="stats-display"></div>
+      </div>
+      <div id="inventory-panel" class="panel">
+        <h3>Inventory</h3>
+        <div id="inventory-display"></div>
+      </div>
+      <div id="message-panel" class="panel">
+        <h3>Messages</h3>
+        <div id="message-log"></div>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="dist/main.js"></script>
+</body>
+</html>
