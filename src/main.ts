@@ -5,8 +5,39 @@
 import { Dungeon } from "./game/dungeon.js";
 import { GameRenderer } from "./render/canvas.js";
 import { InputHandler, Direction } from "./game/input.js";
+import { runHashTests } from "./game/hash_test.js";
 
 console.log("Main: starting...");
+console.log("Hash verification:");
+const hashOk = runHashTests();
+console.log(hashOk ? "All hash tests PASSED" : "Hash tests FAILED");
+
+// MT19937 verification against C++.
+import { MT19937 } from "./game/rng.js";
+import { hashSeedSync } from "./game/hash.js";
+const testSeed = hashSeedSync("hello_world:1");
+console.log("MT19937 seed:", testSeed, "(0x" + testSeed.toString(16) + ")");
+const testRng = new MT19937(testSeed);
+const expected = [3715977427, 2037900038, 1597496797, 2282518739, 3751484099,
+                  2356626247, 1625781333, 2059247412, 3748425691, 784824438];
+let rngOk = true;
+for (let i = 0; i < 10; i++) {
+  const got = testRng.next();
+  const match = got === expected[i];
+  if (!match) rngOk = false;
+  console.log(`  MT[${i}]: got ${got}, expected ${expected[i]} ${match ? "✓" : "✗ FAIL"}`);
+}
+console.log(rngOk ? "All MT19937 tests PASSED" : "MT19937 tests FAILED");
+
+// Test nextRange matches C++ uniform_int_distribution.
+const distRng = new MT19937(1872746867);
+const roomCount = distRng.nextRange(8, 15);  // C++ gives 14
+console.log(`nextRange(8,15): got ${roomCount}, expected 14 ${roomCount === 14 ? "✓" : "✗"}`);
+const rw = distRng.nextRange(4, 8);  // C++ gives 6
+const rh = distRng.nextRange(4, 7);  // C++ gives 5
+const rx = distRng.nextRange(1, 80 - rw - 2);  // C++ gives 39
+const ry = distRng.nextRange(1, 40 - rh - 2);  // C++ gives 29
+console.log(`Room 0: w=${rw} h=${rh} x=${rx} y=${ry} (C++: w=6 h=5 x=39 y=29)`);
 
 try {
   const renderer = new GameRenderer("game-canvas");
@@ -17,8 +48,9 @@ try {
   console.log("Main: dungeon generated, rooms:", dungeon.rooms.length,
               "gates:", dungeon.gates.length);
   renderer.setDungeon(dungeon);
-  console.log("Main: dungeon set, player at",
-              renderer.playerX, renderer.playerY);
+  console.log("Main: player at", renderer.playerX, renderer.playerY);
+  console.log("Main: gates:",
+    dungeon.gates.map(g => `${g.direction} at (${g.x}, ${g.y})`).join(", "));
 
   // Stats display.
   const statsEl = document.getElementById("stats-display");

@@ -113,10 +113,10 @@ Play a dungeon session entirely in the browser.
 - Stats panel: HP bar, kills, XP, gold
 - Message log: combat messages, pickups, events
 
-**Decision**: Port dungeon engine to TS, or compile C++ to WASM?
-- **TS port**: More work upfront, but runs natively in browser, easy to debug
-- **WASM**: Reuse exact C++ code, guaranteed identical results, but harder to debug
-- **Recommendation**: WASM for the game engine (determinism matters for channels), TS for rendering/UI
+**Decision**: TS port (decided). Players can read and inspect the source code —
+important for trust in a crypto game. C++ backend remains authoritative for
+channel settlement. SHA-256 hash + MT19937 RNG ported and verified to match
+C++ output. WASM remains an option for future performance optimization.
 
 **Test**: Open in browser, play through a dungeon with keyboard, fight monsters, exit via gate.
 

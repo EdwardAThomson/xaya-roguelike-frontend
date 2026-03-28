@@ -4,6 +4,7 @@
  */
 
 import { MT19937 } from "./rng.js";
+import { hashSeedSync } from "./hash.js";
 
 export enum Tile {
   Wall = 0,
@@ -62,14 +63,7 @@ export class Dungeon {
     d.depth = depth;
     d.clear();
 
-    // TODO: replace with SHA-256 hash once debugged.
-    // For now, use a simple string-to-number hash.
-    let h = 0;
-    const s = seed + ":" + depth;
-    for (let i = 0; i < s.length; i++) {
-      h = ((h << 5) - h + s.charCodeAt(i)) | 0;
-    }
-    const rng = new MT19937((h >>> 0));
+    const rng = new MT19937(hashSeedSync(seed + ":" + depth));
     d.generateRooms(rng);
     d.connectRooms(rng);
 

@@ -39,12 +39,24 @@ export class MT19937 {
     return y >>> 0;
   }
 
-  /** Returns a random integer in [0, n). */
+  /**
+   * Returns a random integer in [0, n).
+   * Uses Lemire's method — matches libstdc++ uniform_int_distribution.
+   * Formula: floor(uint64(raw) * uint64(n) / 2^32)
+   */
   nextInt(n: number): number {
     if (n <= 1) return 0;
-    // Simple modulo — slight bias for large n but fine for our use case
-    // (room sizes, positions, etc. are all small numbers).
-    return this.next() % n;
+    const raw = this.next();
+    // 64-bit multiply: (raw * n) >> 32.
+    // JS doesn't have uint64, so split into high/low 16-bit parts.
+    const rawHi = raw >>> 16;
+    const rawLo = raw & 0xffff;
+    // raw * n = (rawHi * 2^16 + rawLo) * n
+    //         = rawHi * n * 2^16 + rawLo * n
+    // We need the top 32 bits of this 64-bit result.
+    const lo = rawLo * n;
+    const hi = rawHi * n + (lo >>> 16);
+    return (hi >>> 16);
   }
 
   /** Returns a random integer in [min, max] inclusive. */
