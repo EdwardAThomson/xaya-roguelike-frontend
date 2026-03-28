@@ -52,6 +52,48 @@ try {
   console.log("Main: gates:",
     dungeon.gates.map(g => `${g.direction} at (${g.x}, ${g.y})`).join(", "));
 
+  // Tile count verification against C++.
+  let floors = 0, walls = 0, gates = 0;
+  for (let y = 0; y < 40; y++)
+    for (let x = 0; x < 80; x++) {
+      const t = dungeon.getTile(x, y);
+      if (t === 1) floors++;
+      else if (t === 0) walls++;
+      else if (t === 2) gates++;
+    }
+  console.log(`Tile counts: ${floors} floors, ${walls} walls, ${gates} gates`);
+
+  // Point-by-point tile grid verification against C++.
+  // Fetches the reference grid from a file served alongside the app.
+  fetch("cpp_tiles.txt").then(r => r.text()).then(text => {
+    const cppTiles = text.trim().split(",").map(Number);
+    if (cppTiles.length !== 80 * 40) {
+      console.log(`Grid check: cpp_tiles.txt has ${cppTiles.length} tiles, expected 3200`);
+      return;
+    }
+    let mismatches = 0;
+    const firstMismatches: string[] = [];
+    for (let y = 0; y < 40; y++) {
+      for (let x = 0; x < 80; x++) {
+        const idx = y * 80 + x;
+        const tsTile = dungeon.getTile(x, y);
+        const cppTile = cppTiles[idx];
+        if (tsTile !== cppTile) {
+          mismatches++;
+          if (firstMismatches.length < 5) {
+            firstMismatches.push(`(${x},${y}): TS=${tsTile} C++=${cppTile}`);
+          }
+        }
+      }
+    }
+    if (mismatches === 0) {
+      console.log("Point-by-point grid check: ALL 3200 TILES MATCH C++ ✓");
+    } else {
+      console.log(`Point-by-point grid check: ${mismatches} MISMATCHES ✗`);
+      firstMismatches.forEach(m => console.log("  " + m));
+    }
+  });
+
   // Stats display.
   const statsEl = document.getElementById("stats-display");
   if (statsEl) {
