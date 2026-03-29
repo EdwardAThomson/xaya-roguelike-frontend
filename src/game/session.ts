@@ -62,6 +62,9 @@ export class DungeonSession {
 
   messages: GameMessage[] = [];
 
+  /** Action log for replay verification proof. */
+  actionLog: GameAction[] = [];
+
   constructor(seed: string, depth: number, stats: PlayerStats,
               hp: number, maxHp: number, startingPotions: CollectedItem[] = []) {
     this.depth = depth;
@@ -246,6 +249,7 @@ export class DungeonSession {
 
     if (!valid) return false;
 
+    this.actionLog.push(action);
     this.turnCount++;
 
     // Monsters act.
