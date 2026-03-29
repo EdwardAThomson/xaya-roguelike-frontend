@@ -1,146 +1,192 @@
 /**
- * Main entry point — Phase F1: Render a dungeon and pan with keyboard.
+ * Main entry point — Phase F2: Playable dungeon in the browser.
  */
 
-import { Dungeon } from "./game/dungeon.js";
-import { GameRenderer } from "./render/canvas.js";
+import { WIDTH, HEIGHT } from "./game/dungeon.js";
+import { DungeonSession, GameAction } from "./game/session.js";
+import { PlayerStats } from "./game/combat.js";
+import { Camera } from "./render/camera.js";
+import { TILE_SIZE, drawTile, initSprites } from "./render/tiles.js";
+import { drawMonsters, drawGroundItems, drawPlayer } from "./render/entities.js";
 import { InputHandler, Direction } from "./game/input.js";
-import { runHashTests } from "./game/hash_test.js";
 
-console.log("Main: starting...");
-console.log("Hash verification:");
-const hashOk = runHashTests();
-console.log(hashOk ? "All hash tests PASSED" : "Hash tests FAILED");
+// --- Setup ---
 
-// MT19937 verification against C++.
-import { MT19937 } from "./game/rng.js";
-import { hashSeedSync } from "./game/hash.js";
-const testSeed = hashSeedSync("hello_world:1");
-console.log("MT19937 seed:", testSeed, "(0x" + testSeed.toString(16) + ")");
-const testRng = new MT19937(testSeed);
-const expected = [3715977427, 2037900038, 1597496797, 2282518739, 3751484099,
-                  2356626247, 1625781333, 2059247412, 3748425691, 784824438];
-let rngOk = true;
-for (let i = 0; i < 10; i++) {
-  const got = testRng.next();
-  const match = got === expected[i];
-  if (!match) rngOk = false;
-  console.log(`  MT[${i}]: got ${got}, expected ${expected[i]} ${match ? "✓" : "✗ FAIL"}`);
+const canvas = document.getElementById("game-canvas") as HTMLCanvasElement;
+const ctx = canvas.getContext("2d")!;
+const camera = new Camera();
+initSprites();
+
+const stats: PlayerStats = {
+  level: 1,
+  strength: 10,
+  dexterity: 10,
+  constitution: 10,
+  intelligence: 10,
+  equipAttack: 5,
+  equipDefense: 2,
+};
+
+const session = new DungeonSession(
+  "hello_world", 1, stats, 100, 100,
+  [{ itemId: "health_potion", quantity: 3 }]
+);
+
+// --- Resize ---
+
+function resize(): void {
+  const parent = canvas.parentElement!;
+  canvas.width = parent.clientWidth;
+  canvas.height = parent.clientHeight;
+  camera.resize(canvas.width, canvas.height);
+  camera.centerOn(session.playerX, session.playerY);
+  render();
 }
-console.log(rngOk ? "All MT19937 tests PASSED" : "MT19937 tests FAILED");
+window.addEventListener("resize", resize);
+resize();
 
-// Test nextRange matches C++ uniform_int_distribution.
-const distRng = new MT19937(1872746867);
-const roomCount = distRng.nextRange(8, 15);  // C++ gives 14
-console.log(`nextRange(8,15): got ${roomCount}, expected 14 ${roomCount === 14 ? "✓" : "✗"}`);
-const rw = distRng.nextRange(4, 8);  // C++ gives 6
-const rh = distRng.nextRange(4, 7);  // C++ gives 5
-const rx = distRng.nextRange(1, 80 - rw - 2);  // C++ gives 39
-const ry = distRng.nextRange(1, 40 - rh - 2);  // C++ gives 29
-console.log(`Room 0: w=${rw} h=${rh} x=${rx} y=${ry} (C++: w=6 h=5 x=39 y=29)`);
+// --- Render ---
 
-try {
-  const renderer = new GameRenderer("game-canvas");
-  console.log("Main: renderer created");
+function render(): void {
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Generate a dungeon from a test seed.
-  const dungeon = Dungeon.generate("hello_world", 1);
-  console.log("Main: dungeon generated, rooms:", dungeon.rooms.length,
-              "gates:", dungeon.gates.length);
-  renderer.setDungeon(dungeon);
-  console.log("Main: player at", renderer.playerX, renderer.playerY);
-  console.log("Main: gates:",
-    dungeon.gates.map(g => `${g.direction} at (${g.x}, ${g.y})`).join(", "));
+  const dungeon = session.dungeon;
 
-  // Tile count verification against C++.
-  let floors = 0, walls = 0, gates = 0;
-  for (let y = 0; y < 40; y++)
-    for (let x = 0; x < 80; x++) {
-      const t = dungeon.getTile(x, y);
-      if (t === 1) floors++;
-      else if (t === 0) walls++;
-      else if (t === 2) gates++;
+  // Tiles.
+  for (let y = camera.y; y < camera.y + camera.viewH && y < HEIGHT; y++) {
+    for (let x = camera.x; x < camera.x + camera.viewW && x < WIDTH; x++) {
+      const [px, py] = camera.toScreen(x, y);
+      drawTile(ctx, dungeon.getTile(x, y), px, py);
     }
-  console.log(`Tile counts: ${floors} floors, ${walls} walls, ${gates} gates`);
-
-  // Point-by-point tile grid verification against C++.
-  // Fetches the reference grid from a file served alongside the app.
-  fetch("cpp_tiles.txt").then(r => r.text()).then(text => {
-    const cppTiles = text.trim().split(",").map(Number);
-    if (cppTiles.length !== 80 * 40) {
-      console.log(`Grid check: cpp_tiles.txt has ${cppTiles.length} tiles, expected 3200`);
-      return;
-    }
-    let mismatches = 0;
-    const firstMismatches: string[] = [];
-    for (let y = 0; y < 40; y++) {
-      for (let x = 0; x < 80; x++) {
-        const idx = y * 80 + x;
-        const tsTile = dungeon.getTile(x, y);
-        const cppTile = cppTiles[idx];
-        if (tsTile !== cppTile) {
-          mismatches++;
-          if (firstMismatches.length < 5) {
-            firstMismatches.push(`(${x},${y}): TS=${tsTile} C++=${cppTile}`);
-          }
-        }
-      }
-    }
-    if (mismatches === 0) {
-      console.log("Point-by-point grid check: ALL 3200 TILES MATCH C++ ✓");
-    } else {
-      console.log(`Point-by-point grid check: ${mismatches} MISMATCHES ✗`);
-      firstMismatches.forEach(m => console.log("  " + m));
-    }
-  });
-
-  // Stats display.
-  const statsEl = document.getElementById("stats-display");
-  if (statsEl) {
-    statsEl.innerHTML = `
-      <div>Seed: hello_world</div>
-      <div>Depth: ${dungeon.depth}</div>
-      <div>Rooms: ${dungeon.rooms.length}</div>
-      <div>Gates: ${dungeon.gates.length}</div>
-      <div style="margin-top: 8px">
-        <strong>Controls</strong><br>
-        WASD / Arrows: Move<br>
-        Q/E/Z/C: Diagonal<br>
-        G: Pickup &nbsp; P: Potion<br>
-        Space: Wait &nbsp; Enter: Gate
-      </div>
-    `;
   }
 
-  // Input: move the player.
-  new InputHandler((action: string, dir?: Direction) => {
-    if (action === "move" && dir) {
-      const nx = renderer.playerX + dir.dx;
-      const ny = renderer.playerY + dir.dy;
-      const tile = dungeon.getTile(nx, ny);
-      // Allow walking on floor and gate tiles.
-      if (tile !== 0) { // 0 = Wall
-        renderer.playerX = nx;
-        renderer.playerY = ny;
-        renderer.camera.centerOn(renderer.playerX, renderer.playerY);
-      }
+  // Ground items.
+  drawGroundItems(ctx, camera, session.groundItems);
+
+  // Monsters.
+  drawMonsters(ctx, camera, session.monsters);
+
+  // Player.
+  drawPlayer(ctx, camera, session.playerX, session.playerY);
+
+  // Gate direction arrows.
+  ctx.font = "bold 14px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (const gate of dungeon.gates) {
+    if (camera.isVisible(gate.x, gate.y)) {
+      const [gx, gy] = camera.toScreen(gate.x, gate.y);
+      ctx.fillStyle = "#ffd700";
+      const arrow = gate.direction === "north" ? "↑"
+                  : gate.direction === "south" ? "↓"
+                  : gate.direction === "east" ? "→" : "←";
+      ctx.fillText(arrow, gx + TILE_SIZE / 2, gy + TILE_SIZE / 2);
     }
-    renderer.render();
-  });
-
-  // Initial render.
-  renderer.render();
-  console.log("Main: initial render done");
-
-  // Message log.
-  const msgLog = document.getElementById("message-log");
-  if (msgLog) {
-    msgLog.innerHTML = `
-      <div class="msg-info">Welcome to the dungeon.</div>
-      <div class="msg-info">Use WASD or arrows to move.</div>
-    `;
   }
 
-} catch (e) {
-  console.error("Main: error:", e);
+  // Update UI.
+  updateStats();
+  updateMessages();
 }
+
+// --- Input ---
+
+new InputHandler((action: string, dir?: Direction) => {
+  if (session.gameOver) return;
+
+  let gameAction: GameAction | null = null;
+
+  switch (action) {
+    case "move":
+      if (dir) gameAction = { type: "move", dx: dir.dx, dy: dir.dy };
+      break;
+    case "pickup":
+      gameAction = { type: "pickup" };
+      break;
+    case "wait":
+      gameAction = { type: "wait" };
+      break;
+    case "gate":
+      gameAction = { type: "gate" };
+      break;
+    case "use_potion":
+      gameAction = { type: "use", itemId: "health_potion" };
+      break;
+  }
+
+  if (gameAction) {
+    session.processAction(gameAction);
+    camera.centerOn(session.playerX, session.playerY);
+    render();
+  }
+});
+
+// --- Stats Panel ---
+
+function updateStats(): void {
+  const el = document.getElementById("stats-display");
+  if (!el) return;
+
+  const hpPct = Math.max(0, session.playerHp / session.playerMaxHp * 100);
+  const hpColor = hpPct > 60 ? "#4a4" : hpPct > 30 ? "#aa4" : "#c44";
+
+  el.innerHTML = `
+    <div>Turn: ${session.turnCount}</div>
+    <div class="hp-bar">
+      <div class="hp-bar-fill" style="width:${hpPct}%; background:${hpColor}"></div>
+      <div class="hp-bar-text">HP ${session.playerHp} / ${session.playerMaxHp}</div>
+    </div>
+    <div>XP: ${session.totalXp} &nbsp; Gold: ${session.totalGold}</div>
+    <div>Kills: ${session.totalKills}</div>
+    <div>Depth: ${session.depth}</div>
+    ${session.gameOver
+      ? `<div style="margin-top:8px;color:${session.survived ? '#4a4' : '#c44'};font-weight:bold">
+           ${session.survived ? 'SURVIVED — Exited ' + session.exitGate : 'YOU DIED'}
+         </div>`
+      : ''}
+    <div style="margin-top:8px;font-size:11px;color:#888">
+      WASD/Arrows: Move &nbsp; G: Pickup<br>
+      P: Potion &nbsp; Space: Wait &nbsp; Enter: Gate
+    </div>
+  `;
+}
+
+// --- Inventory Panel ---
+
+function updateInventory(): void {
+  const el = document.getElementById("inventory-display");
+  if (!el) return;
+
+  if (session.loot.length === 0) {
+    el.innerHTML = '<div style="color:#666">Empty</div>';
+    return;
+  }
+
+  el.innerHTML = session.loot
+    .filter(l => l.quantity > 0)
+    .map(l => `<div>${l.itemId} x${l.quantity}</div>`)
+    .join("");
+}
+
+// --- Message Log ---
+
+function updateMessages(): void {
+  const el = document.getElementById("message-log");
+  if (!el) return;
+
+  // Show last 8 messages.
+  const recent = session.messages.slice(-8);
+  el.innerHTML = recent.map(m =>
+    `<div class="msg-${m.type}">${m.text}</div>`
+  ).join("");
+
+  el.scrollTop = el.scrollHeight;
+
+  updateInventory();
+}
+
+// Initial render.
+render();
+console.log("Game ready. Seed: hello_world, Depth: 1");
+console.log(`Monsters: ${session.monsters.length}, Items: ${session.groundItems.length}`);
