@@ -78,12 +78,12 @@ function render(): void {
   // Player.
   drawPlayer(ctx, camera, session.playerX, session.playerY);
 
-  // Gate direction arrows.
+  // Gate direction arrows (only when visible in FOV).
   ctx.font = "bold 14px monospace";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   for (const gate of dungeon.gates) {
-    if (camera.isVisible(gate.x, gate.y)) {
+    if (camera.isVisible(gate.x, gate.y) && fov.isVisible(gate.x, gate.y)) {
       const [gx, gy] = camera.toScreen(gate.x, gate.y);
       ctx.fillStyle = "#ffd700";
       const arrow = gate.direction === "north" ? "↑"
