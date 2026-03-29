@@ -136,6 +136,37 @@ export class DungeonSession {
               this.totalXp += target.xpValue;
               this.totalKills++;
               this.addMessage(`${target.name} defeated! +${target.xpValue} XP`, "combat");
+
+              // Monster drops (35% chance).
+              if (this.rng.nextRange(1, 100) <= 35) {
+                const dropRoll = this.rng.nextRange(1, 100);
+                let dropId: string;
+                let dropQty: number;
+
+                if (dropRoll <= 50) {
+                  dropId = "gold_coins";
+                  dropQty = this.rng.nextRange(1, 5 + this.depth * 3);
+                } else if (dropRoll <= 75) {
+                  dropId = "health_potion";
+                  dropQty = 1;
+                } else {
+                  const spawnable = getSpawnableItems(this.depth);
+                  if (spawnable.length > 0) {
+                    dropId = spawnable[this.rng.nextInt(spawnable.length)].id;
+                    dropQty = 1;
+                  } else {
+                    dropId = "health_potion";
+                    dropQty = 1;
+                  }
+                }
+
+                this.groundItems.push({
+                  x: target.x, y: target.y,
+                  itemId: dropId, quantity: dropQty,
+                });
+                const def = lookupItem(dropId);
+                this.addMessage(`${target.name} dropped ${def?.name ?? dropId}!`, "pickup");
+              }
             }
           } else {
             this.addMessage(`You miss ${target.name}!`, "combat");

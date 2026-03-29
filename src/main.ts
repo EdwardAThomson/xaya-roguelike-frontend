@@ -28,13 +28,19 @@ const stats: PlayerStats = {
   equipDefense: 2,
 };
 
-const session = new DungeonSession(
-  "hello_world", 1, stats, 100, 100,
-  [{ itemId: "health_potion", quantity: 3 }]
-);
+let session: DungeonSession;
+let fov: FovMap;
+let seedCounter = 0;
 
-const fov = new FovMap();
-fov.update(session.playerX, session.playerY, session.dungeon);
+function newGame(): void {
+  const seed = "dungeon_" + seedCounter++;
+  session = new DungeonSession(seed, 1, stats, 100, 100,
+    [{ itemId: "health_potion", quantity: 3 }]);
+  fov = new FovMap();
+  fov.update(session.playerX, session.playerY, session.dungeon);
+  camera.centerOn(session.playerX, session.playerY);
+  render();
+}
 
 // --- Resize ---
 
@@ -43,8 +49,10 @@ function resize(): void {
   canvas.width = parent.clientWidth;
   canvas.height = parent.clientHeight;
   camera.resize(canvas.width, canvas.height);
-  camera.centerOn(session.playerX, session.playerY);
-  render();
+  if (session) {
+    camera.centerOn(session.playerX, session.playerY);
+    render();
+  }
 }
 window.addEventListener("resize", resize);
 resize();
@@ -55,30 +63,31 @@ function render(): void {
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+  if (!session) return;
   const dungeon = session.dungeon;
 
   // Tiles (with FOV).
   for (let y = camera.y; y < camera.y + camera.viewH && y < HEIGHT; y++) {
     for (let x = camera.x; x < camera.x + camera.viewW && x < WIDTH; x++) {
       const alpha = fov.getAlpha(x, y);
-      if (alpha <= 0) continue; // Hidden — don't render.
+      if (alpha <= 0) continue;
       const [px, py] = camera.toScreen(x, y);
       drawTile(ctx, dungeon.getTile(x, y), px, py, alpha);
     }
   }
 
-  // Ground items (only visible tiles).
+  // Ground items (only visible).
   drawGroundItems(ctx, camera,
     session.groundItems.filter(gi => fov.isVisible(gi.x, gi.y)));
 
-  // Monsters (only visible tiles).
+  // Monsters (only visible).
   drawMonsters(ctx, camera,
     session.monsters.filter(m => m.alive && fov.isVisible(m.x, m.y)));
 
   // Player.
   drawPlayer(ctx, camera, session.playerX, session.playerY);
 
-  // Gate direction arrows (only when visible in FOV).
+  // Gate direction arrows (only visible in FOV).
   ctx.font = "bold 14px monospace";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
@@ -96,12 +105,13 @@ function render(): void {
   // Update UI.
   updateStats();
   updateMessages();
+  updateInventory();
 }
 
 // --- Input ---
 
 new InputHandler((action: string, dir?: Direction) => {
-  if (session.gameOver) return;
+  if (!session || session.gameOver) return;
 
   let gameAction: GameAction | null = null;
 
@@ -131,6 +141,13 @@ new InputHandler((action: string, dir?: Direction) => {
   }
 });
 
+// Restart button (delegated click handler).
+document.addEventListener("click", (e) => {
+  if ((e.target as HTMLElement).id === "restart-btn") {
+    newGame();
+  }
+});
+
 // --- Stats Panel ---
 
 function updateStats(): void {
@@ -152,7 +169,12 @@ function updateStats(): void {
     ${session.gameOver
       ? `<div style="margin-top:8px;color:${session.survived ? '#4a4' : '#c44'};font-weight:bold">
            ${session.survived ? 'SURVIVED — Exited ' + session.exitGate : 'YOU DIED'}
-         </div>`
+         </div>
+         <button id="restart-btn" style="margin-top:8px;padding:6px 16px;
+           background:#333;color:#ccc;border:1px solid #555;cursor:pointer;
+           font-family:monospace;font-size:13px">
+           New Dungeon
+         </button>`
       : ''}
     <div style="margin-top:8px;font-size:11px;color:#888">
       WASD/Arrows: Move &nbsp; G: Pickup<br>
@@ -167,13 +189,13 @@ function updateInventory(): void {
   const el = document.getElementById("inventory-display");
   if (!el) return;
 
-  if (session.loot.length === 0) {
+  const items = session.loot.filter(l => l.quantity > 0);
+  if (items.length === 0) {
     el.innerHTML = '<div style="color:#666">Empty</div>';
     return;
   }
 
-  el.innerHTML = session.loot
-    .filter(l => l.quantity > 0)
+  el.innerHTML = items
     .map(l => `<div>${l.itemId} x${l.quantity}</div>`)
     .join("");
 }
@@ -184,34 +206,13 @@ function updateMessages(): void {
   const el = document.getElementById("message-log");
   if (!el) return;
 
-  // Show last 8 messages.
   const recent = session.messages.slice(-8);
   el.innerHTML = recent.map(m =>
     `<div class="msg-${m.type}">${m.text}</div>`
   ).join("");
-
   el.scrollTop = el.scrollHeight;
-
-  updateInventory();
 }
 
-// Initial render.
-render();
-console.log("Game ready. Seed: hello_world, Depth: 1");
-console.log(`Monsters: ${session.monsters.length}, Items: ${session.groundItems.length}`);
+// --- Start ---
 
-// Entity verification against C++.
-console.log("TS Monsters:");
-for (const m of [...session.monsters].sort((a, b) => a.y - b.y || a.x - b.x)) {
-  console.log(`  ${m.name} (${m.symbol}) at (${m.x},${m.y}) HP:${m.hp} ATK:${m.attack}`);
-}
-import { getSpawnableItems } from "./game/items.js";
-const spawnable = getSpawnableItems(1);
-console.log(`Spawnable items at depth 1 (${spawnable.length}):`);
-for (let i = 0; i < spawnable.length; i++) {
-  console.log(`  [${i}] ${spawnable[i].id} (value=${spawnable[i].value})`);
-}
-console.log("TS Ground items:");
-for (const i of [...session.groundItems].sort((a, b) => a.y - b.y || a.x - b.x)) {
-  console.log(`  ${i.itemId} x${i.quantity} at (${i.x},${i.y})`);
-}
+newGame();
