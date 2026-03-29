@@ -9,6 +9,7 @@ import { Camera } from "./render/camera.js";
 import { TILE_SIZE, drawTile, initSprites } from "./render/tiles.js";
 import { drawMonsters, drawGroundItems, drawPlayer } from "./render/entities.js";
 import { InputHandler, Direction } from "./game/input.js";
+import { FovMap } from "./render/fov.js";
 
 // --- Setup ---
 
@@ -32,6 +33,9 @@ const session = new DungeonSession(
   [{ itemId: "health_potion", quantity: 3 }]
 );
 
+const fov = new FovMap();
+fov.update(session.playerX, session.playerY, session.dungeon);
+
 // --- Resize ---
 
 function resize(): void {
@@ -53,19 +57,23 @@ function render(): void {
 
   const dungeon = session.dungeon;
 
-  // Tiles.
+  // Tiles (with FOV).
   for (let y = camera.y; y < camera.y + camera.viewH && y < HEIGHT; y++) {
     for (let x = camera.x; x < camera.x + camera.viewW && x < WIDTH; x++) {
+      const alpha = fov.getAlpha(x, y);
+      if (alpha <= 0) continue; // Hidden — don't render.
       const [px, py] = camera.toScreen(x, y);
-      drawTile(ctx, dungeon.getTile(x, y), px, py);
+      drawTile(ctx, dungeon.getTile(x, y), px, py, alpha);
     }
   }
 
-  // Ground items.
-  drawGroundItems(ctx, camera, session.groundItems);
+  // Ground items (only visible tiles).
+  drawGroundItems(ctx, camera,
+    session.groundItems.filter(gi => fov.isVisible(gi.x, gi.y)));
 
-  // Monsters.
-  drawMonsters(ctx, camera, session.monsters);
+  // Monsters (only visible tiles).
+  drawMonsters(ctx, camera,
+    session.monsters.filter(m => m.alive && fov.isVisible(m.x, m.y)));
 
   // Player.
   drawPlayer(ctx, camera, session.playerX, session.playerY);
@@ -117,6 +125,7 @@ new InputHandler((action: string, dir?: Direction) => {
 
   if (gameAction) {
     session.processAction(gameAction);
+    fov.update(session.playerX, session.playerY, session.dungeon);
     camera.centerOn(session.playerX, session.playerY);
     render();
   }
