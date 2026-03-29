@@ -199,3 +199,19 @@ function updateMessages(): void {
 render();
 console.log("Game ready. Seed: hello_world, Depth: 1");
 console.log(`Monsters: ${session.monsters.length}, Items: ${session.groundItems.length}`);
+
+// Entity verification against C++.
+console.log("TS Monsters:");
+for (const m of [...session.monsters].sort((a, b) => a.y - b.y || a.x - b.x)) {
+  console.log(`  ${m.name} (${m.symbol}) at (${m.x},${m.y}) HP:${m.hp} ATK:${m.attack}`);
+}
+import { getSpawnableItems } from "./game/items.js";
+const spawnable = getSpawnableItems(1);
+console.log(`Spawnable items at depth 1 (${spawnable.length}):`);
+for (let i = 0; i < spawnable.length; i++) {
+  console.log(`  [${i}] ${spawnable[i].id} (value=${spawnable[i].value})`);
+}
+console.log("TS Ground items:");
+for (const i of [...session.groundItems].sort((a, b) => a.y - b.y || a.x - b.x)) {
+  console.log(`  ${i.itemId} x${i.quantity} at (${i.x},${i.y})`);
+}

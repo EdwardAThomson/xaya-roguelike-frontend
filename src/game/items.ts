@@ -22,6 +22,7 @@ const ITEMS: ItemDef[] = [
   { id: "short_sword",  name: "Short Sword",  type: "weapon", slot: "weapon", icon: "🗡️", color: "#e74c3c", attackPower: 5,  defense: 0, healAmount: 0,  value: 25,  consumable: false },
   { id: "iron_sword",   name: "Iron Sword",   type: "weapon", slot: "weapon", icon: "⚔️", color: "#e74c3c", attackPower: 6,  defense: 0, healAmount: 0,  value: 35,  consumable: false },
   { id: "long_sword",   name: "Long Sword",   type: "weapon", slot: "weapon", icon: "⚔️", color: "#e74c3c", attackPower: 8,  defense: 0, healAmount: 0,  value: 50,  consumable: false },
+  { id: "scimitar",     name: "Scimitar",     type: "weapon", slot: "weapon", icon: "⚔️", color: "#e74c3c", attackPower: 7,  defense: 0, healAmount: 0,  value: 38,  consumable: false },
   { id: "battle_axe",   name: "Battle Axe",   type: "weapon", slot: "weapon", icon: "🪓", color: "#e74c3c", attackPower: 10, defense: 0, healAmount: 0,  value: 65,  consumable: false },
   { id: "mace",         name: "Iron Mace",    type: "weapon", slot: "weapon", icon: "🔨", color: "#e74c3c", attackPower: 7,  defense: 0, healAmount: 0,  value: 42,  consumable: false },
   { id: "staff",        name: "Wooden Staff",  type: "weapon", slot: "weapon", icon: "🪄", color: "#9b59b6", attackPower: 4,  defense: 0, healAmount: 0,  value: 40,  consumable: false },
@@ -31,18 +32,22 @@ const ITEMS: ItemDef[] = [
   { id: "iron_helmet",  name: "Iron Helmet",  type: "armor", slot: "head", icon: "⛑️", color: "#3498db", attackPower: 0, defense: 3, healAmount: 0, value: 40, consumable: false },
 
   /* Body armor */
-  { id: "leather_armor", name: "Leather Armor",  type: "armor", slot: "body", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 2, healAmount: 0, value: 25,  consumable: false },
-  { id: "chainmail",     name: "Chainmail",      type: "armor", slot: "body", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 4, healAmount: 0, value: 60,  consumable: false },
-  { id: "plate_armor",   name: "Plate Armor",    type: "armor", slot: "body", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 7, healAmount: 0, value: 100, consumable: false },
+  { id: "leather_armor",   name: "Leather Armor",   type: "armor", slot: "body", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 2, healAmount: 0, value: 25,  consumable: false },
+  { id: "studded_leather", name: "Studded Leather", type: "armor", slot: "body", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 3, healAmount: 0, value: 40,  consumable: false },
+  { id: "scale_mail",     name: "Scale Mail",      type: "armor", slot: "body", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 5, healAmount: 0, value: 50,  consumable: false },
+  { id: "chainmail",      name: "Chainmail",       type: "armor", slot: "body", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 4, healAmount: 0, value: 60,  consumable: false },
+  { id: "plate_armor",    name: "Plate Armor",     type: "armor", slot: "body", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 7, healAmount: 0, value: 100, consumable: false },
 
   /* Feet */
-  { id: "leather_boots", name: "Leather Boots", type: "armor", slot: "feet", icon: "👢", color: "#3498db", attackPower: 0, defense: 1, healAmount: 0, value: 20, consumable: false },
-  { id: "iron_boots",    name: "Iron Boots",    type: "armor", slot: "feet", icon: "👢", color: "#3498db", attackPower: 0, defense: 2, healAmount: 0, value: 35, consumable: false },
+  { id: "leather_boots",    name: "Leather Boots",    type: "armor", slot: "feet", icon: "👢", color: "#3498db", attackPower: 0, defense: 1, healAmount: 0, value: 20, consumable: false },
+  { id: "iron_boots",       name: "Iron Boots",       type: "armor", slot: "feet", icon: "👢", color: "#3498db", attackPower: 0, defense: 2, healAmount: 0, value: 35, consumable: false },
+  { id: "reinforced_boots", name: "Reinforced Boots", type: "armor", slot: "feet", icon: "👢", color: "#3498db", attackPower: 0, defense: 1, healAmount: 0, value: 28, consumable: false },
 
   /* Shields */
-  { id: "wooden_shield", name: "Wooden Shield", type: "armor", slot: "offhand", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 2, healAmount: 0, value: 25,  consumable: false },
-  { id: "iron_shield",   name: "Iron Shield",   type: "armor", slot: "offhand", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 4, healAmount: 0, value: 60,  consumable: false },
-  { id: "tower_shield",  name: "Tower Shield",  type: "armor", slot: "offhand", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 7, healAmount: 0, value: 120, consumable: false },
+  { id: "wooden_shield",     name: "Wooden Shield",     type: "armor", slot: "offhand", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 2, healAmount: 0, value: 25,  consumable: false },
+  { id: "reinforced_shield", name: "Reinforced Shield", type: "armor", slot: "offhand", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 3, healAmount: 0, value: 40,  consumable: false },
+  { id: "iron_shield",      name: "Iron Shield",       type: "armor", slot: "offhand", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 4, healAmount: 0, value: 60,  consumable: false },
+  { id: "tower_shield",     name: "Tower Shield",      type: "armor", slot: "offhand", icon: "🛡️", color: "#3498db", attackPower: 0, defense: 7, healAmount: 0, value: 120, consumable: false },
 
   /* Accessories */
   { id: "silver_ring",        name: "Silver Ring",        type: "accessory", slot: "ring",   icon: "💍", color: "#f1c40f", attackPower: 0, defense: 2, healAmount: 0, value: 45, consumable: false },
