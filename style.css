@@ -12,9 +12,85 @@ body {
   height: 100vh;
 }
 
+/* --- Top bar --- */
+
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: #1a1a1a;
+  border-bottom: 1px solid #333;
+  font-size: 12px;
+  height: 36px;
+}
+
+.topbar-label {
+  color: #888;
+}
+
+#topbar input {
+  background: #222;
+  border: 1px solid #444;
+  color: #ccc;
+  font-family: monospace;
+  font-size: 12px;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+#gsp-url { width: 220px; }
+#player-name { width: 120px; }
+
+#connect-btn {
+  background: #2a4a2a;
+  color: #8c8;
+  border: 1px solid #4a4;
+  padding: 2px 12px;
+  font-family: monospace;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+#connect-btn:hover { background: #3a5a3a; }
+
+#connection-status {
+  font-size: 11px;
+  padding: 0 8px;
+}
+
+.status-disconnected { color: #888; }
+.status-connecting { color: #aa8; }
+.status-connected { color: #4a4; }
+.status-error { color: #c44; }
+
+.topbar-spacer { flex: 1; }
+
+.mode-btn {
+  background: #222;
+  color: #888;
+  border: 1px solid #444;
+  padding: 2px 10px;
+  font-family: monospace;
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+.mode-btn.active {
+  background: #2a2a3a;
+  color: #aaf;
+  border-color: #66a;
+}
+
+.mode-btn:hover:not(.active) { background: #2a2a2a; }
+
+/* --- Main layout --- */
+
 #app {
   display: flex;
-  height: 100vh;
+  height: calc(100vh - 36px);
 }
 
 #game-area {
@@ -93,6 +169,56 @@ body {
   line-height: 16px;
   color: #fff;
 }
+
+/* --- Stat rows for overworld player info --- */
+
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 1px 0;
+}
+
+.stat-label { color: #888; }
+.stat-value { color: #ccc; }
+
+.inventory-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 1px 0;
+  font-size: 12px;
+}
+
+.slot-equipped { color: #daa520; }
+.slot-bag { color: #888; }
+
+/* --- Action buttons --- */
+
+.action-btn {
+  display: inline-block;
+  margin: 4px 2px 0;
+  padding: 4px 10px;
+  background: #2a2a2a;
+  color: #ccc;
+  border: 1px solid #555;
+  font-family: monospace;
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+.action-btn:hover:not(:disabled) { background: #3a3a3a; }
+.action-btn:disabled { opacity: 0.4; cursor: default; }
+
+.action-travel { border-color: #6a6; color: #8c8; }
+.action-travel:hover:not(:disabled) { background: #2a3a2a; }
+
+.action-enter { border-color: #66a; color: #aaf; }
+.action-enter:hover:not(:disabled) { background: #2a2a3a; }
+
+.action-discover { border-color: #a86; color: #ca8; }
+.action-discover:hover:not(:disabled) { background: #3a2a1a; }
+
+/* --- Message colors --- */
 
 .msg-combat { color: #f55; }
 .msg-pickup { color: #5f5; }

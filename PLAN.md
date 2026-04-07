@@ -84,7 +84,7 @@ xaya-roguelike-frontend/
 
 ## Phases
 
-### Phase F1: Project Setup + Dungeon Renderer
+### Phase F1: Project Setup + Dungeon Renderer — DONE
 
 Get a canvas rendering a dungeon from a seed.
 
@@ -97,64 +97,73 @@ Get a canvas rendering a dungeon from a seed.
 - Keyboard input (arrow keys / WASD) to pan the camera
 - Dark theme CSS
 
-**Test**: Open `index.html`, see a rendered dungeon, pan around with keys.
-
-### Phase F2: Local Dungeon Play
+### Phase F2: Local Dungeon Play — DONE
 
 Play a dungeon session entirely in the browser.
 
-- Port the dungeon generation algorithm to TypeScript (or compile C++ to WASM)
-- Monster rendering (colored text symbols, matching JS roguelike)
-- Item rendering (emoji icons)
-- Player rendering (@ symbol or sprite)
-- Input: arrow keys move the player, actions happen per-turn
-- Combat: show damage numbers, monster death
-- Fog of war: visible (bright) / explored (dim) / hidden (black)
-- Stats panel: HP bar, kills, XP, gold
-- Message log: combat messages, pickups, events
+- TS port of dungeon generation, verified identical to C++ (3200/3200 tiles match)
+- SHA-256 hash + MT19937 RNG ported and verified to match C++ byte-for-byte
+- Monster rendering: 14 types, colored text symbols, HP bars
+- Item rendering: 35 items, emoji icons
+- Player rendering: gold circle + @ symbol
+- Turn-based gameplay: 8-dir movement, combat, items, monster AI, gate exits
+- Fog of war: 8-tile radius circular LOS (visible / explored / hidden)
+- Stats panel: HP bar (color-coded), kills, XP, gold, depth
+- Message log: 50-message buffer, color-coded (combat, pickup, info, warning)
+- Action log recording for replay proof
+- Monster drops (35% chance: gold, potions, equipment)
 
-**Decision**: TS port (decided). Players can read and inspect the source code —
-important for trust in a crypto game. C++ backend remains authoritative for
-channel settlement. SHA-256 hash + MT19937 RNG ported and verified to match
-C++ output. WASM remains an option for future performance optimization.
-
-**Test**: Open in browser, play through a dungeon with keyboard, fight monsters, exit via gate.
-
-### Phase F3: GSP Connection
+### Phase F3: GSP Connection — DONE
 
 Connect to a running GSP for on-chain state.
 
-- RPC client: `getplayerinfo`, `getsegmentinfo`, `listsegments`, `listvisits`
-- WebSocket client: subscribe to state changes via gsp-websocket-server.py
-- Display on-chain player stats (HP, level, inventory, current segment)
-- Overworld view: segment map showing the world graph (nodes + edges)
-- Travel UI: click a linked segment to submit travel move
+- `src/net/rpc.ts`: JSON-RPC 2.0 client with typed responses for all GSP endpoints
+  (getplayerinfo, listsegments, getsegmentinfo, listvisits, waitforchange, getcurrentstate)
+- `src/net/connection.ts`: Connection manager with auto-polling (2s interval)
+- Overworld view: segment map with BFS grid layout, depth-colored nodes, directional links
+- Segment 0 (hub) always shown even though it's not in the DB — links inferred from neighbors
+- Click-to-select segments on the overworld canvas with hit-testing
+- On-chain player stats displayed: HP bar, level, XP, gold, stats, equipment, combat record
+- On-chain inventory shown with equipped slot labels
+- World info: player count, segment count, active visits, other players
+- Dual-mode UI: overworld (on-chain state) vs dungeon (local play)
+- Top bar: GSP URL input, player name input, connect/disconnect, mode toggle
 
-**Test**: Connect to local devnet GSP, see player state update in real-time.
+### Phase F4a: Devnet Move Submission — DONE
 
-### Phase F4: Wallet Integration + Move Submission
+Submit game moves via a devnet HTTP proxy (no MetaMask needed for testing).
 
-Submit game moves via MetaMask.
+- `src/net/moves.ts`: Move submission client with typed convenience methods
+  (register, discover, travel, enterChannel, exitChannel, equip, useItem, allocateStat)
+- `devnet/frontend_devnet.py`: starts full stack (anvil + Xaya X + rogueliked)
+  and runs HTTP move proxy on port 18380 with CORS support
+- Proxy translates simple JSON POSTs into XayaAccounts smart contract calls
+- Sidebar buttons: Register Player, Discover (per direction), Travel, Enter Dungeon
+
+### Phase F5: Channel Play Integration — DONE
+
+Full dungeon play through the browser with on-chain settlement.
+
+- Enter channel from overworld: on-chain `ec` move via proxy
+- Dungeon session created with real on-chain player stats (level, str/dex/con/int,
+  equipped attack/defense, HP, potions from inventory)
+- Segment seed from GSP used for deterministic dungeon generation
+- On dungeon exit (survived or died): "Submit Results On-Chain" button
+- Submits `xc` move with results + full action replay proof (actionLog array)
+- GSP verifies replay deterministically; results reflected in overworld state
+- Channel session label in dungeon sidebar shows segment ID
+
+### Phase F4b: MetaMask / Wallet Integration
+
+Submit game moves via MetaMask (production path, replaces devnet proxy).
 
 - Wallet connector: `window.ethereum` for MetaMask
+- ABI encoding for XayaAccounts contract (register, move)
 - Connect wallet, detect Xaya accounts contract
-- Submit moves: register, discover, travel, equip, use item, enter/exit channel
 - Transaction status: pending → confirmed → state update
 - Error handling: rejected transaction, insufficient gas, etc.
 
 **Test**: Register a player, discover a segment, travel — all via browser + MetaMask.
-
-### Phase F5: Channel Play Integration
-
-Full dungeon play through the browser with on-chain settlement.
-
-- Enter channel (on-chain move)
-- Play dungeon locally in browser (WASM engine or TS port)
-- Exit channel: submit results on-chain
-- Show loot summary, XP gained, level-ups after settlement
-- Inventory management: equip/unequip between dungeon runs
-
-**Test**: Full loop — enter channel, play dungeon, exit, see results on-chain.
 
 ### Phase F6: Visual Polish
 

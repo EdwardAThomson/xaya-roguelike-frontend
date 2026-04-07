@@ -7,6 +7,17 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <div id="topbar">
+    <span class="topbar-label">GSP</span>
+    <input id="gsp-url" type="text" value="http://localhost:18332" spellcheck="false">
+    <span class="topbar-label">Player</span>
+    <input id="player-name" type="text" placeholder="name" spellcheck="false">
+    <button id="connect-btn">Connect</button>
+    <span id="connection-status" class="status-disconnected">Disconnected</span>
+    <div class="topbar-spacer"></div>
+    <button id="mode-overworld" class="mode-btn active" disabled>Overworld</button>
+    <button id="mode-dungeon" class="mode-btn">Dungeon</button>
+  </div>
   <div id="app">
     <div id="game-area">
       <canvas id="game-canvas"></canvas>
