@@ -21,6 +21,15 @@ import { MoveClient } from "./net/moves.js";
 import { layoutSegments, SegmentNode, hitTestSegment, areLinked } from "./game/overworld.js";
 import { drawOverworld, NODE_SIZE, CELL } from "./render/overworld.js";
 import { DEFAULT_GSP_URL, DEFAULT_PROXY_URL } from "./config.js";
+import {
+  ValidatorContext, ValidationResult,
+  validateDiscover, validateTravel, validateEnterChannel,
+  validateUseItem, validateAllocateStat, validateEquip, validateUnequip,
+  discoveryCooldownRemaining,
+} from "./net/validator.js";
+import { waitFor } from "./net/pending.js";
+import { showErrorModal, showModal } from "./ui/modal.js";
+import { lookupItem } from "./game/items.js";
 
 // --- DOM refs ---
 
@@ -196,16 +205,100 @@ function startChannelDungeon(segmentSeed: string, depth: number, segmentId: numb
 
 // --- Async actions (travel, enter channel, exit channel) ---
 
+/**
+ * Builds the validator context from the current connection state.
+ * Returns null if we're not in a state where validation is meaningful
+ * (not connected, no player, etc.) — callers should short-circuit.
+ */
+function validatorContext(): ValidatorContext | null {
+  if (!connState?.player) return null;
+  return {
+    player: connState.player,
+    segments: connState.segments,
+    currentHeight: connState.currentHeight,
+  };
+}
+
+/** Shows an error modal for a failed validation and returns false. */
+function handleValidation(result: ValidationResult): boolean {
+  if (result.ok) return true;
+  showErrorModal(result.title, result.message);
+  return false;
+}
+
+const OPPOSITE_DIR: Record<string, string> = {
+  north: "south", south: "north", east: "west", west: "east",
+};
+
+/**
+ * Given a validator context and a direction, returns the segment ID
+ * the player would arrive at after traveling — or null if none can be
+ * determined from the cache (e.g. stale data, hub with no neighbours).
+ */
+function targetSegmentFor(ctx: ValidatorContext, dir: string): number | null {
+  const curSeg = ctx.player.current_segment;
+  if (curSeg === 0) {
+    const opp = OPPOSITE_DIR[dir];
+    for (const seg of ctx.segments.values()) {
+      for (const [d, lnk] of Object.entries(seg.links)) {
+        if (lnk.to_segment === 0 && d === opp) return seg.id;
+      }
+    }
+    return null;
+  }
+  const segInfo = ctx.segments.get(curSeg);
+  return segInfo?.links[dir]?.to_segment ?? null;
+}
+
+/**
+ * Called when a move's expected state change did NOT materialise.
+ * Re-runs the validator against the latest state (now that the chain
+ * has advanced) to surface the real reason in a modal.  Falls back to
+ * a generic message if the validator also sees no problem.
+ */
+function diagnoseRejection(action: string, revalidate: () => ValidationResult): void {
+  try {
+    const v = revalidate();
+    if (!v.ok) {
+      showErrorModal(v.title, v.message);
+      return;
+    }
+  } catch {
+    // If revalidation needs a context we no longer have, fall through
+    // to the generic message.
+  }
+  showErrorModal(
+    `${action.charAt(0).toUpperCase() + action.slice(1)} move rejected`,
+    `The move was submitted but the GSP did not apply it. The most likely cause is a race with another player (someone else grabbed the coordinate, or the cooldown window advanced between click and block inclusion). Try again.`,
+  );
+}
+
 async function doTravel(dir: string): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
+  const ctx = validatorContext();
+  if (!ctx) {
+    showErrorModal("Not connected", "Connect to a GSP and register a player before traveling.");
+    return;
+  }
+  if (!handleValidation(validateTravel(ctx, dir))) return;
+
+  // Compute expected target segment so we can detect the state change.
+  const expectedTarget = targetSegmentFor(ctx, dir);
+  const beforeSeg = ctx.player.current_segment;
+
   busy = true;
   updateSidebar();
   try {
     await moves.travel(connState.playerName, dir);
     addOverworldMessage(`Traveling ${dir}...`, "info");
-    // Polling will pick up the state change.
+
+    const resolved = await waitFor(connection, ({ player }) =>
+      !!player && player.current_segment !== beforeSeg
+        && (expectedTarget === null || player.current_segment === expectedTarget));
+
+    if (!resolved) diagnoseRejection("travel", () => validateTravel(validatorContext()!, dir));
   } catch (e) {
-    addOverworldMessage(`Travel failed: ${e instanceof Error ? e.message : e}`, "warning");
+    showErrorModal("Travel failed", e instanceof Error ? e.message : String(e));
   }
   busy = false;
   updateSidebar();
@@ -213,33 +306,38 @@ async function doTravel(dir: string): Promise<void> {
 
 async function doEnterChannel(segmentId: number): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
+  const ctx = validatorContext();
+  if (!ctx) {
+    showErrorModal("Not connected", "Connect to a GSP and register a player before entering a dungeon.");
+    return;
+  }
+  if (!handleValidation(validateEnterChannel(ctx, segmentId))) return;
+
   busy = true;
   updateSidebar();
   try {
     await moves.enterChannel(connState.playerName, segmentId);
     addOverworldMessage(`Entering dungeon at segment ${segmentId}...`, "info");
 
-    // Refetch player to get visit ID.
-    // Give the GSP a moment to process.
-    await new Promise(r => setTimeout(r, 1500));
-    if (connection.rpc) {
-      const rpc = connection.rpc;
-      const player = await rpc.getplayerinfo(connState.playerName);
-      if (player && player.in_channel && player.active_visit) {
-        connState.player = player;
+    const resolved = await waitFor(connection, ({ player }) =>
+      !!player && player.in_channel && player.active_visit !== null);
 
-        // Get segment info for the seed.
-        const segInfo = connState.segments.get(segmentId);
-        if (segInfo) {
-          startChannelDungeon(segInfo.seed, segInfo.depth, segmentId, player.active_visit.visit_id);
-          busy = false;
-          return;
-        }
+    if (resolved && connState.player?.active_visit) {
+      const segInfo = connState.segments.get(segmentId);
+      if (segInfo) {
+        startChannelDungeon(segInfo.seed, segInfo.depth, segmentId, connState.player.active_visit.visit_id);
+        busy = false;
+        return;
       }
+      showErrorModal(
+        "Missing segment data",
+        `The frontend doesn't have segment ${segmentId} cached. Try reconnecting.`,
+      );
+    } else {
+      diagnoseRejection("enter dungeon", () => validateEnterChannel(validatorContext()!, segmentId));
     }
-    addOverworldMessage("Channel entered but could not start dungeon session.", "warning");
   } catch (e) {
-    addOverworldMessage(`Enter channel failed: ${e instanceof Error ? e.message : e}`, "warning");
+    showErrorModal("Enter dungeon failed", e instanceof Error ? e.message : String(e));
   }
   busy = false;
   updateSidebar();
@@ -247,13 +345,19 @@ async function doEnterChannel(segmentId: number): Promise<void> {
 
 async function doExitChannel(): Promise<void> {
   if (busy || !moves || !connState?.playerName || !session || !channelSession) return;
+  // Snapshot gold before settle so we can report how much was lost on death.
+  const goldBefore = connState.player?.gold ?? 0;
+  const survived = session.survived;
+  const earnedXp = session.totalXp;
+  const earnedGold = session.totalGold;
+
   busy = true;
   updateSidebar();
   try {
     const results = {
-      survived: session.survived,
-      xp: session.totalXp,
-      gold: session.totalGold,
+      survived,
+      xp: earnedXp,
+      gold: earnedGold,
       kills: session.totalKills,
     };
 
@@ -264,12 +368,39 @@ async function doExitChannel(): Promise<void> {
     });
 
     await moves.exitChannel(connState.playerName, channelVisitId, results, actions);
-    addOverworldMessage(
-      session.survived
-        ? `Dungeon complete! +${session.totalXp} XP, +${session.totalGold} gold`
-        : "You died in the dungeon...",
-      session.survived ? "pickup" : "combat"
-    );
+
+    const resolved = await waitFor(connection, ({ player }) =>
+      !!player && !player.in_channel);
+
+    if (!resolved) {
+      showErrorModal(
+        "Settlement rejected",
+        "Your dungeon results were submitted but the GSP did not close the channel. The most likely cause is action-log replay mismatch — the submitted actions don't verify against the reported outcome. The dungeon session is still active; try exiting again.",
+      );
+      busy = false;
+      updateSidebar();
+      return;
+    }
+
+    if (survived) {
+      addOverworldMessage(
+        `Dungeon complete! +${earnedXp} XP, +${earnedGold} gold`,
+        "pickup",
+      );
+    } else {
+      // Death penalty: respawn at hub, lose 25% of carried gold
+      // (computed against gold AFTER crediting anything earned).
+      const totalGold = goldBefore + earnedGold;
+      const goldLost = totalGold - Math.floor(totalGold * 75 / 100);
+      addOverworldMessage("You died in the dungeon...", "combat");
+      showModal({
+        title: "You died",
+        message:
+          `You respawned at the hub (segment 0) and lost ${goldLost} gold ` +
+          `(25% of your carried gold). XP and equipment are preserved.`,
+        variant: "error",
+      });
+    }
 
     // Return to overworld.
     channelSession = false;
@@ -277,7 +408,7 @@ async function doExitChannel(): Promise<void> {
     fov = null;
     setMode("overworld");
   } catch (e) {
-    addOverworldMessage(`Exit channel failed: ${e instanceof Error ? e.message : e}`, "warning");
+    showErrorModal("Exit channel failed", e instanceof Error ? e.message : String(e));
   }
   busy = false;
   updateSidebar();
@@ -285,15 +416,138 @@ async function doExitChannel(): Promise<void> {
 
 async function doDiscover(dir: string): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
-  const currentSeg = connState?.player?.current_segment ?? 0;
+  const ctx = validatorContext();
+  if (!ctx) {
+    showErrorModal("Not connected", "Connect to a GSP and register a player before discovering.");
+    return;
+  }
+  if (!handleValidation(validateDiscover(ctx, dir))) return;
+
+  const currentSeg = ctx.player.current_segment;
   const currentDepth = overworldNodes.get(currentSeg)?.depth ?? 0;
+  const beforeLastDiscover = ctx.player.last_discover_height;
+
   busy = true;
   updateSidebar();
   try {
     await moves.discover(connState.playerName, currentDepth + 1, dir);
     addOverworldMessage(`Discovering ${dir}...`, "info");
+
+    const resolved = await waitFor(connection, ({ player }) =>
+      !!player && player.last_discover_height > beforeLastDiscover);
+
+    if (!resolved) diagnoseRejection("discover", () => validateDiscover(validatorContext()!, dir));
   } catch (e) {
-    addOverworldMessage(`Discover failed: ${e instanceof Error ? e.message : e}`, "warning");
+    showErrorModal("Discover failed", e instanceof Error ? e.message : String(e));
+  }
+  busy = false;
+  updateSidebar();
+}
+
+async function doUseItem(itemId: string): Promise<void> {
+  if (busy || !moves || !connState?.playerName) return;
+  const ctx = validatorContext();
+  if (!ctx) return;
+  if (!handleValidation(validateUseItem(ctx, itemId))) return;
+
+  const beforeHp = ctx.player.hp;
+  const beforeQty = ctx.player.inventory
+    .filter(i => i.item_id === itemId && i.slot === "bag")
+    .reduce((a, i) => a + i.quantity, 0);
+
+  busy = true;
+  updateSidebar();
+  try {
+    await moves.useItem(connState.playerName, itemId);
+    addOverworldMessage(`Used ${itemId}...`, "info");
+
+    const resolved = await waitFor(connection, ({ player }) => {
+      if (!player) return false;
+      if (player.hp > beforeHp) return true;
+      const qty = player.inventory
+        .filter(i => i.item_id === itemId && i.slot === "bag")
+        .reduce((a, i) => a + i.quantity, 0);
+      return qty < beforeQty;
+    });
+
+    if (!resolved) diagnoseRejection("use item", () => validateUseItem(validatorContext()!, itemId));
+  } catch (e) {
+    showErrorModal("Use item failed", e instanceof Error ? e.message : String(e));
+  }
+  busy = false;
+  updateSidebar();
+}
+
+async function doAllocateStat(stat: string): Promise<void> {
+  if (busy || !moves || !connState?.playerName) return;
+  const ctx = validatorContext();
+  if (!ctx) return;
+  if (!handleValidation(validateAllocateStat(ctx, stat))) return;
+
+  const before = ctx.player.stat_points;
+
+  busy = true;
+  updateSidebar();
+  try {
+    await moves.allocateStat(connState.playerName, stat);
+    addOverworldMessage(`Allocated +1 ${stat}.`, "pickup");
+
+    const resolved = await waitFor(connection, ({ player }) =>
+      !!player && player.stat_points < before);
+
+    if (!resolved) diagnoseRejection("allocate stat", () => validateAllocateStat(validatorContext()!, stat));
+  } catch (e) {
+    showErrorModal("Allocate stat failed", e instanceof Error ? e.message : String(e));
+  }
+  busy = false;
+  updateSidebar();
+}
+
+async function doEquip(rowid: number, slot: string): Promise<void> {
+  if (busy || !moves || !connState?.playerName) return;
+  const ctx = validatorContext();
+  if (!ctx) return;
+  if (!handleValidation(validateEquip(ctx, rowid, slot))) return;
+
+  busy = true;
+  updateSidebar();
+  try {
+    await moves.equip(connState.playerName, rowid, slot);
+    addOverworldMessage(`Equipped to ${slot}.`, "info");
+
+    const resolved = await waitFor(connection, ({ player }) => {
+      const item = player?.inventory.find(i => i.rowid === rowid);
+      return !!item && item.slot === slot;
+    });
+
+    if (!resolved) diagnoseRejection("equip", () => validateEquip(validatorContext()!, rowid, slot));
+  } catch (e) {
+    showErrorModal("Equip failed", e instanceof Error ? e.message : String(e));
+  }
+  busy = false;
+  updateSidebar();
+}
+
+async function doUnequip(rowid: number): Promise<void> {
+  if (busy || !moves || !connState?.playerName) return;
+  const ctx = validatorContext();
+  if (!ctx) return;
+  if (!handleValidation(validateUnequip(ctx, rowid))) return;
+
+  busy = true;
+  updateSidebar();
+  try {
+    await moves.unequip(connState.playerName, rowid);
+    addOverworldMessage("Unequipped.", "info");
+
+    const resolved = await waitFor(connection, ({ player }) => {
+      const item = player?.inventory.find(i => i.rowid === rowid);
+      return !!item && item.slot === "bag";
+    });
+
+    if (!resolved) diagnoseRejection("unequip", () => validateUnequip(validatorContext()!, rowid));
+  } catch (e) {
+    showErrorModal("Unequip failed", e instanceof Error ? e.message : String(e));
   }
   busy = false;
   updateSidebar();
@@ -305,9 +559,19 @@ async function doRegister(): Promise<void> {
   updateSidebar();
   try {
     await moves.registerPlayer(connState.playerName);
-    addOverworldMessage("Player registered!", "pickup");
+
+    const resolved = await waitFor(connection, ({ player }) => player !== null);
+
+    if (resolved) {
+      addOverworldMessage("Player registered!", "pickup");
+    } else {
+      showErrorModal(
+        "Registration rejected",
+        "The register move was submitted but the GSP did not create the player. The name may already be taken on-chain or the proxy may not have minted the Xaya name. Check the proxy logs.",
+      );
+    }
   } catch (e) {
-    addOverworldMessage(`Registration failed: ${e instanceof Error ? e.message : e}`, "warning");
+    showErrorModal("Registration failed", e instanceof Error ? e.message : String(e));
   }
   busy = false;
   updateSidebar();
@@ -469,6 +733,18 @@ document.addEventListener("click", (e) => {
       fov = null;
       setMode("overworld");
       break;
+    case "use-item":
+      doUseItem(target.dataset.item!);
+      break;
+    case "allocate-stat":
+      doAllocateStat(target.dataset.stat!);
+      break;
+    case "equip":
+      doEquip(Number(target.dataset.rowid), target.dataset.slot!);
+      break;
+    case "unequip":
+      doUnequip(Number(target.dataset.rowid));
+      break;
   }
 });
 
@@ -546,11 +822,53 @@ function updateOverworldStats(): void {
     const curNode = overworldNodes.get(p.current_segment);
     const dirs = ["north", "east", "south", "west"];
     const openDirs = dirs.filter(d => !curNode?.links[d]);
+    const cooldown = discoveryCooldownRemaining(p, connState?.currentHeight ?? 0);
     if (openDirs.length > 0) {
-      discoverBtns = `<div style="margin-top:6px;font-size:11px;color:#888">Discover:</div>`;
-      discoverBtns += openDirs.map(d =>
-        `<button data-action="discover" data-dir="${d}" class="action-btn action-discover" ${busy ? "disabled" : ""}>${d}</button>`
-      ).join(" ");
+      if (cooldown > 0) {
+        discoverBtns = `<div style="margin-top:6px;font-size:11px;color:#c86">Discovery on cooldown \u2014 ${cooldown} block${cooldown === 1 ? "" : "s"} left</div>`;
+        discoverBtns += openDirs.map(d =>
+          `<button class="action-btn action-discover" disabled>${d}</button>`
+        ).join(" ");
+      } else {
+        discoverBtns = `<div style="margin-top:6px;font-size:11px;color:#888">Discover:</div>`;
+        discoverBtns += openDirs.map(d =>
+          `<button data-action="discover" data-dir="${d}" class="action-btn action-discover" ${busy ? "disabled" : ""}>${d}</button>`
+        ).join(" ");
+      }
+    }
+  }
+
+  // Stat-point allocation (shown when player has points to spend).
+  let statBtns = "";
+  if (p.stat_points > 0 && !p.in_channel && hasProxy) {
+    statBtns = `
+      <div style="margin-top:6px;font-size:11px;color:#8c8">
+        ${p.stat_points} stat point${p.stat_points === 1 ? "" : "s"} to spend:
+      </div>
+      <div>
+        <button data-action="allocate-stat" data-stat="strength"     class="action-btn" ${busy ? "disabled" : ""}>+STR</button>
+        <button data-action="allocate-stat" data-stat="dexterity"    class="action-btn" ${busy ? "disabled" : ""}>+DEX</button>
+        <button data-action="allocate-stat" data-stat="constitution" class="action-btn" ${busy ? "disabled" : ""}>+CON</button>
+        <button data-action="allocate-stat" data-stat="intelligence" class="action-btn" ${busy ? "disabled" : ""}>+INT</button>
+      </div>`;
+  }
+
+  // Overworld potion-use button (shown when HP < max and player has potions).
+  let potionBtn = "";
+  if (!p.in_channel && hasProxy && p.hp < p.max_hp) {
+    const potion = p.inventory.find(
+      i => i.slot === "bag"
+        && (i.item_id === "health_potion" || i.item_id === "greater_health_potion")
+        && i.quantity > 0,
+    );
+    if (potion) {
+      const def = lookupItem(potion.item_id);
+      const heal = def?.healAmount ?? 0;
+      potionBtn = `<button data-action="use-item" data-item="${potion.item_id}"
+        class="action-btn action-travel" ${busy ? "disabled" : ""}>
+        Use ${def?.name ?? potion.item_id}${heal > 0 ? ` (+${heal} HP)` : ""}
+        \u00d7${potion.quantity}
+      </button>`;
     }
   }
 
@@ -573,6 +891,8 @@ function updateOverworldStats(): void {
     <div style="color:#888;font-size:11px">
       K:${p.combat_record.kills} D:${p.combat_record.deaths} V:${p.combat_record.visits_completed}
     </div>
+    ${statBtns}
+    ${potionBtn}
     ${discoverBtns}
     ${selectedInfo}
     ${busy ? '<div style="margin-top:6px;color:#aa8">Processing...</div>' : ""}
@@ -582,6 +902,7 @@ function updateOverworldStats(): void {
 function updateOverworldInventory(): void {
   const el = document.getElementById("inventory-display")!;
   const p = connState?.player;
+  const canMutate = !!moves && !p?.in_channel;
 
   if (!p || p.inventory.length === 0) {
     el.innerHTML = '<div style="color:#666">Empty</div>';
@@ -591,9 +912,25 @@ function updateOverworldInventory(): void {
   el.innerHTML = p.inventory.map(item => {
     const slotClass = item.slot === "bag" ? "slot-bag" : "slot-equipped";
     const slotLabel = item.slot === "bag" ? "" : `[${item.slot}]`;
+    const def = lookupItem(item.item_id);
+    const isEquipable = def && def.slot !== "" && def.type !== "potion"
+        && def.type !== "misc";
+
+    let btn = "";
+    if (canMutate && item.slot === "bag" && isEquipable) {
+      btn = `<button data-action="equip" data-rowid="${item.rowid}"
+        data-slot="${def!.slot}" class="inv-btn"
+        ${busy ? "disabled" : ""}>Equip</button>`;
+    } else if (canMutate && item.slot !== "bag") {
+      btn = `<button data-action="unequip" data-rowid="${item.rowid}"
+        class="inv-btn"
+        ${busy ? "disabled" : ""}>Unequip</button>`;
+    }
+
     return `<div class="inventory-item">
       <span>${item.item_id} x${item.quantity}</span>
       <span class="${slotClass}">${slotLabel}</span>
+      ${btn}
     </div>`;
   }).join("");
 }

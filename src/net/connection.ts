@@ -15,6 +15,8 @@ export interface ConnectionState {
   player: PlayerInfo | null;
   segments: Map<number, SegmentInfo>;
   fullState: FullState | null;
+  /** Block height that the game state corresponds to (0 until known). */
+  currentHeight: number;
 }
 
 export type StateChangeCallback = (state: ConnectionState) => void;
@@ -22,6 +24,7 @@ export type StateChangeCallback = (state: ConnectionState) => void;
 export class Connection {
   rpc: RpcClient | null = null;
   private polling = false;
+  private pollInFlight = false;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private onChange: StateChangeCallback;
 
@@ -31,6 +34,7 @@ export class Connection {
     player: null,
     segments: new Map(),
     fullState: null,
+    currentHeight: 0,
   };
 
   constructor(onChange: StateChangeCallback) {
@@ -51,9 +55,10 @@ export class Connection {
     this.notify();
 
     try {
-      // Test connection by fetching current state.
-      const fullState = await this.rpc.getcurrentstate();
-      this.state.fullState = fullState;
+      // Test connection by fetching current state (with height).
+      const envelope = await this.rpc.getCurrentStateEnvelope();
+      this.state.fullState = envelope.state;
+      this.state.currentHeight = envelope.height;
 
       // Fetch player info if name provided.
       if (playerName) {
@@ -61,7 +66,7 @@ export class Connection {
       }
 
       // Fetch full segment details (with links/gates) for each segment.
-      await this.fetchSegmentDetails(fullState.segments.map(s => s.id));
+      await this.fetchSegmentDetails(envelope.state.segments.map(s => s.id));
 
       this.state.status = "connected";
       this.notify();
@@ -84,6 +89,7 @@ export class Connection {
       player: null,
       segments: new Map(),
       fullState: null,
+      currentHeight: 0,
     };
     this.notify();
   }
@@ -113,24 +119,22 @@ export class Connection {
   }
 
   private async poll(): Promise<void> {
-    if (!this.polling || !this.rpc) return;
+    if (!this.polling || !this.rpc || this.pollInFlight) return;
+    this.pollInFlight = true;
 
     try {
-      const fullState = await this.rpc.getcurrentstate();
-      this.state.fullState = fullState;
+      const envelope = await this.rpc.getCurrentStateEnvelope();
+      this.state.fullState = envelope.state;
+      this.state.currentHeight = envelope.height;
 
       if (this.state.playerName) {
         this.state.player = await this.rpc.getplayerinfo(this.state.playerName);
       }
 
-      // Refresh segment details if new segments appeared.
-      const knownIds = new Set(this.state.segments.keys());
-      const newIds = fullState.segments
-        .map(s => s.id)
-        .filter(id => !knownIds.has(id));
-      if (newIds.length > 0) {
-        await this.fetchSegmentDetails(newIds);
-      }
+      // Refresh segment details for new AND existing segments — links
+      // and `confirmed` can change as other players act.
+      const allIds = envelope.state.segments.map(s => s.id);
+      await this.fetchSegmentDetails(allIds);
 
       this.state.status = "connected";
       this.state.error = undefined;
@@ -139,11 +143,27 @@ export class Connection {
       this.state.status = "error";
       this.state.error = e instanceof Error ? e.message : String(e);
       this.notify();
+    } finally {
+      this.pollInFlight = false;
     }
 
     // Schedule next poll.
     if (this.polling) {
       this.pollTimer = setTimeout(() => this.poll(), POLL_INTERVAL_MS);
     }
+  }
+
+  /**
+   * Forces an immediate poll — used after submitting a move so callers
+   * don't have to wait for the next scheduled tick.  No-op if a poll is
+   * already in flight or the connection is not active.
+   */
+  refresh(): void {
+    if (!this.polling || this.pollInFlight) return;
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+    }
+    void this.poll();
   }
 }

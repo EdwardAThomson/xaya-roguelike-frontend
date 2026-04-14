@@ -86,6 +86,11 @@ export class MoveClient {
     await this.mine();
   }
 
+  async unequip(name: string, rowid: number): Promise<void> {
+    await this.move(name, { uq: { rowid } });
+    await this.mine();
+  }
+
   async allocateStat(name: string, stat: string): Promise<void> {
     await this.move(name, { as: { stat } });
     await this.mine();

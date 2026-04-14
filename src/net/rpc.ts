@@ -30,6 +30,7 @@ export interface PlayerInfo {
   max_hp: number;
   current_segment: number;
   in_channel: boolean;
+  last_discover_height: number;
   effective_stats: {
     attack_power: number;
     defense: number;
@@ -37,6 +38,7 @@ export interface PlayerInfo {
     equip_defense: number;
   };
   inventory: Array<{
+    rowid: number;
     item_id: string;
     quantity: number;
     slot: string;
@@ -53,6 +55,9 @@ export interface SegmentSummary {
   max_players: number;
   created_height: number;
   visit_count: number;
+  world_x: number;
+  world_y: number;
+  confirmed: boolean;
 }
 
 export interface SegmentInfo {
@@ -62,6 +67,9 @@ export interface SegmentInfo {
   depth: number;
   max_players: number;
   created_height: number;
+  world_x: number;
+  world_y: number;
+  confirmed: boolean;
   gates: Record<string, { x: number; y: number }>;
   links: Record<string, { to_segment: number; to_direction: string }>;
   visits: Array<{
@@ -101,6 +109,17 @@ export interface FullState {
   dungeon_id?: string;
 }
 
+/**
+ * The libxayagame `getcurrentstate` envelope — wraps `gamestate` with
+ * the block metadata the game loop advanced to.  Exposed so the UI can
+ * reason about heights (e.g. discovery cooldown countdowns).
+ */
+export interface CurrentState {
+  state: FullState;
+  height: number;
+  blockhash: string;
+}
+
 // --- RPC client ---
 
 export class RpcClient {
@@ -133,8 +152,11 @@ export class RpcClient {
     }
 
     // The framework wraps results:
-    //   getcurrentstate → result.gamestate
-    //   custom methods  → result.data
+    //   getcurrentstate → { gamestate, height, blockhash, ... }
+    //   custom methods  → { data }
+    // Most callers want only the inner payload, but getcurrentstate
+    // callers sometimes need the height — use getCurrentStateEnvelope
+    // for that.
     const result = json.result;
     if (result && typeof result === "object") {
       if ("gamestate" in result) return result.gamestate;
@@ -143,8 +165,45 @@ export class RpcClient {
     return result;
   }
 
+  private async callRaw(method: string, params: unknown[]): Promise<unknown> {
+    const body = {
+      jsonrpc: "2.0",
+      method,
+      params,
+      id: this.nextId++,
+    };
+
+    const resp = await fetch(this.url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (!resp.ok) {
+      throw new Error(`RPC HTTP ${resp.status}: ${resp.statusText}`);
+    }
+
+    const json = await resp.json();
+
+    if (json.error) {
+      throw new Error(`RPC error ${json.error.code}: ${json.error.message}`);
+    }
+
+    return json.result;
+  }
+
   async getcurrentstate(): Promise<FullState> {
     return (await this.call("getcurrentstate", [])) as FullState;
+  }
+
+  /** getcurrentstate with block metadata. */
+  async getCurrentStateEnvelope(): Promise<CurrentState> {
+    const raw = (await this.callRaw("getcurrentstate", [])) as {
+      gamestate: FullState;
+      height: number;
+      blockhash: string;
+    };
+    return { state: raw.gamestate, height: raw.height, blockhash: raw.blockhash };
   }
 
   async getplayerinfo(name: string): Promise<PlayerInfo | null> {

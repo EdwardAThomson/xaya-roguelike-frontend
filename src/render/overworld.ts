@@ -91,7 +91,16 @@ export function drawOverworld(
 
     roundRect(ctx, cx - half, cy - half, NODE_SIZE, NODE_SIZE, 6);
     ctx.fill();
-    ctx.stroke();
+
+    // Dashed border for provisional (not-yet-confirmed) segments.
+    if (node.provisional) {
+      ctx.save();
+      ctx.setLineDash([5, 3]);
+      ctx.stroke();
+      ctx.restore();
+    } else {
+      ctx.stroke();
+    }
 
     // Glow for current segment.
     if (isCurrent) {
@@ -116,13 +125,23 @@ export function drawOverworld(
     ctx.font = "bold 16px monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(isOrigin ? "HUB" : `#${node.id}`, cx, cy - 8);
+    const label = isOrigin ? "HUB"
+                : node.provisional ? `#${node.id}?`
+                : `#${node.id}`;
+    ctx.fillText(label, cx, cy - 8);
 
-    // Depth label.
-    ctx.fillStyle = depthColor(node.depth);
-    ctx.font = "11px monospace";
-    ctx.textAlign = "center";
-    ctx.fillText(isOrigin ? "Safe Zone" : `Depth ${node.depth}`, cx, cy + 10);
+    // Depth label (or "Provisional" hint).
+    if (node.provisional) {
+      ctx.fillStyle = "#d08040";
+      ctx.font = "11px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(`Depth ${node.depth} \u2014 prov.`, cx, cy + 10);
+    } else {
+      ctx.fillStyle = depthColor(node.depth);
+      ctx.font = "11px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(isOrigin ? "Safe Zone" : `Depth ${node.depth}`, cx, cy + 10);
+    }
 
     // Direction arrows on edges.
     ctx.fillStyle = "#555";
@@ -143,7 +162,7 @@ export function drawOverworld(
   ctx.textBaseline = "top";
   ctx.fillStyle = "#666";
   ctx.font = "11px monospace";
-  ctx.fillText("Overworld Map \u2014 click a segment to select", 12, 12);
+  ctx.fillText("Overworld Map \u2014 click a segment to select (dashed = provisional)", 12, 12);
 }
 
 function roundRect(

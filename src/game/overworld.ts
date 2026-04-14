@@ -110,7 +110,7 @@ export function layoutSegments(segments: Map<number, SegmentInfo>): Map<number, 
         gridX: gx,
         gridY: gy,
         links: neighborLinks,
-        provisional: false,  // TODO: detect from GSP data when available
+        provisional: neighborSeg ? !neighborSeg.confirmed : true,
       };
       nodes.set(neighborId, node);
       occupied.set(key, neighborId);
