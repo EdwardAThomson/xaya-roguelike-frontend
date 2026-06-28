@@ -65,6 +65,12 @@ body {
 .status-connected { color: #4a4; }
 .status-error { color: #c44; }
 
+.topbar-info {
+  font-size: 11px;
+  padding: 0 8px;
+  color: #779;
+}
+
 .topbar-spacer { flex: 1; }
 
 .mode-btn {
@@ -285,9 +291,12 @@ body {
 
 .modal-actions {
   text-align: right;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
-.modal-dismiss {
+.modal-dismiss, .modal-cancel {
   background: #333;
   color: #ddd;
   border: 1px solid #555;
@@ -298,5 +307,53 @@ body {
   font-size: 12px;
 }
 
-.modal-dismiss:hover { background: #444; }
-.modal-dismiss:focus { outline: 1px solid #88a; }
+.modal-confirm { border-color: #4a8; color: #8ec; }
+
+.modal-dismiss:hover, .modal-cancel:hover { background: #444; }
+.modal-confirm:hover { background: #2a3a3a; }
+.modal-dismiss:focus, .modal-confirm:focus, .modal-cancel:focus {
+  outline: 1px solid #88a;
+}
+
+/* --- Processing overlay --- */
+
+.processing-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 900;
+  pointer-events: auto;
+}
+
+.processing-box {
+  background: #181820;
+  border: 1px solid #4a8;
+  border-radius: 8px;
+  padding: 20px 28px;
+  min-width: 280px;
+  color: #ddd;
+  font-family: monospace;
+  text-align: center;
+}
+
+.processing-spinner {
+  width: 28px;
+  height: 28px;
+  margin: 0 auto 14px;
+  border: 3px solid #333;
+  border-top-color: #8ec;
+  border-radius: 50%;
+  animation: processing-spin 0.9s linear infinite;
+}
+
+.processing-message {
+  font-size: 13px;
+  color: #ccc;
+}
+
+@keyframes processing-spin {
+  to { transform: rotate(360deg); }
+}

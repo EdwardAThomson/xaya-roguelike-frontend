@@ -14,10 +14,12 @@ import { PlayerStats } from "./game/combat.js";
 import { Camera } from "./render/camera.js";
 import { TILE_SIZE, drawTile, initSprites } from "./render/tiles.js";
 import { drawMonsters, drawGroundItems, drawPlayer } from "./render/entities.js";
-import { InputHandler, Direction } from "./game/input.js";
+import { InputHandler, Direction, isEditableTarget } from "./game/input.js";
 import { FovMap } from "./render/fov.js";
 import { Connection, ConnectionState } from "./net/connection.js";
-import { MoveClient } from "./net/moves.js";
+import { PlayerInfo, SegmentInfo } from "./net/rpc.js";
+import { Gate } from "./game/dungeon.js";
+import { MoveClient, createMoveClient } from "./net/moves.js";
 import { layoutSegments, SegmentNode, hitTestSegment, areLinked } from "./game/overworld.js";
 import { drawOverworld, NODE_SIZE, CELL } from "./render/overworld.js";
 import { DEFAULT_GSP_URL, DEFAULT_PROXY_URL } from "./config.js";
@@ -25,10 +27,12 @@ import {
   ValidatorContext, ValidationResult,
   validateDiscover, validateTravel, validateEnterChannel,
   validateUseItem, validateAllocateStat, validateEquip, validateUnequip,
+  validateGateWalk,
   discoveryCooldownRemaining,
 } from "./net/validator.js";
 import { waitFor } from "./net/pending.js";
-import { showErrorModal, showModal } from "./ui/modal.js";
+import { showErrorModal, showModal, showConfirmModal } from "./ui/modal.js";
+import { showOverlay, hideOverlay } from "./ui/overlay.js";
 import { lookupItem } from "./game/items.js";
 
 // --- DOM refs ---
@@ -40,25 +44,34 @@ const gspUrlInput = document.getElementById("gsp-url") as HTMLInputElement;
 const playerNameInput = document.getElementById("player-name") as HTMLInputElement;
 const connectBtn = document.getElementById("connect-btn") as HTMLButtonElement;
 const statusEl = document.getElementById("connection-status")!;
+const blockHeightEl = document.getElementById("block-height")!;
 const modeOverworldBtn = document.getElementById("mode-overworld") as HTMLButtonElement;
 const modeDungeonBtn = document.getElementById("mode-dungeon") as HTMLButtonElement;
 
 // --- State ---
 
 type AppMode = "overworld" | "dungeon";
-let mode: AppMode = "overworld";
+let mode: AppMode = "dungeon";  // default: tile view (hub or active session)
 let busy = false;  // prevents actions while async ops are in progress
 
 const camera = new Camera();
 initSprites();
 
-// Dungeon mode state.
+// Dungeon-mode state.  `session` holds whichever tile-room is currently
+// shown: a real dungeon session when channelSession=true, or the hub
+// session when the player is at segment 0 out-of-channel.
 let session: DungeonSession | null = null;
 let fov: FovMap | null = null;
 let seedCounter = 0;
-let channelSession = false;  // true when dungeon was entered via channel
+let channelSession = false;  // true when session is a real dungeon channel
 let channelSegmentId = -1;
 let channelVisitId = -1;
+/** Snapshot of player.current_segment the last time we built a hub session,
+ *  so we know to rebuild if it changes (e.g. on death respawn). */
+let hubBuiltAtSegment = -1;
+/** True while the reconnect-mid-channel modal is on screen; prevents
+ *  it being shown again on every poll. */
+let reconnectPromptShown = false;
 
 // Overworld mode state.
 let overworldNodes: Map<number, SegmentNode> = new Map();
@@ -73,12 +86,170 @@ let moves: MoveClient | null = null;
 const connection = new Connection((state: ConnectionState) => {
   connState = state;
   updateConnectionUI();
-  if (mode === "overworld") {
-    rebuildOverworld();
-    render();
-    updateSidebar();
-  }
+  rebuildOverworld();
+  ensureSessionFromChainState();
+  render();
+  updateSidebar();
 });
+
+/**
+ * Rebuilds the local session to match what the chain says about the
+ * player.  Three cases:
+ *   - in_channel=1 with active_visit → reconstruct the dungeon from
+ *     that segment's seed.  Local action log / kills / pickups from
+ *     before the refresh are gone, so the player has to re-clear the
+ *     dungeon before settling.  HP on-chain still reflects what it
+ *     was at entry, so a fresh session uses that HP correctly.
+ *   - current_segment=0 and not in channel → hub session (existing
+ *     logic).
+ *   - current_segment != 0 and not in channel → legacy state from
+ *     before gw; the player can use the Map view to navigate.  No
+ *     session built here.
+ */
+function ensureSessionFromChainState(): void {
+  const p = connState?.player;
+  if (!p) return;
+  if (channelSession || session) return;  // already have something
+
+  if (p.in_channel && p.active_visit) {
+    const segId = p.active_visit.segment_id;
+    const visitId = p.active_visit.visit_id;
+    const segInfo = connState!.segments.get(segId);
+    if (!segInfo) {
+      // Segment cache not populated yet; the next poll will retry.
+      return;
+    }
+    if (reconnectPromptShown) return;  // modal is already up
+    reconnectPromptShown = true;
+    promptReconnectChoice(segInfo.seed, segInfo.depth, segId, visitId,
+                          !segInfo.confirmed,
+                          constraintsFor(segInfo),
+                          p.active_visit.entry_direction);
+    return;
+  }
+
+  ensureHubSessionIfAtHub();
+}
+
+/**
+ * Modal shown when the player reconnects while still in_channel on
+ * chain.  Two explicit choices, no keyboard escape — Esc and backdrop
+ * are disabled because both options have consequences.
+ *
+ *   Continue: rebuild a fresh session for the same segment.  The
+ *     player's in-flight progress is lost (frontend-only state) but
+ *     the on-chain visit is still active; clearing the dungeon again
+ *     and walking out will settle normally.
+ *   Forfeit:  submit an empty xc with survived=false.  Backend applies
+ *     the death penalty (respawn at hub, 25% gold) and — under the new
+ *     anti-grief rule — also prunes the segment if it was provisional.
+ */
+function promptReconnectChoice(
+  seed: string, depth: number, segmentId: number, visitId: number,
+  isProvisional: boolean, constraints: Gate[], entryDirection: string,
+): void {
+  const forfeitDetail = isProvisional
+    ? "Respawn at the hub now (25% gold penalty).  The segment is provisional and will be deleted — you'll have to re-discover it."
+    : "Respawn at the hub now (25% gold penalty).  The segment stays available for future visits.";
+
+  showConfirmModal({
+    title: "You were in a dungeon when you disconnected",
+    message:
+      `Active visit on segment ${segmentId}.  Your local progress from before is lost.\n\n` +
+      `Continue: replay the dungeon from scratch (it's deterministic, ` +
+      `so it's the same layout).  You have until the 200-block visit ` +
+      `timeout to settle.\n\n` +
+      `Forfeit: ${forfeitDetail}`,
+    confirmLabel: "Continue",
+    cancelLabel: "Forfeit",
+    dismissibleByEscape: false,
+    onConfirm: () => {
+      reconnectPromptShown = false;
+      startChannelDungeon(seed, depth, segmentId, visitId,
+                          constraints, entryDirection);
+      addOverworldMessage(
+        `Replaying dungeon at segment ${segmentId} from scratch.`,
+        "info",
+      );
+    },
+    onCancel: () => {
+      reconnectPromptShown = false;
+      void doForfeitVisit(visitId);
+    },
+  });
+}
+
+/**
+ * Submits an empty xc with survived=false to settle an abandoned
+ * channel.  The replay produces survived=false (empty action log
+ * means the player did nothing), so the claim matches and the chain
+ * applies the death penalty atomically.
+ */
+async function doForfeitVisit(visitId: number): Promise<void> {
+  if (!moves || !connState?.playerName) return;
+  busy = true;
+  updateSidebar();
+  showOverlay("Forfeiting visit...");
+  try {
+    await moves.exitChannel(
+      connState.playerName, visitId,
+      { survived: false, xp: 0, gold: 0, kills: 0 },
+      [],
+    );
+    const resolved = await waitFor(connection, ({ player }) =>
+      !!player && !player.in_channel);
+    if (resolved) {
+      addOverworldMessage(
+        "Forfeited dungeon. Respawned at the hub.",
+        "combat",
+      );
+      ensureHubSessionIfAtHub();
+    } else {
+      showErrorModal(
+        "Forfeit didn't settle",
+        "The chain didn't close the channel within the timeout. Try again, or wait for the 200-block force-settle.",
+      );
+    }
+  } catch (e) {
+    showErrorModal("Forfeit failed", e instanceof Error ? e.message : String(e));
+  } finally {
+    hideOverlay();
+    busy = false;
+    updateSidebar();
+    render();
+  }
+}
+
+/**
+ * If the player is at the hub (segment 0) and not inside a real channel,
+ * make sure we have a hub session ready to render.  Rebuilds whenever
+ * the player's `current_segment` flips from non-hub back to hub
+ * (e.g. after a death respawn).
+ */
+function ensureHubSessionIfAtHub(entryDirection: string = ""): void {
+  const p = connState?.player;
+  if (!p) return;
+  if (channelSession) return;  // real session takes precedence
+  if (p.in_channel) return;     // about to load a real session
+  if (p.current_segment !== 0) return;
+
+  if (hubBuiltAtSegment === 0 && session !== null) return;  // already built
+
+  const stats: PlayerStats = {
+    level: p.level,
+    strength: p.stats.strength,
+    dexterity: p.stats.dexterity,
+    constitution: p.stats.constitution,
+    intelligence: p.stats.intelligence,
+    equipAttack: p.effective_stats.equip_attack,
+    equipDefense: p.effective_stats.equip_defense,
+  };
+  session = DungeonSession.createHub(stats, p.hp, p.max_hp, entryDirection);
+  fov = new FovMap();
+  fov.update(session.playerX, session.playerY, session.dungeon);
+  camera.centerOn(session.playerX, session.playerY);
+  hubBuiltAtSegment = 0;
+}
 
 gspUrlInput.value = DEFAULT_GSP_URL;
 
@@ -86,10 +257,15 @@ connectBtn.addEventListener("click", () => {
   if (connState?.status === "connected" || connState?.status === "connecting") {
     connection.disconnect();
     moves = null;
+    session = null;
+    fov = null;
+    channelSession = false;
+    hubBuiltAtSegment = -1;
+    reconnectPromptShown = false;
   } else {
     const url = gspUrlInput.value.trim();
     const name = playerNameInput.value.trim();
-    moves = new MoveClient(DEFAULT_PROXY_URL);
+    moves = createMoveClient({ proxyUrl: DEFAULT_PROXY_URL });
     connection.connect(url, name);
   }
 });
@@ -105,6 +281,22 @@ function updateConnectionUI(): void {
   connectBtn.textContent = connected ? "Disconnect" : "Connect";
   gspUrlInput.disabled = connected;
   playerNameInput.disabled = connected;
+
+  // Block height (and discovery-cooldown countdown) in the topbar so the
+  // player can see the chain advancing and how many blocks remain on the
+  // cooldown.  Heights only move when a block is mined, so an unchanging
+  // number means the chain is idle.
+  if (s === "connected" && connState) {
+    let text = `Block: ${connState.currentHeight}`;
+    const p = connState.player;
+    if (p) {
+      const cd = discoveryCooldownRemaining(p, connState.currentHeight);
+      if (cd > 0) text += ` · discover in ${cd}`;
+    }
+    blockHeightEl.textContent = text;
+  } else {
+    blockHeightEl.textContent = "";
+  }
 }
 
 // --- Mode switching ---
@@ -168,8 +360,24 @@ function newStandaloneDungeon(): void {
   updateSidebar();
 }
 
+/**
+ * Build the gate-alignment constraint for a segment from its on-chain info,
+ * so the frontend regenerates the same constrained layout as the GSP. Empty
+ * when the segment was discovered unconstrained (e.g. from the hub).
+ */
+function constraintsFor(segInfo: SegmentInfo): Gate[] {
+  const dir = segInfo.constraint_dir;
+  if (!dir) return [];
+  const g = segInfo.gates[dir];
+  if (!g) return [];
+  return [{ x: g.x, y: g.y, direction: dir }];
+}
+
 /** Start a channel dungeon session using real on-chain player data. */
-function startChannelDungeon(segmentSeed: string, depth: number, segmentId: number, visitId: number): void {
+function startChannelDungeon(
+  segmentSeed: string, depth: number, segmentId: number, visitId: number,
+  constraints: Gate[] = [], entryDirection: string = "",
+): void {
   const p = connState?.player;
   if (!p) return;
 
@@ -195,13 +403,20 @@ function startChannelDungeon(segmentSeed: string, depth: number, segmentId: numb
     }
   }
 
-  session = new DungeonSession(segmentSeed, depth, stats, p.hp, p.max_hp, potions);
+  session = new DungeonSession(
+    segmentSeed, depth, stats, p.hp, p.max_hp, potions,
+    constraints, entryDirection);
   fov = new FovMap();
   fov.update(session.playerX, session.playerY, session.dungeon);
   camera.centerOn(session.playerX, session.playerY);
 
   setMode("dungeon");
 }
+
+
+const OPPOSITE_DIRECTION: Record<string, string> = {
+  north: "south", south: "north", east: "west", west: "east",
+};
 
 // --- Async actions (travel, enter channel, exit channel) ---
 
@@ -269,7 +484,11 @@ function diagnoseRejection(action: string, revalidate: () => ValidationResult): 
   }
   showErrorModal(
     `${action.charAt(0).toUpperCase() + action.slice(1)} move rejected`,
-    `The move was submitted but the GSP did not apply it. The most likely cause is a race with another player (someone else grabbed the coordinate, or the cooldown window advanced between click and block inclusion). Try again.`,
+    `The move was submitted but the GSP did not apply it. Likely causes: ` +
+      `you're out of HP (heal before entering a dungeon); the discovery ` +
+      `cooldown hasn't elapsed (it counts blocks, not real time — an idle ` +
+      `devnet doesn't advance it); another player grabbed the coordinate ` +
+      `first; or your local view is stale. Reconnect to refresh, then try again.`,
   );
 }
 
@@ -325,7 +544,11 @@ async function doEnterChannel(segmentId: number): Promise<void> {
     if (resolved && connState.player?.active_visit) {
       const segInfo = connState.segments.get(segmentId);
       if (segInfo) {
-        startChannelDungeon(segInfo.seed, segInfo.depth, segmentId, connState.player.active_visit.visit_id);
+        startChannelDungeon(
+          segInfo.seed, segInfo.depth, segmentId,
+          connState.player.active_visit.visit_id,
+          constraintsFor(segInfo),
+          connState.player.active_visit.entry_direction);
         busy = false;
         return;
       }
@@ -402,11 +625,21 @@ async function doExitChannel(): Promise<void> {
       });
     }
 
-    // Return to overworld.
+    // Exit complete.  Clear channel-session state; the connection
+    // callback will rebuild the hub session if we're back at segment 0
+    // (which is the case for both death-respawn and Pass A's gate flow).
+    // Pass B will replace this with an automatic transition into the
+    // neighbour's session via the gw move.
     channelSession = false;
     session = null;
     fov = null;
-    setMode("overworld");
+    hubBuiltAtSegment = -1;
+    ensureHubSessionIfAtHub();
+    if (!session) {
+      // Not at hub and no real session — fall back to the map view so
+      // the player can navigate.  Pass B removes this case.
+      setMode("overworld");
+    }
   } catch (e) {
     showErrorModal("Exit channel failed", e instanceof Error ? e.message : String(e));
   }
@@ -553,6 +786,142 @@ async function doUnequip(rowid: number): Promise<void> {
   updateSidebar();
 }
 
+/**
+ * Atomic gate-walk: settles current dungeon (if any) and transits to the
+ * neighbour in `dir`, entering its channel — all in one on-chain move.
+ * Auto-triggered when the player walks onto a gate tile, or when a
+ * dungeon session ends via the gate action.
+ */
+async function doGateWalk(dir: string): Promise<void> {
+  if (busy || !moves || !connState?.playerName) return;
+  const ctx = validatorContext();
+  if (!ctx) return;
+  if (!handleValidation(validateGateWalk(ctx, dir))) return;
+
+  // Build the settlement payload if we're settling a real dungeon run.
+  // We deliberately do NOT end the live session here: walking through a
+  // gate means survived=true, and the gate action is appended to the
+  // action log purely for the replay payload.  The session is torn down
+  // only *after* the chain confirms the transit (below), so a rejected
+  // gate-walk — refused client-side or by the GSP — leaves the run fully
+  // playable instead of stranding the player on the gate tile.
+  let settlement: undefined | {
+    results: { survived: boolean; xp: number; gold: number; kills: number };
+    actions: object[];
+  };
+  if (channelSession && session) {
+    const actions: object[] = session.actionLog.map(a =>
+      a.type === "use" ? { type: "use", item: a.itemId } : a);
+    actions.push({ type: "gate" });
+    settlement = {
+      results: {
+        survived: true,
+        xp: session.totalXp,
+        gold: session.totalGold,
+        kills: session.totalKills,
+      },
+      actions,
+    };
+  }
+
+  const wasInChannel = channelSession;
+  const sourceSeg = ctx.player.current_segment;
+  // Snapshot the current visit so we can detect the *actual* transit.
+  // A gw from inside a channel starts with in_channel=1 + an active
+  // visit, so we must wait for a DIFFERENT visit (every channel entry
+  // mints a fresh visit id) rather than for "in a channel" — otherwise
+  // waitFor resolves immediately on the stale pre-gw state and we
+  // re-enter the same segment at the opposite gate.
+  const beforeVisitId = ctx.player.active_visit?.visit_id ?? null;
+
+  busy = true;
+  updateSidebar();
+  showOverlay(
+    wasInChannel
+      ? `Settling dungeon and walking ${dir}...`
+      : `Walking ${dir}...`,
+  );
+
+  try {
+    await moves.gateWalk(connState.playerName, dir, settlement);
+
+    // Wait for the chain to reflect the transit.  Success looks like:
+    //   - entered a (new) channel — a visit id different from before, OR
+    //   - landed at the hub from somewhere else (current_segment==0,
+    //     !in_channel, and source was non-hub).
+    const resolved = await waitFor(connection, ({ player }) => {
+      if (!player) return false;
+      if (player.in_channel && player.active_visit
+          && player.active_visit.visit_id !== beforeVisitId) {
+        return true;
+      }
+      if (sourceSeg !== 0
+          && player.current_segment === 0
+          && !player.in_channel) {
+        return true;
+      }
+      return false;
+    });
+
+    if (!resolved) {
+      diagnoseRejection(
+        "gate walk",
+        () => validateGateWalk(validatorContext()!, dir),
+      );
+      return;
+    }
+
+    // gw only ever settles a survival exit (deaths go through xc, and
+    // the GSP refuses survived=false on gw), so report the run complete.
+    if (settlement) {
+      addOverworldMessage(
+        `Dungeon complete! +${settlement.results.xp} XP, +${settlement.results.gold} gold`,
+        "pickup",
+      );
+    }
+
+    // Tear down old session and load the new one based on where we
+    // ended up.
+    channelSession = false;
+    session = null;
+    fov = null;
+    hubBuiltAtSegment = -1;
+
+    const p = connState.player!;
+    if (p.in_channel && p.active_visit) {
+      // Entered a new channel — load that segment's dungeon.
+      const newSegId = p.active_visit.segment_id;
+      const segInfo = connState.segments.get(newSegId);
+      if (segInfo) {
+        // Regenerate the same constrained layout the GSP replay uses, and
+        // spawn at the gate the player entered through — both come from
+        // on-chain state so live play matches the replay byte-for-byte.
+        startChannelDungeon(
+          segInfo.seed, segInfo.depth, newSegId, p.active_visit.visit_id,
+          constraintsFor(segInfo), p.active_visit.entry_direction);
+      } else {
+        // Segment cache miss; force a refresh.  The session will load
+        // on the next poll via ensureHubSessionIfAtHub or manual retry.
+        showErrorModal(
+          "Missing segment data",
+          `The frontend doesn't have segment ${newSegId} cached. Reconnect to refresh.`,
+        );
+      }
+    } else if (p.current_segment === 0) {
+      // Arrived back at the hub: spawn at the gate we came in through
+      // (opposite the direction we walked).
+      ensureHubSessionIfAtHub(OPPOSITE_DIRECTION[dir] ?? "");
+    }
+  } catch (e) {
+    showErrorModal("Gate walk failed", e instanceof Error ? e.message : String(e));
+  } finally {
+    hideOverlay();
+    busy = false;
+    updateSidebar();
+    render();
+  }
+}
+
 async function doRegister(): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
   busy = true;
@@ -612,8 +981,19 @@ function render(): void {
   }
 }
 
+/**
+ * The segment the player is actually located in.  While in a channel the
+ * dungeon being played is `active_visit.segment_id`, which can differ from
+ * `current_segment` (the overworld node the player is based at) — the tile
+ * view loads the visit's segment, so the map and sidebar must agree.
+ */
+function playerLocationSegment(p: PlayerInfo): number {
+  return p.in_channel && p.active_visit ? p.active_visit.segment_id : p.current_segment;
+}
+
 function renderOverworld(): void {
-  const currentSeg = connState?.player?.current_segment ?? 0;
+  const p = connState?.player;
+  const currentSeg = p ? playerLocationSegment(p) : 0;
   drawOverworld(ctx, overworldNodes, currentSeg, selectedSegment, canvas.width, canvas.height);
 }
 
@@ -626,7 +1006,22 @@ function renderDungeon(): void {
     ctx.font = "16px monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText("Press N to start a new dungeon.", canvas.width / 2, canvas.height / 2);
+
+    let line1: string;
+    let line2: string;
+    if (connState?.status !== "connected") {
+      line1 = "Enter a GSP URL and player name in the top bar,";
+      line2 = "then click Connect.";
+    } else if (!connState.player) {
+      line1 = `Player "${connState.playerName}" doesn't exist on-chain yet.`;
+      line2 = "Click “Register Player” in the right-hand sidebar →";
+    } else {
+      line1 = "Loading hub...";
+      line2 = "";
+    }
+    ctx.fillText(line1, canvas.width / 2, canvas.height / 2 - 12);
+    if (line2)
+      ctx.fillText(line2, canvas.width / 2, canvas.height / 2 + 12);
     return;
   }
 
@@ -667,6 +1062,7 @@ function renderDungeon(): void {
 new InputHandler((action: string, dir?: Direction) => {
   if (mode !== "dungeon") return;
   if (!session || session.gameOver) return;
+  if (busy) return;  // an on-chain action is in flight
 
   let gameAction: GameAction | null = null;
   switch (action) {
@@ -674,15 +1070,25 @@ new InputHandler((action: string, dir?: Direction) => {
       if (dir) gameAction = { type: "move", dx: dir.dx, dy: dir.dy };
       break;
     case "pickup":
+      // Pickup is a no-op in the hub (no items there).
+      if (!channelSession) return;
       gameAction = { type: "pickup" };
       break;
     case "wait":
       gameAction = { type: "wait" };
       break;
-    case "gate":
-      gameAction = { type: "gate" };
-      break;
+    case "gate": {
+      // Pressing Enter on a gate is explicit intent: trigger gw directly
+      // in both the hub and a channel.  doGateWalk ends the in-session
+      // run itself (after validating), so we don't touch the session
+      // here — that keeps a rejected gw from stranding the run in a
+      // gameOver state.
+      const gate = gateAtPlayer();
+      if (gate) doGateWalk(gate.direction);
+      return;
+    }
     case "use_potion":
+      if (!channelSession) return;
       gameAction = { type: "use", itemId: "health_potion" };
       break;
   }
@@ -693,10 +1099,92 @@ new InputHandler((action: string, dir?: Direction) => {
     camera.centerOn(session.playerX, session.playerY);
     render();
     updateSidebar();
+
+    // If a "move" landed us on a gate (hub OR real dungeon), ask for
+    // confirmation before settling/transiting.  Easy to step on a gate
+    // by accident.  (Enter-on-a-gate is handled directly above.)
+    if (action === "move") {
+      const gate = gateAtPlayer();
+      if (gate) confirmGateWalk(gate.direction);
+    }
   }
 });
 
+/** Returns the gate at the player's current position, or null. */
+function gateAtPlayer(): { x: number; y: number; direction: string } | null {
+  if (!session) return null;
+  for (const g of session.dungeon.gates) {
+    if (g.x === session.playerX && g.y === session.playerY) return g;
+  }
+  return null;
+}
+
+/**
+ * Shows a confirmation modal before stepping through a gate.  Used when
+ * the player walks onto a gate tile (easy to do by accident).  Pressing
+ * Enter while already on a gate is treated as explicit intent and
+ * skips this confirmation — see the input handler.
+ */
+function confirmGateWalk(dir: string): void {
+  const p = connState?.player;
+  if (!p) return;
+
+  // Build a context-appropriate message based on what's on the other
+  // side of the gate.
+  let detail = "";
+  const curSeg = p.current_segment;
+  const opp = OPPOSITE_DIRECTION[dir];
+
+  // Find target via segment_links (hub uses inferred back-links).
+  let target: number | undefined;
+  if (curSeg === 0) {
+    for (const seg of (connState?.segments?.values() ?? [])) {
+      for (const [d, lnk] of Object.entries(seg.links)) {
+        if (lnk.to_segment === 0 && d === opp) { target = seg.id; break; }
+      }
+      if (target !== undefined) break;
+    }
+  } else {
+    const segInfo = connState?.segments.get(curSeg);
+    target = segInfo?.links[dir]?.to_segment;
+  }
+
+  if (target === undefined) {
+    const remaining = discoveryCooldownRemaining(p, connState?.currentHeight ?? 0);
+    if (remaining > 0) {
+      detail = `Discovers a new dungeon (currently on cooldown — wait ${remaining} block${remaining === 1 ? "" : "s"}).`;
+    } else {
+      detail = `Discovers a new dungeon (50-block cooldown will apply after).`;
+    }
+  } else if (target === 0) {
+    detail = `Returns you to the hub (0, 0).`;
+  } else {
+    const segInfo = connState?.segments.get(target);
+    if (segInfo) {
+      const coord = `(${segInfo.world_x}, ${segInfo.world_y})`;
+      const status = segInfo.confirmed ? "depth " + segInfo.depth
+                                       : `depth ${segInfo.depth}, provisional`;
+      detail = `Enters ${coord} (${status}).`;
+    } else {
+      detail = `Enters a new area.`;
+    }
+  }
+
+  showConfirmModal({
+    title: `Walk through the ${dir} gate?`,
+    message: detail,
+    confirmLabel: "Walk",
+    onConfirm: () => {
+      // doGateWalk validates first, then ends the in-session run itself
+      // (appending the gate action to the log for replay).  We don't
+      // touch the session here so a rejected gw leaves it playable.
+      doGateWalk(dir);
+    },
+  });
+}
+
 document.addEventListener("keydown", (e) => {
+  if (isEditableTarget(e.target)) return;
   if (mode === "dungeon" && e.key.toLowerCase() === "n" && !channelSession) {
     newStandaloneDungeon();
   }
@@ -751,7 +1239,11 @@ document.addEventListener("click", (e) => {
 // --- Sidebar updates ---
 
 function updateSidebar(): void {
-  if (mode === "overworld") {
+  // The dungeon-mode sidebar (turns, kills, "submit results") only makes
+  // sense when we're in an actual channel session.  When dungeon mode is
+  // rendering the hub, use the overworld sidebar so the player still has
+  // their stats, inventory, and stat-point/potion buttons.
+  if (mode === "overworld" || !channelSession) {
     updateOverworldStats();
     updateOverworldInventory();
     updateOverworldMessages();
@@ -787,14 +1279,25 @@ function updateOverworldStats(): void {
   const hpPct = Math.max(0, p.hp / p.max_hp * 100);
   const hpColor = hpPct > 60 ? "#4a4" : hpPct > 30 ? "#aa4" : "#c44";
 
+  // Location readout: the segment the player is actually in (the visit's
+  // segment while in a channel) plus its world coordinates, so the
+  // sidebar agrees with the map and tile view.
+  const locSeg = playerLocationSegment(p);
+  const locInfo = connState?.segments.get(locSeg);
+  const locCoord = locSeg === 0 ? "(0, 0)"
+    : locInfo ? `(${locInfo.world_x}, ${locInfo.world_y})` : "(?, ?)";
+  const locLabel = `${locCoord}${p.in_channel ? " · in dungeon" : ""}`;
+
   let selectedInfo = "";
   if (selectedSegment !== null) {
     const selNode = overworldNodes.get(selectedSegment);
     const isAdjacentDir = areLinked(overworldNodes, p.current_segment, selectedSegment);
     const isCurrent = selectedSegment === p.current_segment;
 
+    const selCoord = selectedSegment === 0 ? "(0, 0)"
+      : selNode ? `(${selNode.worldX}, ${selNode.worldY})` : `(?, ?)`;
     selectedInfo = `<div style="margin-top:8px;border-top:1px solid #333;padding-top:8px">`;
-    selectedInfo += `<div style="color:#aaf;font-weight:bold">Segment ${selectedSegment}</div>`;
+    selectedInfo += `<div style="color:#aaf;font-weight:bold">${selCoord}</div>`;
 
     if (selNode) {
       selectedInfo += `<div class="stat-row"><span class="stat-label">Depth</span><span class="stat-value">${selNode.depth}</span></div>`;
@@ -880,7 +1383,7 @@ function updateOverworldStats(): void {
     </div>
     <div class="stat-row"><span class="stat-label">XP</span><span class="stat-value">${p.xp}</span></div>
     <div class="stat-row"><span class="stat-label">Gold</span><span class="stat-value">${p.gold}</span></div>
-    <div class="stat-row"><span class="stat-label">Segment</span><span class="stat-value">${p.current_segment}${p.in_channel ? " (in dungeon)" : ""}</span></div>
+    <div class="stat-row"><span class="stat-label">Location</span><span class="stat-value">${locLabel}</span></div>
     <div style="margin-top:6px;color:#888;font-size:11px">
       STR ${p.stats.strength} DEX ${p.stats.dexterity}
       CON ${p.stats.constitution} INT ${p.stats.intelligence}
@@ -979,16 +1482,28 @@ function updateDungeonStats(): void {
   const hpPct = Math.max(0, session.playerHp / session.playerMaxHp * 100);
   const hpColor = hpPct > 60 ? "#4a4" : hpPct > 30 ? "#aa4" : "#c44";
 
-  const channelLabel = channelSession
-    ? `<div style="color:#aaf;font-size:11px">Channel session (seg ${channelSegmentId})</div>` : "";
+  let channelLabel = "";
+  if (channelSession) {
+    const segInfo = connState?.segments.get(channelSegmentId);
+    const coord = channelSegmentId === 0 ? "(0, 0)"
+      : segInfo ? `(${segInfo.world_x}, ${segInfo.world_y})` : "(?, ?)";
+    channelLabel = `<div style="color:#aaf;font-size:11px">${coord}</div>`;
+  }
 
   let endButtons = "";
   if (session.gameOver) {
     if (channelSession) {
-      endButtons = `
-        <button data-action="exit-channel" class="action-btn action-enter" ${busy ? "disabled" : ""}>
-          Submit Results On-Chain
-        </button>`;
+      // Survival exits are auto-settled by gw when the player walks
+      // onto the gate.  Only deaths need a manual submit (gw refuses
+      // survived=false; xc applies the death penalty).
+      if (!session.survived) {
+        endButtons = `
+          <button data-action="exit-channel" class="action-btn action-enter" ${busy ? "disabled" : ""}>
+            Respawn at Hub
+          </button>`;
+      } else {
+        endButtons = `<div style="margin-top:6px;color:#888;font-size:11px">Settling on-chain...</div>`;
+      }
     } else {
       endButtons = `
         <button data-action="restart" class="action-btn">New Dungeon</button>`;
@@ -1054,4 +1569,4 @@ function updateDungeonMessages(): void {
 
 // --- Start ---
 
-setMode("overworld");
+setMode("dungeon");

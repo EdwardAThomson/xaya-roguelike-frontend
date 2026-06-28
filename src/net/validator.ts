@@ -238,6 +238,88 @@ export function validateUseItem(
   return { ok: true };
 }
 
+/** Mirror of moveparser.cpp::HandleGateWalk. */
+export function validateGateWalk(
+  ctx: ValidatorContext, dir: string,
+): ValidationResult {
+  const p = ctx.player;
+
+  if (p.hp <= 0) {
+    return err("dead", "Out of HP",
+      "You have 0 HP. Heal before walking through a gate.");
+  }
+  if (!VALID_DIRS.has(dir)) {
+    return err("invalid_dir", "Invalid direction",
+      `"${dir}" is not a valid direction.`);
+  }
+
+  // Look up the target via the current segment's links.
+  const curSeg = p.current_segment;
+  let targetSeg: number | undefined;
+  let targetExists = false;
+
+  if (curSeg === 0) {
+    // Hub: inferred from neighbours that link back to 0.
+    const opp = OPPOSITE[dir];
+    for (const seg of ctx.segments.values()) {
+      for (const [d, lnk] of Object.entries(seg.links)) {
+        if (lnk.to_segment === 0 && d === opp) {
+          targetSeg = seg.id;
+          targetExists = true;
+          break;
+        }
+      }
+      if (targetExists) break;
+    }
+  } else {
+    const segInfo = ctx.segments.get(curSeg);
+    if (!segInfo) {
+      return err("unknown_segment", "Unknown segment",
+        `Your current segment is not in the frontend's cache. Try reconnecting.`);
+    }
+    const lnk = segInfo.links[dir];
+    if (lnk) {
+      targetSeg = lnk.to_segment;
+      targetExists = true;
+    }
+  }
+
+  if (!targetExists) {
+    // Would need to discover.  Cooldown + coord-occupied checks.
+    const remaining = discoveryCooldownRemaining(p, ctx.currentHeight);
+    if (remaining > 0) {
+      return err("cooldown", "Cooldown",
+        `Walking through an unexplored gate needs a discover, but you're on cooldown for ${remaining} more block${remaining === 1 ? "" : "s"}.`);
+    }
+
+    // Compute target world coord.
+    let srcX = 0, srcY = 0;
+    if (curSeg !== 0) {
+      const segInfo = ctx.segments.get(curSeg)!;
+      srcX = segInfo.world_x;
+      srcY = segInfo.world_y;
+    }
+    const targetX = srcX + (DIR_DX[dir] ?? 0);
+    const targetY = srcY + (DIR_DY[dir] ?? 0);
+    for (const seg of ctx.segments.values()) {
+      if (seg.world_x === targetX && seg.world_y === targetY) {
+        return err("coord_occupied", "Coordinate already claimed",
+          `Another player has claimed the segment at (${targetX}, ${targetY}). Pick a different gate.`);
+      }
+    }
+  } else if (targetSeg !== undefined && targetSeg !== 0) {
+    // Existing non-hub segment.  Provisional segments can only be
+    // entered by the discoverer.
+    const segInfo = ctx.segments.get(targetSeg);
+    if (segInfo && !segInfo.confirmed && segInfo.discoverer !== p.name) {
+      return err("not_discoverer", "Segment is provisional",
+        `Only ${segInfo.discoverer} can enter this segment while it is provisional. Wait for them to confirm it, then you can join.`);
+    }
+  }
+
+  return { ok: true };
+}
+
 /** Mirror of moveparser.cpp::HandleAllocateStat. */
 export function validateAllocateStat(
   ctx: ValidatorContext, stat: string,

@@ -83,3 +83,70 @@ export function showErrorModal(title: string, message: string): void {
 export function showInfoModal(title: string, message: string): void {
   showModal({ title, message, variant: "info" });
 }
+
+export interface ConfirmModalOptions {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  onConfirm: () => void;
+  onCancel?: () => void;
+  /**
+   * If false, Esc and backdrop click do NOT dismiss the modal — the
+   * user must click one of the two buttons explicitly.  Useful when
+   * both choices have consequences (e.g. reconnect prompt: Continue
+   * vs Forfeit) and a stray Esc could fire the wrong one.  Defaults
+   * to true (standard confirm behaviour).
+   */
+  dismissibleByEscape?: boolean;
+}
+
+/**
+ * Two-button confirmation modal.  Confirm is focused by default so the
+ * user can press Enter to accept (or Esc / Cancel button to back out).
+ */
+export function showConfirmModal(opts: ConfirmModalOptions): void {
+  document.getElementById("modal-root")?.remove();
+
+  const root = document.createElement("div");
+  root.id = "modal-root";
+  root.className = "modal-overlay";
+  root.innerHTML = `
+    <div class="modal modal-info" role="alertdialog" aria-modal="true">
+      <div class="modal-title">${escapeHtml(opts.title)}</div>
+      <div class="modal-body">${escapeHtml(opts.message)}</div>
+      <div class="modal-actions">
+        <button class="modal-cancel">${escapeHtml(opts.cancelLabel ?? "Cancel")}</button>
+        <button class="modal-dismiss modal-confirm">${escapeHtml(opts.confirmLabel ?? "Confirm")}</button>
+      </div>
+    </div>
+  `;
+
+  const close = (accept: boolean) => {
+    root.remove();
+    document.removeEventListener("keydown", onKey);
+    if (accept) opts.onConfirm();
+    else opts.onCancel?.();
+  };
+
+  const escDismissible = opts.dismissibleByEscape ?? true;
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape" && escDismissible) {
+      e.preventDefault();
+      close(false);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      close(true);
+    }
+  };
+
+  root.addEventListener("click", (e) => {
+    if (e.target === root && escDismissible) close(false);
+  });
+  root.querySelector(".modal-cancel")!.addEventListener("click", () => close(false));
+  root.querySelector(".modal-confirm")!.addEventListener("click", () => close(true));
+  document.addEventListener("keydown", onKey);
+
+  document.body.appendChild(root);
+  (root.querySelector(".modal-confirm") as HTMLButtonElement).focus();
+}

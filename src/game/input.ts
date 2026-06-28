@@ -24,6 +24,18 @@ const keyMap: Record<string, Direction> = {
 
 export type InputCallback = (action: string, dir?: Direction) => void;
 
+/**
+ * True when the keydown target is something the user is typing into:
+ * an input, textarea, select, or contenteditable element.  Used to
+ * skip game-key interception so form fields work normally.
+ */
+export function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+  return target.isContentEditable;
+}
+
 export class InputHandler {
   private callback: InputCallback;
 
@@ -33,6 +45,12 @@ export class InputHandler {
   }
 
   private onKey(e: KeyboardEvent): void {
+    // Don't intercept keystrokes while the user is typing into a form
+    // control or contenteditable element — they need those keys for
+    // actual text input.  Without this, a/w/s/d/q/e/z/c/g/p/Enter/Space
+    // get swallowed by preventDefault() and never reach the input.
+    if (isEditableTarget(e.target)) return;
+
     // Movement.
     const dir = keyMap[e.key];
     if (dir) {

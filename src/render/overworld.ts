@@ -120,14 +120,12 @@ export function drawOverworld(
       ctx.fillText("@", cx + half - 3, cy - half + 3);
     }
 
-    // Segment ID.
+    // World coordinates as the node's identity.
     ctx.fillStyle = isCurrent ? "#fff" : isSelected ? "#ddf" : "#ccc";
-    ctx.font = "bold 16px monospace";
+    ctx.font = "bold 15px monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    const label = isOrigin ? "HUB"
-                : node.provisional ? `#${node.id}?`
-                : `#${node.id}`;
+    const label = `(${node.worldX}, ${node.worldY})${node.provisional ? "?" : ""}`;
     ctx.fillText(label, cx, cy - 8);
 
     // Depth label (or "Provisional" hint).

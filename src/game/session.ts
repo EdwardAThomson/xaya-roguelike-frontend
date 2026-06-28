@@ -5,7 +5,7 @@
 
 import { MT19937 } from "./rng.js";
 import { hashSeedSync } from "./hash.js";
-import { Dungeon, Tile, WIDTH, HEIGHT } from "./dungeon.js";
+import { Dungeon, Gate, Tile, WIDTH, HEIGHT } from "./dungeon.js";
 import { Monster, spawnMonsters } from "./monsters.js";
 import { PlayerStats, playerAttackMonster, monsterAttackPlayer } from "./combat.js";
 import { lookupItem, getSpawnableItems } from "./items.js";
@@ -66,7 +66,8 @@ export class DungeonSession {
   actionLog: GameAction[] = [];
 
   constructor(seed: string, depth: number, stats: PlayerStats,
-              hp: number, maxHp: number, startingPotions: CollectedItem[] = []) {
+              hp: number, maxHp: number, startingPotions: CollectedItem[] = [],
+              constraints: Gate[] = [], entryDirection: string = "") {
     this.depth = depth;
     this.stats = stats;
     this.playerHp = hp;
@@ -75,14 +76,35 @@ export class DungeonSession {
     // Seed the RNG — must match C++ dungeongame.cpp.
     this.rng = new MT19937(hashSeedSync(seed + ":game:" + depth));
 
-    // Generate dungeon.
-    this.dungeon = Dungeon.generate(seed, depth);
+    // Generate dungeon.  When the segment was discovered with a gate
+    // aligned to its neighbour, regenerate with that same constraint so the
+    // layout matches the GSP replay byte-for-byte.
+    this.dungeon = Dungeon.generate(seed, depth, constraints);
 
-    // Player starts at center of first room.
-    if (this.dungeon.rooms.length > 0) {
-      const r = this.dungeon.rooms[0];
-      this.playerX = r.x + Math.floor(r.width / 2);
-      this.playerY = r.y + Math.floor(r.height / 2);
+    // Spawn: one tile inside the entry gate if we came in through one;
+    // otherwise at the first room's centre.  Must match DungeonGame::Create.
+    let spawned = false;
+    if (entryDirection) {
+      const gate = this.dungeon.gates.find(g => g.direction === entryDirection);
+      if (gate) {
+        this.playerX = gate.x;
+        this.playerY = gate.y;
+        if (entryDirection === "north") this.playerY += 1;
+        else if (entryDirection === "south") this.playerY -= 1;
+        else if (entryDirection === "east") this.playerX -= 1;
+        else if (entryDirection === "west") this.playerX += 1;
+        spawned = true;
+      }
+    }
+    if (!spawned) {
+      if (this.dungeon.rooms.length > 0) {
+        const r = this.dungeon.rooms[0];
+        this.playerX = r.x + Math.floor(r.width / 2);
+        this.playerY = r.y + Math.floor(r.height / 2);
+      } else {
+        this.playerX = Math.floor(WIDTH / 2);
+        this.playerY = Math.floor(HEIGHT / 2);
+      }
     }
 
     // Spawn monsters (must match C++ order).
@@ -103,6 +125,61 @@ export class DungeonSession {
     }
 
     this.addMessage("You enter the dungeon. Depth " + depth + ".", "info");
+  }
+
+  /**
+   * Creates a hub session (segment 0): empty 80x40 room with 4 gates,
+   * no monsters, no items, no combat.  Used as the default view when
+   * the player is at the hub (not in a real dungeon session).
+   */
+  static createHub(
+    stats: PlayerStats, hp: number, maxHp: number,
+    entryDirection: string = "",
+  ): DungeonSession {
+    const s: DungeonSession = Object.create(DungeonSession.prototype);
+    s.depth = 0;
+    s.stats = stats;
+    s.playerHp = hp;
+    s.playerMaxHp = maxHp;
+    s.rng = new MT19937(0);  // unused — no procedural content
+    s.dungeon = Dungeon.buildHub();
+
+    // Spawn one tile inside the gate we entered through (so arriving back
+    // at the hub feels like stepping through the door), else room centre.
+    // The hub is never replayed, so this is purely cosmetic.
+    let spawned = false;
+    if (entryDirection) {
+      const gate = s.dungeon.gates.find(g => g.direction === entryDirection);
+      if (gate) {
+        s.playerX = gate.x;
+        s.playerY = gate.y;
+        if (entryDirection === "north") s.playerY += 1;
+        else if (entryDirection === "south") s.playerY -= 1;
+        else if (entryDirection === "east") s.playerX -= 1;
+        else if (entryDirection === "west") s.playerX += 1;
+        spawned = true;
+      }
+    }
+    if (!spawned) {
+      const r = s.dungeon.rooms[0];
+      s.playerX = r.x + Math.floor(r.width / 2);
+      s.playerY = r.y + Math.floor(r.height / 2);
+    }
+
+    s.monsters = [];
+    s.groundItems = [];
+    s.loot = [];
+    s.turnCount = 0;
+    s.totalXp = 0;
+    s.totalGold = 0;
+    s.totalKills = 0;
+    s.gameOver = false;
+    s.survived = false;
+    s.exitGate = "";
+    s.messages = [];
+    s.actionLog = [];
+    s.addMessage("Welcome to the hub. Walk to a gate to head out.", "info");
+    return s;
   }
 
   addMessage(text: string, type: GameMessage["type"]): void {

@@ -45,7 +45,7 @@ export interface PlayerInfo {
     item_data?: string;
   }>;
   known_spells: string[];
-  active_visit: { visit_id: number; segment_id: number } | null;
+  active_visit: { visit_id: number; segment_id: number; entry_direction: string } | null;
 }
 
 export interface SegmentSummary {
@@ -70,6 +70,10 @@ export interface SegmentInfo {
   world_x: number;
   world_y: number;
   confirmed: boolean;
+  // Direction of the gate aligned to the neighbour this segment was
+  // discovered from ("" = unconstrained). Used to regenerate the same
+  // constrained layout the GSP replay uses.
+  constraint_dir: string;
   gates: Record<string, { x: number; y: number }>;
   links: Record<string, { to_segment: number; to_direction: string }>;
   visits: Array<{
