@@ -21,10 +21,10 @@ without `?e2e=1`, so it never ships in normal play or the hosted demo.
 In three terminals:
 
 ```bash
-# 1. backend stack (GSP + move proxy). For the agent, disable the public
-#    rate limit so automated play isn't throttled:
+# 1. backend stack (GSP + move proxy). The per-IP rate limit defaults OFF
+#    locally, so automated play isn't throttled — no flag needed.
 source ~/Explore/xayax/.venv/bin/activate
-ROG_RATE_LIMIT_MAX=0 python3 devnet/frontend_devnet.py   # in the xayaroguelike repo
+python3 devnet/frontend_devnet.py         # in the xayaroguelike repo
 
 # 2. frontend static server
 python3 serve.py 8000                     # in this repo
@@ -37,8 +37,9 @@ Env: `ROG_URL` (default `http://localhost:8000`), `ROG_HEADED=1` to watch the
 browser, `ROG_OUTBOUND` (agent, default 4) how many new segments to open,
 `ROG_TICKS` (agent, default 600).
 
-Note: leave the public rate limit on (`ROG_RATE_LIMIT_MAX` unset) for the
-real demo; only disable it for the agent's fast automated play.
+Note: the rate limit is OFF for the local devnet by default; the hosted
+deploy (`run_sandbox.sh`) turns it on. Set `ROG_RATE_LIMIT_MAX=N` to enable
+it locally if you want to test that path.
 
 ## Isolation caveat
 
