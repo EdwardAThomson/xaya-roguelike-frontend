@@ -86,6 +86,12 @@ export class MoveClient {
     await this.transport.mine();
   }
 
+  /** Permanently destroys a bag item. */
+  async discard(name: string, rowid: number): Promise<void> {
+    await this.transport.submitMove(name, { di: { rowid } });
+    await this.transport.mine();
+  }
+
   /**
    * Atomic gate-walk: optionally settles the current dungeon and
    * transits into the neighbour in `dir` (discovering it first if

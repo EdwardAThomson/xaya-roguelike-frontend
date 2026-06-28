@@ -37,7 +37,8 @@ export type ValidationErrorCode =
   | "not_in_bag"
   | "already_in_bag"
   | "invalid_stat"
-  | "wrong_slot";
+  | "wrong_slot"
+  | "equipped";
 
 export interface ValidatorContext {
   player: PlayerInfo;
@@ -382,6 +383,27 @@ export function validateUnequip(
   if (item.slot === "bag") {
     return err("not_in_bag", "Item not equipped",
       `${item.item_id} is already in your bag.`);
+  }
+  return { ok: true };
+}
+
+/** Mirror of moveparser.cpp::HandleDiscard. */
+export function validateDiscard(
+  ctx: ValidatorContext, rowid: number,
+): ValidationResult {
+  const p = ctx.player;
+  if (p.in_channel) {
+    return err("in_channel", "In a dungeon",
+      "You are currently in a dungeon channel. Exit it before discarding items.");
+  }
+  const item = p.inventory.find((i) => i.rowid === rowid);
+  if (!item) {
+    return err("no_item", "Item not found",
+      "That inventory item no longer exists. Refresh and try again.");
+  }
+  if (item.slot !== "bag") {
+    return err("equipped", "Item equipped",
+      `${item.item_id} is equipped in the ${item.slot} slot. Unequip it before discarding.`);
   }
   return { ok: true };
 }

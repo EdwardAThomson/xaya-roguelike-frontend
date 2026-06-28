@@ -27,6 +27,7 @@ import {
   ValidatorContext, ValidationResult,
   validateDiscover, validateTravel, validateEnterChannel,
   validateUseItem, validateAllocateStat, validateEquip, validateUnequip,
+  validateDiscard,
   validateGateWalk,
   discoveryCooldownRemaining,
 } from "./net/validator.js";
@@ -796,6 +797,39 @@ async function doUnequip(rowid: number): Promise<void> {
   updateSidebar();
 }
 
+function doDiscard(rowid: number): void {
+  if (busy || !moves || !connState?.playerName) return;
+  const ctx = validatorContext();
+  if (!ctx) return;
+  if (!handleValidation(validateDiscard(ctx, rowid))) return;
+
+  const item = ctx.player.inventory.find(i => i.rowid === rowid);
+  const label = item ? (lookupItem(item.item_id)?.name ?? item.item_id) : "this item";
+
+  showConfirmModal({
+    title: "Discard item?",
+    message: `Permanently destroy ${label}? This cannot be undone.`,
+    confirmLabel: "Discard",
+    onConfirm: async () => {
+      if (busy || !moves || !connState?.playerName) return;
+      busy = true;
+      updateSidebar();
+      try {
+        await moves.discard(connState.playerName, rowid);
+        addOverworldMessage(`Discarded ${label}.`, "info");
+        const resolved = await waitFor(connection, ({ player }) =>
+          !!player && !player.inventory.some(i => i.rowid === rowid));
+        if (!resolved)
+          diagnoseRejection("discard", () => validateDiscard(validatorContext()!, rowid));
+      } catch (e) {
+        showErrorModal("Discard failed", e instanceof Error ? e.message : String(e));
+      }
+      busy = false;
+      updateSidebar();
+    },
+  });
+}
+
 /**
  * Atomic gate-walk: settles current dungeon (if any) and transits to the
  * neighbour in `dir`, entering its channel — all in one on-chain move.
@@ -1195,6 +1229,14 @@ function confirmGateWalk(dir: string): void {
 
 document.addEventListener("keydown", (e) => {
   if (isEditableTarget(e.target)) return;
+  if (e.key === "Escape" && inventoryOpen) {
+    setInventoryOpen(false);
+    return;
+  }
+  if (e.key.toLowerCase() === "i" && connState?.player) {
+    setInventoryOpen(!inventoryOpen);
+    return;
+  }
   if (mode === "dungeon" && e.key.toLowerCase() === "n" && !channelSession) {
     newStandaloneDungeon();
   }
@@ -1243,8 +1285,167 @@ document.addEventListener("click", (e) => {
     case "unequip":
       doUnequip(Number(target.dataset.rowid));
       break;
+    case "discard":
+      doDiscard(Number(target.dataset.rowid));
+      break;
+    case "open-inventory":
+      setInventoryOpen(true);
+      break;
+    case "close-inventory":
+      setInventoryOpen(false);
+      break;
   }
 });
+
+// --- Inventory & equipment modal ---
+
+/** Equipment slots in display order, matching the GSP's slot names. */
+const EQUIP_SLOTS: Array<{ slot: string; label: string; icon: string }> = [
+  { slot: "weapon",  label: "Weapon",   icon: "⚔️" },
+  { slot: "offhand", label: "Off-hand", icon: "🛡️" },
+  { slot: "head",    label: "Head",     icon: "⛑️" },
+  { slot: "body",    label: "Body",     icon: "👕" },
+  { slot: "feet",    label: "Feet",     icon: "👢" },
+  { slot: "ring",    label: "Ring",     icon: "💍" },
+  { slot: "amulet",  label: "Amulet",   icon: "📿" },
+];
+
+let inventoryOpen = false;
+
+function setInventoryOpen(open: boolean): void {
+  inventoryOpen = open;
+  document.body.classList.toggle("inv-open", open);
+  renderInventoryModal();
+}
+
+/** Short stat-bonus summary for an item, e.g. "ATK +5, STR +1". */
+function itemStatLine(itemId: string): string {
+  const d = lookupItem(itemId);
+  if (!d) return "";
+  const parts: string[] = [];
+  if (d.attackPower) parts.push(`ATK +${d.attackPower}`);
+  if (d.defense) parts.push(`DEF +${d.defense}`);
+  if (d.strength) parts.push(`STR ${d.strength > 0 ? "+" : ""}${d.strength}`);
+  if (d.dexterity) parts.push(`DEX ${d.dexterity > 0 ? "+" : ""}${d.dexterity}`);
+  if (d.constitution) parts.push(`CON ${d.constitution > 0 ? "+" : ""}${d.constitution}`);
+  if (d.intelligence) parts.push(`INT ${d.intelligence > 0 ? "+" : ""}${d.intelligence}`);
+  if (d.maxHealth) parts.push(`HP +${d.maxHealth}`);
+  if (d.healAmount) parts.push(`heals ${d.healAmount}`);
+  return parts.join(", ");
+}
+
+function itemIcon(itemId: string): string {
+  return lookupItem(itemId)?.icon ?? "📦";
+}
+function itemName(itemId: string): string {
+  return lookupItem(itemId)?.name ?? itemId;
+}
+function itemColor(itemId: string): string {
+  return lookupItem(itemId)?.color ?? "#ccc";
+}
+
+function renderInventoryModal(): void {
+  document.getElementById("inventory-modal")?.remove();
+  if (!inventoryOpen) return;
+
+  const p = connState?.player;
+  if (!p) { inventoryOpen = false; document.body.classList.remove("inv-open"); return; }
+
+  // On-chain inventory is the truth everywhere.  Equip/use/discard are
+  // chain moves the GSP rejects mid-channel, so they're only active in
+  // the hub; inside a dungeon the modal is read-only + pending finds.
+  const interactive = !!moves && !p.in_channel && !busy;
+  const equipped = new Map<string, typeof p.inventory[number]>();
+  for (const it of p.inventory) if (it.slot !== "bag") equipped.set(it.slot, it);
+  const bag = p.inventory.filter(it => it.slot === "bag");
+
+  const equipHtml = EQUIP_SLOTS.map(s => {
+    const it = equipped.get(s.slot);
+    if (!it) {
+      return `<div class="inv-slot inv-slot-empty">
+        <span class="inv-slot-icon">${s.icon}</span>
+        <span class="inv-slot-label">${s.label}</span>
+        <span class="inv-empty">empty</span></div>`;
+    }
+    const stat = itemStatLine(it.item_id);
+    const unequipBtn = interactive
+      ? `<button class="inv-btn unequip" data-action="unequip" data-rowid="${it.rowid}">Unequip</button>`
+      : "";
+    return `<div class="inv-slot">
+      <span class="inv-slot-icon">${itemIcon(it.item_id)}</span>
+      <span class="inv-slot-label">${s.label}</span>
+      <span class="inv-item-name" style="color:${itemColor(it.item_id)}">${itemName(it.item_id)}</span>
+      ${stat ? `<span class="inv-stat">${stat}</span>` : ""}
+      ${unequipBtn}</div>`;
+  }).join("");
+
+  const bagHtml = bag.length === 0
+    ? '<div class="inv-empty">Bag is empty</div>'
+    : bag.map(it => {
+        const def = lookupItem(it.item_id);
+        const canEquip = def && def.slot !== "" && def.type !== "potion" && def.type !== "misc";
+        const canUse = def && def.type === "potion";
+        const stat = itemStatLine(it.item_id);
+        const btns = interactive ? [
+          canEquip ? `<button class="inv-btn equip" data-action="equip" data-rowid="${it.rowid}" data-slot="${def!.slot}">Equip</button>` : "",
+          canUse ? `<button class="inv-btn use" data-action="use-item" data-item="${it.item_id}">Use</button>` : "",
+          `<button class="inv-btn discard" data-action="discard" data-rowid="${it.rowid}">Drop</button>`,
+        ].join("") : "";
+        const qty = it.quantity > 1 ? ` x${it.quantity}` : "";
+        return `<div class="inv-row">
+          <span class="inv-item-icon">${itemIcon(it.item_id)}</span>
+          <span class="inv-item-name" style="color:${itemColor(it.item_id)}">${itemName(it.item_id)}${qty}</span>
+          ${stat ? `<span class="inv-stat">${stat}</span>` : ""}
+          <span class="inv-row-actions">${btns}</span></div>`;
+      }).join("");
+
+  // Pending finds collected during the current run (settle on a winning exit).
+  let pendingHtml = "";
+  if (channelSession && session && session.collected.length > 0) {
+    const rows = session.collected.filter(c => c.quantity > 0).map(c =>
+      `<div class="inv-row inv-pending">
+        <span class="inv-item-icon">${itemIcon(c.itemId)}</span>
+        <span class="inv-item-name" style="color:${itemColor(c.itemId)}">${itemName(c.itemId)}${c.quantity > 1 ? ` x${c.quantity}` : ""}</span>
+        <span class="inv-stat">${itemStatLine(c.itemId)}</span></div>`).join("");
+    pendingHtml = `<div class="inv-pending-box">
+      <div class="inv-pending-title">Collected this run (not saved until you exit through a gate)</div>
+      ${rows}</div>`;
+  }
+
+  const note = p.in_channel
+    ? '<div class="inv-note">In a dungeon: inventory is locked until you settle.</div>'
+    : "";
+
+  const root = document.createElement("div");
+  root.id = "inventory-modal";
+  root.className = "modal-overlay";
+  root.innerHTML = `
+    <div class="inv-modal" role="dialog" aria-modal="true">
+      <div class="inv-header">
+        <span class="inv-title">Inventory &amp; Equipment</span>
+        <span class="inv-gold">🪙 ${p.gold}</span>
+        <button class="inv-close" data-action="close-inventory">✕</button>
+      </div>
+      ${note}
+      <div class="inv-body">
+        <div class="inv-bag">
+          <div class="inv-col-title">Bag (${bag.length})</div>
+          ${bagHtml}
+          ${pendingHtml}
+        </div>
+        <div class="inv-equip">
+          <div class="inv-col-title">Equipped</div>
+          ${equipHtml}
+        </div>
+      </div>
+      <div class="inv-foot">Press I or Esc to close</div>
+    </div>`;
+  // Backdrop click closes.
+  root.addEventListener("click", (e) => {
+    if (e.target === root) setInventoryOpen(false);
+  });
+  document.body.appendChild(root);
+}
 
 // --- Sidebar updates ---
 
@@ -1262,6 +1463,8 @@ function updateSidebar(): void {
     updateDungeonInventory();
     updateDungeonMessages();
   }
+  // Keep the inventory modal (if open) in sync with state polls.
+  if (inventoryOpen) renderInventoryModal();
 }
 
 // --- Overworld sidebar ---
@@ -1545,21 +1748,32 @@ function updateDungeonStats(): void {
 
 function updateDungeonInventory(): void {
   const el = document.getElementById("inventory-display")!;
+  const p = connState?.player;
 
-  if (!session) {
-    el.innerHTML = '<div style="color:#666">Empty</div>';
-    return;
+  // Show the player's real (on-chain) inventory here too, so the panel is
+  // consistent with the hub.  Items found this run are listed separately
+  // as pending (they settle only on a winning exit).  Full management is
+  // in the modal (I), which is read-only while in a dungeon.
+  const lines: string[] = [];
+  if (p && p.inventory.length > 0) {
+    for (const it of p.inventory) {
+      const slot = it.slot === "bag" ? "" : ` [${it.slot}]`;
+      const qty = it.quantity > 1 ? ` x${it.quantity}` : "";
+      lines.push(`<div class="inventory-item"><span>${itemIcon(it.item_id)} ${itemName(it.item_id)}${qty}</span><span class="slot-equipped">${slot}</span></div>`);
+    }
+  } else {
+    lines.push('<div style="color:#666">Empty</div>');
   }
 
-  const items = session.loot.filter(l => l.quantity > 0);
-  if (items.length === 0) {
-    el.innerHTML = '<div style="color:#666">Empty</div>';
-    return;
+  const pending = session ? session.collected.filter(l => l.quantity > 0) : [];
+  if (pending.length > 0) {
+    lines.push('<div style="margin-top:6px;color:#c9b24a;font-size:11px">Collected this run (pending):</div>');
+    for (const l of pending) {
+      lines.push(`<div class="inventory-item" style="opacity:0.85"><span>${itemIcon(l.itemId)} ${itemName(l.itemId)}${l.quantity > 1 ? ` x${l.quantity}` : ""}</span></div>`);
+    }
   }
 
-  el.innerHTML = items
-    .map(l => `<div>${l.itemId} x${l.quantity}</div>`)
-    .join("");
+  el.innerHTML = lines.join("");
 }
 
 function updateDungeonMessages(): void {

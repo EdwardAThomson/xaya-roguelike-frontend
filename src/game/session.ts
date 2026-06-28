@@ -50,6 +50,14 @@ export class DungeonSession {
   groundItems: GroundItem[] = [];
   loot: CollectedItem[] = [];
 
+  /**
+   * Items picked up during this run, tracked separately from `loot` (which
+   * is seeded with carried potions and decremented as they are drunk).
+   * Display-only: shown as "collected this run (pending)" until the run
+   * settles. Does not affect gameplay determinism.
+   */
+  collected: CollectedItem[] = [];
+
   turnCount: number = 0;
   totalXp: number = 0;
   totalGold: number = 0;
@@ -169,6 +177,7 @@ export class DungeonSession {
     s.monsters = [];
     s.groundItems = [];
     s.loot = [];
+    s.collected = [];
     s.turnCount = 0;
     s.totalXp = 0;
     s.totalGold = 0;
@@ -276,6 +285,9 @@ export class DungeonSession {
           } else {
             this.loot.push({ itemId: item.itemId, quantity: item.quantity });
           }
+          const got = this.collected.find(l => l.itemId === item.itemId);
+          if (got) got.quantity += item.quantity;
+          else this.collected.push({ itemId: item.itemId, quantity: item.quantity });
           const def = lookupItem(item.itemId);
           this.addMessage(`Picked up ${def?.name ?? item.itemId}`, "pickup");
         }

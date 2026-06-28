@@ -51,6 +51,9 @@ export class InputHandler {
     // get swallowed by preventDefault() and never reach the input.
     if (isEditableTarget(e.target)) return;
 
+    // Don't drive the dungeon while the inventory modal is open.
+    if (document.body.classList.contains("inv-open")) return;
+
     // Movement.
     const dir = keyMap[e.key];
     if (dir) {
