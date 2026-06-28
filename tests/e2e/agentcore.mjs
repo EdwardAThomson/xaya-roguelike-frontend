@@ -40,6 +40,50 @@ export function bfsStep(walls, fx, fy, tx, ty) {
 }
 
 /**
+ * Drives the player (already in a channel) to a gate and out, fighting
+ * monsters in the way and healing when low. `preferDir` chooses which gate
+ * (default: the entry gate, i.e. come back the way you came). Leaving via a
+ * gate confirms a provisional segment / freely transits a confirmed one.
+ * Returns the final state, or pushes a finding if it can't get out.
+ */
+export async function navigateOut(page, cfg, preferDir = "") {
+  const { name, findings } = cfg;
+  const state = () => page.evaluate(() => globalThis.__rog.state());
+  const call = (fn, ...a) =>
+    page.evaluate(([f, args]) => globalThis.__rog[f](...args), [fn, a]);
+  const walls = (await page.evaluate(() => globalThis.__rog.map()))?.walls;
+  if (!walls) { findings.push(`[${name}] navigateOut: no map`); return state(); }
+
+  for (let t = 0; t < 400; t++) {
+    const s = await state();
+    if (!s.player?.in_channel) return s;            // out
+    if (s.modal) {
+      const c = await page.$(".modal-confirm");
+      if (c) await c.click(); else await call("dismissModal");
+      await sleep(300); continue;
+    }
+    if (s.busy) { await sleep(150); continue; }
+    const sess = s.session;
+    if (!sess) { await sleep(150); continue; }
+    if (sess.gameOver) { await call("exitChannel"); await sleep(400); continue; }
+    if (s.player.hp < s.player.max_hp * 0.35
+        && s.player.inventory.some(i => i.slot === "bag" && i.item_id.includes("potion"))) {
+      await call("input", "use_potion"); await sleep(150); continue;
+    }
+    const dir = preferDir || s.player.active_visit?.entry_direction || sess.gates[0]?.direction;
+    const gate = sess.gates.find(g => g.direction === dir) || sess.gates[0];
+    const adj = sess.monsters.find(m =>
+      Math.abs(m.x - sess.playerX) <= 1 && Math.abs(m.y - sess.playerY) <= 1);
+    const tgt = adj || gate;
+    const step = bfsStep(walls, sess.playerX, sess.playerY, tgt.x, tgt.y);
+    if (!step || (!step[0] && !step[1])) { await call("input", "wait"); await sleep(120); continue; }
+    await call("input", "move", step[0], step[1]); await sleep(120);
+  }
+  findings.push(`[${name}] navigateOut timed out (still in channel)`);
+  return state();
+}
+
+/**
  * Plays one agent to completion on `page`.
  * cfg: { name, findings, outbound=4, maxTicks=600 }.
  */

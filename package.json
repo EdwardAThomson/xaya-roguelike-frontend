@@ -8,7 +8,8 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "e2e": "node tests/e2e/run.mjs",
     "agent": "node tests/e2e/agent.mjs",
-    "multi": "node tests/e2e/multi.mjs"
+    "multi": "node tests/e2e/multi.mjs",
+    "compete": "node tests/e2e/compete.mjs"
   },
   "repository": {
     "type": "git",

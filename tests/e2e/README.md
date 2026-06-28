@@ -19,6 +19,10 @@ without `?e2e=1`, so it never ships in normal play or the hosted demo.
   competing in the same world (`multi.mjs`), plus a referee that polls the
   global GSP state and asserts cross-player invariants (coordinate
   uniqueness, player/segment sanity). Env: `ROG_AGENTS` (default 3).
+- `npm run compete` — scripted competition tests with hard assertions
+  (`compete.mjs`): coordinate race (one winner), provisional access +
+  confirm-unlocks-others, concurrent reward/ownership isolation. Needs a
+  fresh chain (uses fixed hub-adjacent coords).
 
 ## Run
 
