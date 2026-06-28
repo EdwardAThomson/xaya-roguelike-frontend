@@ -36,6 +36,10 @@ export interface PlayerInfo {
     defense: number;
     equip_attack: number;
     equip_defense: number;
+    strength: number;
+    dexterity: number;
+    constitution: number;
+    intelligence: number;
   };
   inventory: Array<{
     rowid: number;

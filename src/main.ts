@@ -235,12 +235,17 @@ function ensureHubSessionIfAtHub(entryDirection: string = ""): void {
 
   if (hubBuiltAtSegment === 0 && session !== null) return;  // already built
 
+  // Use EFFECTIVE stats (base + equipment bonuses) to match the GSP's
+  // ComputePlayerStats, which is what the settlement replay runs with.
+  // Using base str/dex/con here would desync combat from the replay the
+  // moment any stat-granting gear (rings, amulets, shields) is equipped,
+  // and every settlement would be rejected.
   const stats: PlayerStats = {
     level: p.level,
-    strength: p.stats.strength,
-    dexterity: p.stats.dexterity,
-    constitution: p.stats.constitution,
-    intelligence: p.stats.intelligence,
+    strength: p.effective_stats.strength,
+    dexterity: p.effective_stats.dexterity,
+    constitution: p.effective_stats.constitution,
+    intelligence: p.effective_stats.intelligence,
     equipAttack: p.effective_stats.equip_attack,
     equipDefense: p.effective_stats.equip_defense,
   };
@@ -385,12 +390,17 @@ function startChannelDungeon(
   channelSegmentId = segmentId;
   channelVisitId = visitId;
 
+  // Use EFFECTIVE stats (base + equipment bonuses) to match the GSP's
+  // ComputePlayerStats, which is what the settlement replay runs with.
+  // Using base str/dex/con here would desync combat from the replay the
+  // moment any stat-granting gear (rings, amulets, shields) is equipped,
+  // and every settlement would be rejected.
   const stats: PlayerStats = {
     level: p.level,
-    strength: p.stats.strength,
-    dexterity: p.stats.dexterity,
-    constitution: p.stats.constitution,
-    intelligence: p.stats.intelligence,
+    strength: p.effective_stats.strength,
+    dexterity: p.effective_stats.dexterity,
+    constitution: p.effective_stats.constitution,
+    intelligence: p.effective_stats.intelligence,
     equipAttack: p.effective_stats.equip_attack,
     equipDefense: p.effective_stats.equip_defense,
   };
