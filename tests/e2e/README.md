@@ -29,8 +29,7 @@ ROG_RATE_LIMIT_MAX=0 python3 devnet/frontend_devnet.py   # in the xayaroguelike 
 # 2. frontend static server
 python3 serve.py 8000                     # in this repo
 
-# 3. fast-forward past the first-discovery cooldown window, then play:
-curl -s localhost:18380/ -H 'content-type: application/json' -d '{"action":"mine","blocks":60}'
+# 3. play
 npm run agent          # or: npm run e2e
 ```
 
@@ -38,11 +37,8 @@ Env: `ROG_URL` (default `http://localhost:8000`), `ROG_HEADED=1` to watch the
 browser, `ROG_OUTBOUND` (agent, default 4) how many new segments to open,
 `ROG_TICKS` (agent, default 600).
 
-Gotchas:
-- A brand-new player can't discover until chain height > 50 (the cooldown
-  formula treats "never discovered" as block 0), hence the pre-mine above.
-- Leave the public rate limit on (`ROG_RATE_LIMIT_MAX` unset) for the real
-  demo; only disable it for the agent.
+Note: leave the public rate limit on (`ROG_RATE_LIMIT_MAX` unset) for the
+real demo; only disable it for the agent's fast automated play.
 
 ## Isolation caveat
 

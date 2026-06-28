@@ -174,7 +174,10 @@ try {
       }
       const confirmedDirs = Object.keys(confirmedNbr);
       const emptyDirs = Object.keys(OFFSET).filter(d => !occupied.has(d));
-      const cd = Math.max(0, (pl.last_discover_height + 50) - (s.height ?? 0));
+      // Cooldown only applies between discoveries — a never-discovered
+      // player (last_discover_height 0) can discover immediately.
+      const cd = pl.last_discover_height > 0
+        ? Math.max(0, (pl.last_discover_height + 50) - (s.height ?? 0)) : 0;
 
       // Discover a NEW segment when the cooldown allows (tests discovery +
       // confirm-on-return); otherwise transit to a CONFIRMED neighbour
