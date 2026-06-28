@@ -8,13 +8,17 @@ It uses the `?e2e=1` debug hook (`window.__rog` in `src/main.ts`): read-only
 state plus the same orchestration functions the UI calls. The hook is absent
 without `?e2e=1`, so it never ships in normal play or the hosted demo.
 
-## Two harnesses
+## Harnesses
 
 - `npm run e2e` — a fixed scenario (`run.mjs`), good for a quick check.
-- `npm run agent` — a heuristic self-playing soak agent (`agent.mjs`) that
-  explores segment to segment, fights, equips, discovers NEW segments
-  (confirming them on the way back), and freely transits OLD confirmed ones,
-  checking invariants every tick and reporting anomalies.
+- `npm run agent` — one heuristic self-playing soak agent (`agent.mjs`,
+  policy in `agentcore.mjs`): explores segment to segment, fights, equips,
+  discovers NEW segments (confirming them on the way back) and freely
+  transits OLD confirmed ones, checking invariants every tick.
+- `npm run multi` — N agents in N browser contexts against one stack,
+  competing in the same world (`multi.mjs`), plus a referee that polls the
+  global GSP state and asserts cross-player invariants (coordinate
+  uniqueness, player/segment sanity). Env: `ROG_AGENTS` (default 3).
 
 ## Run
 
