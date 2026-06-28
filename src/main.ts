@@ -1812,6 +1812,52 @@ function updateDungeonMessages(): void {
   el.scrollTop = el.scrollHeight;
 }
 
+// --- E2E / headless debug hook ---
+
+// Enabled only with ?e2e=1 in the URL, so it's absent in normal play and
+// on the hosted demo.  Exposes read-only state plus the real orchestration
+// actions (the same functions the UI buttons/keys call), so a Playwright
+// driver exercises the actual code paths instead of scraping the canvas.
+// Rejections still surface as modals (#modal-root), which the driver reads.
+if (typeof location !== "undefined"
+    && new URLSearchParams(location.search).has("e2e")) {
+  (globalThis as unknown as { __rog: unknown }).__rog = {
+    state: () => ({
+      status: connState?.status ?? "disconnected",
+      mode,
+      busy,
+      channelSession,
+      height: connState?.currentHeight ?? null,
+      player: connState?.player ?? null,
+      session: session ? {
+        playerX: session.playerX,
+        playerY: session.playerY,
+        hp: session.playerHp,
+        maxHp: session.playerMaxHp,
+        survived: session.survived,
+        gameOver: session.gameOver,
+        monstersAlive: session.monsters.filter(m => m.alive).length,
+        gates: session.dungeon.gates,
+        tileAtPlayer: session.dungeon.getTile(session.playerX, session.playerY),
+      } : null,
+      modal: document.getElementById("modal-root")?.textContent ?? null,
+    }),
+    connect: (name: string, gsp?: string) => {
+      if (gsp) gspUrlInput.value = gsp;
+      playerNameInput.value = name;
+      connectBtn.click();
+    },
+    register: () => doRegister(),
+    travel: (dir: string) => doTravel(dir),
+    discover: (dir: string) => doDiscover(dir),
+    enterChannel: (id: number) => doEnterChannel(id),
+    exitChannel: () => doExitChannel(),
+    gateWalk: (dir: string) => doGateWalk(dir),
+    forfeit: (visitId: number) => doForfeitVisit(visitId),
+    dismissModal: () => document.querySelector<HTMLElement>(".modal-dismiss")?.click(),
+  };
+}
+
 // --- Start ---
 
 setMode("dungeon");
