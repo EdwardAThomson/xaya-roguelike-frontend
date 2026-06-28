@@ -1134,7 +1134,7 @@ function renderDungeon(): void {
 
 // --- Input ---
 
-new InputHandler((action: string, dir?: Direction) => {
+function handleGameInput(action: string, dir?: Direction): void {
   if (mode !== "dungeon") return;
   if (!session || session.gameOver) return;
   if (busy) return;  // an on-chain action is in flight
@@ -1183,7 +1183,9 @@ new InputHandler((action: string, dir?: Direction) => {
       if (gate) confirmGateWalk(gate.direction);
     }
   }
-});
+}
+
+new InputHandler(handleGameInput);
 
 /** Returns the gate at the player's current position, or null. */
 function gateAtPlayer(): { x: number; y: number; direction: string } | null {
@@ -1846,12 +1848,34 @@ if (typeof location !== "undefined"
         maxHp: session.playerMaxHp,
         survived: session.survived,
         gameOver: session.gameOver,
-        monstersAlive: session.monsters.filter(m => m.alive).length,
         gates: session.dungeon.gates,
         tileAtPlayer: session.dungeon.getTile(session.playerX, session.playerY),
+        monsters: session.monsters.filter(m => m.alive)
+          .map(m => ({ x: m.x, y: m.y, hp: m.hp, attack: m.attack })),
+        groundItems: session.groundItems
+          .map(g => ({ x: g.x, y: g.y, item: g.itemId })),
       } : null,
+      segments: connState?.segments
+        ? Array.from(connState.segments.values()).map(s => ({
+            id: s.id, confirmed: s.confirmed,
+            world_x: s.world_x, world_y: s.world_y,
+            links: s.links, gates: s.gates,
+          }))
+        : [],
       modal: document.getElementById("modal-root")?.textContent ?? null,
     }),
+    // Static wall grid for pathfinding (call once per session).
+    map: () => {
+      if (!session) return null;
+      const d = session.dungeon;
+      const walls: boolean[][] = [];
+      for (let y = 0; y < HEIGHT; y++) {
+        const row: boolean[] = [];
+        for (let x = 0; x < WIDTH; x++) row.push(d.getTile(x, y) === 0);
+        walls.push(row);
+      }
+      return { width: WIDTH, height: HEIGHT, walls };
+    },
     connect: (name: string, gsp?: string) => {
       if (gsp) gspUrlInput.value = gsp;
       playerNameInput.value = name;
@@ -1864,6 +1888,17 @@ if (typeof location !== "undefined"
     exitChannel: () => doExitChannel(),
     gateWalk: (dir: string) => doGateWalk(dir),
     forfeit: (visitId: number) => doForfeitVisit(visitId),
+    // Dungeon-level control: drives the same path as the keyboard.
+    input: (action: string, dx?: number, dy?: number) =>
+      handleGameInput(action,
+        (dx !== undefined || dy !== undefined)
+          ? { dx: dx ?? 0, dy: dy ?? 0 } : undefined),
+    // Inventory management.
+    equip: (rowid: number, slot: string) => doEquip(rowid, slot),
+    unequip: (rowid: number) => doUnequip(rowid),
+    useItem: (item: string) => doUseItem(item),
+    discard: (rowid: number) => doDiscard(rowid),
+    allocateStat: (stat: string) => doAllocateStat(stat),
     dismissModal: () => document.querySelector<HTMLElement>(".modal-dismiss")?.click(),
   };
 }

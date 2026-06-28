@@ -8,24 +8,41 @@ It uses the `?e2e=1` debug hook (`window.__rog` in `src/main.ts`): read-only
 state plus the same orchestration functions the UI calls. The hook is absent
 without `?e2e=1`, so it never ships in normal play or the hosted demo.
 
+## Two harnesses
+
+- `npm run e2e` — a fixed scenario (`run.mjs`), good for a quick check.
+- `npm run agent` — a heuristic self-playing soak agent (`agent.mjs`) that
+  explores segment to segment, fights, equips, discovers NEW segments
+  (confirming them on the way back), and freely transits OLD confirmed ones,
+  checking invariants every tick and reporting anomalies.
+
 ## Run
 
 In three terminals:
 
 ```bash
-# 1. backend stack (GSP + move proxy)
+# 1. backend stack (GSP + move proxy). For the agent, disable the public
+#    rate limit so automated play isn't throttled:
 source ~/Explore/xayax/.venv/bin/activate
-python3 devnet/frontend_devnet.py        # in the xayaroguelike repo
+ROG_RATE_LIMIT_MAX=0 python3 devnet/frontend_devnet.py   # in the xayaroguelike repo
 
 # 2. frontend static server
 python3 serve.py 8000                     # in this repo
 
-# 3. the test
-npm run e2e
+# 3. fast-forward past the first-discovery cooldown window, then play:
+curl -s localhost:18380/ -H 'content-type: application/json' -d '{"action":"mine","blocks":60}'
+npm run agent          # or: npm run e2e
 ```
 
 Env: `ROG_URL` (default `http://localhost:8000`), `ROG_HEADED=1` to watch the
-browser.
+browser, `ROG_OUTBOUND` (agent, default 4) how many new segments to open,
+`ROG_TICKS` (agent, default 600).
+
+Gotchas:
+- A brand-new player can't discover until chain height > 50 (the cooldown
+  formula treats "never discovered" as block 0), hence the pre-mine above.
+- Leave the public rate limit on (`ROG_RATE_LIMIT_MAX` unset) for the real
+  demo; only disable it for the agent.
 
 ## Isolation caveat
 
