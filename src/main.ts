@@ -223,6 +223,25 @@ async function doForfeitVisit(visitId: number): Promise<void> {
 
 /**
  * If the player is at the hub (segment 0) and not inside a real channel,
+/**
+ * Explored fog-of-war tiles, kept per segment so revisiting a place shows
+ * the map you already uncovered instead of going dark again.  Each visit
+ * is still a fresh deterministic run (same layout, monsters/items return),
+ * but the revealed map persists for the session.  Keyed by segment seed
+ * (and "hub" for the overworld hub).  In-memory, browser-local.
+ */
+const exploredByKey = new Map<string, Set<number>>();
+
+function persistentExplored(key: string): Set<number> {
+  let s = exploredByKey.get(key);
+  if (!s) {
+    s = new Set<number>();
+    exploredByKey.set(key, s);
+  }
+  return s;
+}
+
+/**
  * make sure we have a hub session ready to render.  Rebuilds whenever
  * the player's `current_segment` flips from non-hub back to hub
  * (e.g. after a death respawn).
@@ -252,6 +271,7 @@ function ensureHubSessionIfAtHub(entryDirection: string = ""): void {
   };
   session = DungeonSession.createHub(stats, p.hp, p.max_hp, entryDirection);
   fov = new FovMap();
+  fov.explored = persistentExplored("hub");
   fov.update(session.playerX, session.playerY, session.dungeon);
   camera.centerOn(session.playerX, session.playerY);
   hubBuiltAtSegment = 0;
@@ -418,6 +438,7 @@ function startChannelDungeon(
     segmentSeed, depth, stats, p.hp, p.max_hp, potions,
     constraints, entryDirection);
   fov = new FovMap();
+  fov.explored = persistentExplored("seg:" + segmentSeed);
   fov.update(session.playerX, session.playerY, session.dungeon);
   camera.centerOn(session.playerX, session.playerY);
 
