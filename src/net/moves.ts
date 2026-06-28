@@ -96,7 +96,11 @@ export class MoveClient {
    * Atomic gate-walk: optionally settles the current dungeon and
    * transits into the neighbour in `dir` (discovering it first if
    * unexplored), entering its channel in the same on-chain move.
-   * `settlement` is required when the player is in a channel session.
+   *
+   * From a channel, pass either a `settlement` (a played run, settles
+   * rewards) or `transit: true` (a free, no-reward pass — allowed by the
+   * GSP only out of a confirmed segment). From the hub/overworld, pass
+   * neither.
    */
   async gateWalk(
     name: string,
@@ -105,9 +109,11 @@ export class MoveClient {
       results: { survived: boolean; xp: number; gold: number; kills: number };
       actions: object[];
     },
+    transit = false,
   ): Promise<void> {
-    const op: { dir: string; settlement?: object } = { dir };
+    const op: { dir: string; settlement?: object; transit?: boolean } = { dir };
     if (settlement) op.settlement = settlement;
+    else if (transit) op.transit = true;
     await this.transport.submitMove(name, { gw: op });
     await this.transport.mine();
   }

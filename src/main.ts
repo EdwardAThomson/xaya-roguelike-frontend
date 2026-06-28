@@ -870,23 +870,33 @@ async function doGateWalk(dir: string): Promise<void> {
   // only *after* the chain confirms the transit (below), so a rejected
   // gate-walk — refused client-side or by the GSP — leaves the run fully
   // playable instead of stranding the player on the gate tile.
+  // Leaving a CONFIRMED segment is a free transit (no settlement, no
+  // rewards, no penalty): the GSP just moves you to the other side of the
+  // gate. Leaving a PROVISIONAL segment still requires a settled run to
+  // confirm it (anti-grief). See the traversal model in the GSP CLAUDE.md.
+  const curConfirmed = !!ctx.segments.get(ctx.player.current_segment)?.confirmed;
   let settlement: undefined | {
     results: { survived: boolean; xp: number; gold: number; kills: number };
     actions: object[];
   };
+  let transit = false;
   if (channelSession && session) {
-    const actions: object[] = session.actionLog.map(a =>
-      a.type === "use" ? { type: "use", item: a.itemId } : a);
-    actions.push({ type: "gate" });
-    settlement = {
-      results: {
-        survived: true,
-        xp: session.totalXp,
-        gold: session.totalGold,
-        kills: session.totalKills,
-      },
-      actions,
-    };
+    if (curConfirmed) {
+      transit = true;
+    } else {
+      const actions: object[] = session.actionLog.map(a =>
+        a.type === "use" ? { type: "use", item: a.itemId } : a);
+      actions.push({ type: "gate" });
+      settlement = {
+        results: {
+          survived: true,
+          xp: session.totalXp,
+          gold: session.totalGold,
+          kills: session.totalKills,
+        },
+        actions,
+      };
+    }
   }
 
   const wasInChannel = channelSession;
@@ -908,7 +918,7 @@ async function doGateWalk(dir: string): Promise<void> {
   );
 
   try {
-    await moves.gateWalk(connState.playerName, dir, settlement);
+    await moves.gateWalk(connState.playerName, dir, settlement, transit);
 
     // Wait for the chain to reflect the transit.  Success looks like:
     //   - entered a (new) channel — a visit id different from before, OR
