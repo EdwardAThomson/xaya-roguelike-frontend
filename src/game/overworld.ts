@@ -12,42 +12,38 @@ export interface SegmentNode {
   id: number;
   depth: number;
   discoverer: string;
+  worldX: number;
+  worldY: number;
   gridX: number;
   gridY: number;
   links: Record<string, number>;  // direction -> segment ID
   provisional: boolean;
 }
 
-const DIR_DX: Record<string, number> = { east: 1, west: -1, north: 0, south: 0 };
-const DIR_DY: Record<string, number> = { north: -1, south: 1, east: 0, west: 0 };
 const OPPOSITE: Record<string, string> = { north: "south", south: "north", east: "west", west: "east" };
 
 /**
- * Lay out segments on a 2D grid using BFS from segment 0 (origin).
- * Segment 0 is always placed at (0,0) even if it has no DB entry.
+ * Build map nodes directly from the GSP's authoritative world coordinates.
+ * Each segment is placed at its own `world_x`/`world_y`; the origin hub
+ * (segment 0) sits at (0,0) even though it has no row in the segments table.
+ *
+ * `gridY = -world_y` because the GSP uses north = +Y while the canvas grows
+ * downward — flipping keeps north rendering up.
  */
 export function layoutSegments(segments: Map<number, SegmentInfo>): Map<number, SegmentNode> {
   const nodes = new Map<number, SegmentNode>();
-  const occupied = new Map<string, number>();  // "x,y" -> segment ID
 
-  // Always create segment 0 (hub) at origin.
+  // Hub (segment 0): infer its links from neighbours that link back to it.
   const seg0Links: Record<string, number> = {};
-
-  // Infer segment 0's links from other segments that link back to it.
   for (const seg of segments.values()) {
     for (const [dir, lnk] of Object.entries(seg.links)) {
       if (lnk.to_segment === 0) {
-        // This segment links to 0 via direction `dir`.
-        // So segment 0 has a link in the opposite direction to this segment.
         const reverseDir = OPPOSITE[dir];
-        if (reverseDir) {
-          seg0Links[reverseDir] = seg.id;
-        }
+        if (reverseDir) seg0Links[reverseDir] = seg.id;
       }
     }
   }
-
-  // Also check segment 0 data if it somehow exists.
+  // Honour explicit segment-0 data if it ever exists.
   const seg0Data = segments.get(0);
   if (seg0Data) {
     for (const [dir, lnk] of Object.entries(seg0Data.links)) {
@@ -55,67 +51,36 @@ export function layoutSegments(segments: Map<number, SegmentInfo>): Map<number, 
     }
   }
 
-  const hub: SegmentNode = {
+  nodes.set(0, {
     id: 0,
     depth: 0,
     discoverer: "",
+    worldX: 0,
+    worldY: 0,
     gridX: 0,
     gridY: 0,
     links: seg0Links,
     provisional: false,
-  };
-  nodes.set(0, hub);
-  occupied.set("0,0", 0);
+  });
 
-  // BFS from segment 0 to place all connected segments.
-  const queue = [0];
-  while (queue.length > 0) {
-    const curId = queue.shift()!;
-    const curNode = nodes.get(curId)!;
-
-    // Get links from either the node's links (for seg 0) or the segment data.
-    let links: Record<string, number>;
-    if (curId === 0) {
-      links = curNode.links;
-    } else {
-      const curSeg = segments.get(curId);
-      if (!curSeg) continue;
-      links = {};
-      for (const [dir, lnk] of Object.entries(curSeg.links)) {
-        links[dir] = lnk.to_segment;
-      }
+  // Place every other segment at its true world coordinate.
+  for (const seg of segments.values()) {
+    if (seg.id === 0) continue;
+    const links: Record<string, number> = {};
+    for (const [dir, lnk] of Object.entries(seg.links)) {
+      links[dir] = lnk.to_segment;
     }
-
-    for (const [dir, neighborId] of Object.entries(links)) {
-      if (nodes.has(neighborId)) continue;
-
-      const gx = curNode.gridX + (DIR_DX[dir] ?? 0);
-      const gy = curNode.gridY + (DIR_DY[dir] ?? 0);
-
-      const key = `${gx},${gy}`;
-      if (occupied.has(key)) continue;
-
-      const neighborSeg = segments.get(neighborId);
-      const neighborLinks: Record<string, number> = {};
-      if (neighborSeg) {
-        for (const [d, l] of Object.entries(neighborSeg.links)) {
-          neighborLinks[d] = l.to_segment;
-        }
-      }
-
-      const node: SegmentNode = {
-        id: neighborId,
-        depth: neighborSeg?.depth ?? 1,
-        discoverer: neighborSeg?.discoverer ?? "?",
-        gridX: gx,
-        gridY: gy,
-        links: neighborLinks,
-        provisional: neighborSeg ? !neighborSeg.confirmed : true,
-      };
-      nodes.set(neighborId, node);
-      occupied.set(key, neighborId);
-      queue.push(neighborId);
-    }
+    nodes.set(seg.id, {
+      id: seg.id,
+      depth: seg.depth,
+      discoverer: seg.discoverer,
+      worldX: seg.world_x,
+      worldY: seg.world_y,
+      gridX: seg.world_x,
+      gridY: -seg.world_y,
+      links,
+      provisional: !seg.confirmed,
+    });
   }
 
   return nodes;

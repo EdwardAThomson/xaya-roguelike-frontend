@@ -14,9 +14,10 @@
     <input id="player-name" type="text" placeholder="name" spellcheck="false">
     <button id="connect-btn">Connect</button>
     <span id="connection-status" class="status-disconnected">Disconnected</span>
+    <span id="block-height" class="topbar-info"></span>
     <div class="topbar-spacer"></div>
-    <button id="mode-overworld" class="mode-btn active" disabled>Overworld</button>
-    <button id="mode-dungeon" class="mode-btn">Dungeon</button>
+    <button id="mode-dungeon" class="mode-btn active" disabled>World</button>
+    <button id="mode-overworld" class="mode-btn">Map</button>
   </div>
   <div id="app">
     <div id="game-area">
@@ -28,7 +29,7 @@
         <div id="stats-display"></div>
       </div>
       <div id="inventory-panel" class="panel">
-        <h3>Inventory</h3>
+        <h3>Inventory <button id="open-inventory-btn" class="panel-btn" data-action="open-inventory">Manage (I)</button></h3>
         <div id="inventory-display"></div>
       </div>
       <div id="message-panel" class="panel">

@@ -76,6 +76,55 @@ export class Dungeon {
     return d;
   }
 
+  /**
+   * Builds the hub (segment 0): a small empty room centred in the
+   * 80x40 grid, with one Gate tile at the middle of each cardinal
+   * wall.  No monsters, no items, no combat — a safe zone for the
+   * player to learn controls and walk out to a real dungeon.
+   *
+   * The room is intentionally compact (16x12) so the player can see
+   * all four gates from the spawn point — the 8-tile FOV reaches every
+   * gate from the centre.
+   *
+   * This is frontend-only; the backend has no row for segment 0.
+   */
+  static buildHub(): Dungeon {
+    const HUB_W = 16;
+    const HUB_H = 12;
+    const ox = Math.floor((WIDTH - HUB_W) / 2);    // left edge of room interior
+    const oy = Math.floor((HEIGHT - HUB_H) / 2);   // top edge
+
+    const d = new Dungeon();
+    d.depth = 0;
+    d.clear();  // everything starts as Wall
+
+    // Carve out the room interior.
+    for (let y = oy; y < oy + HUB_H; y++) {
+      for (let x = ox; x < ox + HUB_W; x++) {
+        d.setTile(x, y, Tile.Floor);
+      }
+    }
+
+    d.rooms = [{ x: ox, y: oy, width: HUB_W, height: HUB_H }];
+
+    // Gates sit on the wall row/col one cell outside the floor area
+    // and remain walkable (Tile.Gate).  Position each at the midpoint
+    // of its wall so the room is symmetric.
+    const cx = ox + Math.floor(HUB_W / 2);
+    const cy = oy + Math.floor(HUB_H / 2);
+    d.gates = [
+      { x: cx,           y: oy - 1,         direction: "north" },
+      { x: cx,           y: oy + HUB_H,     direction: "south" },
+      { x: ox + HUB_W,   y: cy,             direction: "east" },
+      { x: ox - 1,       y: cy,             direction: "west" },
+    ];
+    for (const g of d.gates) {
+      d.setTile(g.x, g.y, Tile.Gate);
+    }
+
+    return d;
+  }
+
   private clear(): void {
     this.tiles.fill(Tile.Wall);
   }

@@ -2,9 +2,14 @@
   "name": "xaya-roguelike-frontend",
   "version": "1.0.0",
   "description": "",
+  "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "e2e": "node tests/e2e/run.mjs",
+    "agent": "node tests/e2e/agent.mjs",
+    "multi": "node tests/e2e/multi.mjs",
+    "compete": "node tests/e2e/compete.mjs"
   },
   "repository": {
     "type": "git",
@@ -18,6 +23,7 @@
   },
   "homepage": "https://github.com/EdwardAThomson/xaya-roguelike-frontend#readme",
   "devDependencies": {
+    "playwright": "^1.61.1",
     "typescript": "^5.9.3"
   }
 }
