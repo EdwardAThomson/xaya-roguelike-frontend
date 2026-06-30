@@ -8,7 +8,7 @@ Browser-based frontend for the [Xaya Roguelike](../xayaroguelike/) blockchain ga
 
 - **Overworld map**: Segment graph rendered on canvas, click to select, travel between segments
 - **On-chain state**: Player stats, inventory, equipment, combat record from the GSP
-- **Dungeon play**: Full turn-based roguelike (14 monster types, 35 items, fog of war, 8-dir movement)
+- **Dungeon play**: Full turn-based roguelike (12 monster types, 31 items, fog of war, 8-dir movement)
 - **Channel integration**: Enter dungeons using real on-chain player stats, exit with cryptographic replay proof
 - **Deterministic**: Dungeon generation and RNG verified identical to C++ backend (SHA-256 + MT19937)
 
@@ -64,8 +64,8 @@ src/
     dungeon.ts              Procedural dungeon generation (80x40 grid)
     session.ts              Turn-based dungeon session engine
     combat.ts               Attack/defense/crit/dodge math
-    monsters.ts             14 monster templates scaled by depth
-    items.ts                35 item definitions (weapons, armor, potions)
+    monsters.ts             12 monster templates scaled by depth
+    items.ts                31 item definitions (weapons, armor, potions)
     overworld.ts            Segment graph layout (BFS from origin)
     input.ts                Keyboard handler (WASD/arrows/hotkeys)
     rng.ts                  MT19937 (matches C++ std::mt19937)
@@ -80,6 +80,11 @@ src/
     rpc.ts                  JSON-RPC 2.0 client (typed GSP methods)
     connection.ts           Connection manager with auto-polling
     moves.ts                Move submission client (devnet proxy)
+    validator.ts            Client-side pre-validation (mirrors moveparser.cpp)
+    pending.ts              Post-submit revalidation (detect silently-dropped moves)
+  ui/
+    modal.ts                Error/confirm dialogs
+    overlay.ts              Overlay rendering
 dist/                       Compiled JS + source maps
 ```
 
