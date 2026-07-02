@@ -11,7 +11,7 @@ with deterministic RNG, and submits action-replay proofs on-chain. Pairs with th
 
 - [x] Dual-mode UI (dungeon gameplay + overworld segment map)
 - [x] Full local dungeon play (deterministic generation verified vs C++ backend)
-- [x] 14 monster types, 28 items, turn-based combat matching backend formulas
+- [x] 12 monster types, 31 items, turn-based combat matching backend formulas
 - [x] 8-directional movement, fog of war, item pickup/use, monster loot drops
 - [x] Action-log recording for replay verification
 - [x] JSON-RPC client (typed methods, 2s auto-polling)
