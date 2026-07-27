@@ -1184,7 +1184,16 @@ function renderDungeon(): void {
 // --- Input ---
 
 function handleGameInput(action: string, dir?: Direction): void {
-  if (mode !== "dungeon") return;
+  if (mode !== "dungeon") {
+    // If we are peeking at the world map (overworld view) during a live
+    // dungeon run, a gameplay key should snap us back into the dungeon and
+    // act, not be silently swallowed (which feels like being stuck).
+    if (channelSession && session && !session.gameOver) {
+      setMode("dungeon");
+    } else {
+      return;
+    }
+  }
   if (!session || session.gameOver) return;
   if (busy) return;  // an on-chain action is in flight
 
