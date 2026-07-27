@@ -145,13 +145,22 @@ export async function playAgent(page, cfg) {
     }
   }
 
-  // Connect + register.
+  // Connect + register (retry once; connect can be slow under load, and a
+  // silent miss here is what shows up as an idle "undefined" cycle).
   await call("connect", name);
   await waitIdle(15000);
-  for (let i = 0; i < 25 && (await state()).status !== "connected"; i++) await sleep(400);
+  for (let i = 0; i < 40 && (await state()).status !== "connected"; i++) {
+    if (i === 20) await call("connect", name);
+    await sleep(400);
+  }
   let s = await state();
   if (s.status !== "connected") { fail("did not connect"); return; }
   if (!s.player) { await call("register"); await waitIdle(); }
+
+  // Stop growing the map once it is large, so the world does not sprawl
+  // without bound over a long soak; below the cap, bots keep pushing the
+  // frontier (cooldown-paced) so the world stays visibly active.
+  const WORLD_CAP = Math.max(24, OUTBOUND * 6);
 
   let discoveries = 0, lastSig = "", stuck = 0;
   let mapCache = { visitId: null, walls: null };
@@ -191,7 +200,7 @@ export async function playAgent(page, cfg) {
         ? Math.max(0, (pl.last_discover_height + 50) - (s.height ?? 0)) : 0;
 
       let dir = null, discovering = false;
-      if (discoveries < OUTBOUND && cd === 0 && emptyDirs.length) {
+      if (cd === 0 && emptyDirs.length && s.segments.length < WORLD_CAP) {
         dir = emptyDirs[0]; discovering = true;
       } else if (confirmedDirs.length) {
         dir = confirmedDirs[tick % confirmedDirs.length];
@@ -228,7 +237,28 @@ export async function playAgent(page, cfg) {
       Math.abs(m.x - sess.playerX) <= 1 && Math.abs(m.y - sess.playerY) <= 1);
     if (adj) target = { x: adj.x, y: adj.y };
     else {
-      const gate = sess.gates.find(g => g.direction === entryDir) || sess.gates[0];
+      // Pick an exit gate.  Which neighbour coords already have a segment?
+      const curSeg = s.segments.find(x => x.id === p.current_segment);
+      const cx0 = curSeg?.world_x ?? 0, cy0 = curSeg?.world_y ?? 0;
+      const occupied = new Set();
+      for (const [d, [dx, dy]] of Object.entries(OFFSET)) {
+        if (s.segments.find(x => x.world_x === cx0 + dx && x.world_y === cy0 + dy)) occupied.add(d);
+      }
+      const cd = p.last_discover_height > 0
+        ? Math.max(0, (p.last_discover_height + 50) - (s.height ?? 0)) : 0;
+      const frontier = sess.gates.filter(g => !occupied.has(g.direction));
+      // Push the frontier (exit through an unexplored gate -> discover a new
+      // segment on the far side) when off cooldown and under the world cap.
+      // Otherwise transit laterally to a confirmed neighbour so bots spread
+      // across the graph instead of parking at the hub; else head home.
+      let gate;
+      if (cd === 0 && frontier.length && s.segments.length < WORLD_CAP) {
+        gate = frontier[0];
+      } else {
+        gate = sess.gates.find(g => g.direction !== entryDir && occupied.has(g.direction))
+            || sess.gates.find(g => g.direction === entryDir)
+            || sess.gates[0];
+      }
       target = { x: gate.x, y: gate.y };
     }
 
