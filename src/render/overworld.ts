@@ -5,6 +5,12 @@
 
 import { SegmentNode } from "../game/overworld.js";
 
+/** One other player present on a segment, for the map presence tokens. */
+export interface PlayerMarker {
+  name: string;
+  inChannel: boolean;
+}
+
 export const NODE_SIZE = 64;
 const NODE_GAP = 96;
 export const CELL = NODE_SIZE + NODE_GAP;
@@ -29,6 +35,7 @@ export function drawOverworld(
   selectedSegment: number | null,
   canvasW: number,
   canvasH: number,
+  presence?: Map<number, PlayerMarker[]>,
 ): void {
   ctx.fillStyle = "#0a0a0a";
   ctx.fillRect(0, 0, canvasW, canvasH);
@@ -139,6 +146,50 @@ export function drawOverworld(
       ctx.font = "11px monospace";
       ctx.textAlign = "center";
       ctx.fillText(isOrigin ? "Safe Zone" : `Depth ${node.depth}`, cx, cy + 10);
+    }
+
+    // Other players present on this segment, drawn as small initial tokens
+    // along the bottom inside edge of the node (blue = in the hub/overworld
+    // here, brighter cyan = currently in a dungeon on this segment).  Data
+    // comes from the on-chain world state, so it updates every poll.
+    const markers = presence?.get(node.id);
+    if (markers && markers.length) {
+      const R = 8;
+      const gap = 18;
+      const maxShown = 4;
+      const overflow = markers.length > maxShown;
+      const shown = overflow ? maxShown - 1 : markers.length;
+      const slots = shown + (overflow ? 1 : 0);
+      const rowW = (slots - 1) * gap;
+      const by = cy + half - 2;
+      let tx = cx - rowW / 2;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      for (let i = 0; i < shown; i++) {
+        const m = markers[i];
+        ctx.beginPath();
+        ctx.arc(tx, by, R, 0, Math.PI * 2);
+        ctx.fillStyle = m.inChannel ? "#2b9fd0" : "#3060a0";
+        ctx.fill();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "#0a0a0a";
+        ctx.stroke();
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 10px monospace";
+        ctx.fillText((m.name[0] || "?").toUpperCase(), tx, by + 0.5);
+        tx += gap;
+      }
+      if (overflow) {
+        ctx.beginPath();
+        ctx.arc(tx, by, R, 0, Math.PI * 2);
+        ctx.fillStyle = "#555";
+        ctx.fill();
+        ctx.strokeStyle = "#0a0a0a";
+        ctx.stroke();
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 9px monospace";
+        ctx.fillText("+" + (markers.length - shown), tx, by + 0.5);
+      }
     }
 
     // Direction arrows on edges.

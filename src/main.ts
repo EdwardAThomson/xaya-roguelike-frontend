@@ -21,7 +21,7 @@ import { PlayerInfo, SegmentInfo } from "./net/rpc.js";
 import { Gate } from "./game/dungeon.js";
 import { MoveClient, createMoveClient } from "./net/moves.js";
 import { layoutSegments, SegmentNode, hitTestSegment, areLinked } from "./game/overworld.js";
-import { drawOverworld, NODE_SIZE, CELL } from "./render/overworld.js";
+import { drawOverworld, NODE_SIZE, CELL, PlayerMarker } from "./render/overworld.js";
 import { DEFAULT_GSP_URL, DEFAULT_PROXY_URL } from "./config.js";
 import {
   ValidatorContext, ValidationResult,
@@ -1106,7 +1106,19 @@ function playerLocationSegment(p: PlayerInfo): number {
 function renderOverworld(): void {
   const p = connState?.player;
   const currentSeg = p ? playerLocationSegment(p) : 0;
-  drawOverworld(ctx, overworldNodes, currentSeg, selectedSegment, canvas.width, canvas.height);
+  // Presence tokens for OTHER players, keyed by the segment they are on
+  // (from the on-chain world state).  The current player is already shown
+  // via the "@" marker, so exclude self here.
+  const presence = new Map<number, PlayerMarker[]>();
+  const selfName = connState?.playerName;
+  for (const pl of connState?.fullState?.players ?? []) {
+    if (pl.name === selfName) continue;
+    if (!overworldNodes.has(pl.current_segment)) continue;
+    const arr = presence.get(pl.current_segment) ?? [];
+    arr.push({ name: pl.name, inChannel: pl.in_channel });
+    presence.set(pl.current_segment, arr);
+  }
+  drawOverworld(ctx, overworldNodes, currentSeg, selectedSegment, canvas.width, canvas.height, presence);
 }
 
 function renderDungeon(): void {
