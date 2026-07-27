@@ -12,6 +12,98 @@ body {
   height: 100vh;
 }
 
+/* --- Landing / title screen --- */
+
+#landing-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: radial-gradient(circle at 50% 35%, #16181f 0%, #0b0c10 70%, #050506 100%);
+}
+
+#landing-screen.hidden {
+  display: none;
+}
+
+.landing-inner {
+  width: 100%;
+  max-width: 560px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+}
+
+.landing-title {
+  font-size: clamp(2.4rem, 9vw, 4.5rem);
+  font-weight: bold;
+  letter-spacing: 2px;
+  color: #8ec;
+  text-shadow: 0 0 18px rgba(136, 238, 204, 0.25);
+  line-height: 1.05;
+}
+
+.landing-tagline {
+  font-size: clamp(0.85rem, 2.6vw, 1.05rem);
+  color: #99a;
+  max-width: 42ch;
+  line-height: 1.5;
+}
+
+.landing-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  justify-content: center;
+  margin-top: 6px;
+}
+
+.landing-btn {
+  font-family: monospace;
+  font-size: 1.05rem;
+  padding: 12px 34px;
+  border: 1px solid #445;
+  border-radius: 4px;
+  background: #1c1e26;
+  color: #ccc;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.landing-btn:hover {
+  background: #262a34;
+}
+
+.landing-play {
+  border-color: #8ec;
+  color: #8ec;
+  background: #16261f;
+}
+
+.landing-play:hover {
+  background: #1d3a2e;
+}
+
+.landing-copyright {
+  margin-top: 18px;
+  font-size: 0.72rem;
+  color: #667;
+}
+
+.landing-copyright a {
+  color: #8899aa;
+  text-decoration: none;
+}
+
+.landing-copyright a:hover {
+  text-decoration: underline;
+}
+
 /* --- Top bar --- */
 
 #topbar {
@@ -437,4 +529,155 @@ body {
 .inv-foot {
   padding: 8px 16px; border-top: 1px solid #333;
   font-size: 11px; color: #777; text-align: center;
+}
+
+/* --- Help overlay --- */
+
+.help-modal {
+  background: #15151c;
+  border: 1px solid #444;
+  border-radius: 8px;
+  width: min(720px, 94vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  color: #ddd;
+  font-family: monospace;
+}
+.help-body {
+  display: flex; flex-direction: column; gap: 28px;
+  padding: 24px 28px; overflow-y: auto;
+}
+.help-section-title {
+  font-size: 16px; text-transform: uppercase; letter-spacing: 0.06em;
+  font-weight: bold; color: #8ec;
+  padding-bottom: 8px; margin-bottom: 14px;
+  border-bottom: 1px solid #2f4a44;
+}
+.help-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; padding: 7px 0; font-size: 14px; line-height: 1.5; color: #ccc;
+}
+.help-row .help-keys {
+  display: flex; align-items: center; gap: 6px; flex: 0 0 auto;
+}
+.help-row > span:last-child {
+  flex: 1 1 auto; text-align: right; color: #bcc;
+}
+.help-row span.help-key-text {
+  color: #9aa; font-size: 12px;
+}
+.help-row kbd {
+  display: inline-block;
+  background: #2a2a3a; border: 1px solid #555; border-bottom-width: 2px;
+  border-radius: 4px; color: #cdd;
+  font-family: monospace; font-size: 12px; line-height: 1.5;
+  padding: 2px 8px; min-width: 16px; text-align: center;
+}
+.help-note {
+  font-size: 13px; line-height: 1.6; color: #c9b24a;
+  background: rgba(180, 140, 0, 0.1);
+  border: 1px dashed #5a5a3a; border-radius: 5px;
+  padding: 12px 14px;
+}
+.help-credit {
+  font-size: 11px; color: #777; text-align: center;
+  margin-top: 4px; line-height: 1.5;
+}
+.help-credit a { color: #8ec; text-decoration: none; }
+.help-credit a:hover { text-decoration: underline; }
+
+/* --- Unified tabbed game modal --- */
+
+.game-modal-panel {
+  background: #15151c;
+  border: 1px solid #444;
+  border-radius: 8px;
+  width: min(720px, 94vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  color: #ddd;
+  font-family: monospace;
+}
+
+/* Tab bar: a flex row of buttons under the header. */
+.modal-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 16px 0;
+  border-bottom: 1px solid #333;
+}
+.modal-tab {
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  color: #9aa;
+  font-family: monospace;
+  font-size: 13px;
+  padding: 7px 16px;
+  border-radius: 6px 6px 0 0;
+  cursor: pointer;
+}
+.modal-tab:hover { color: #cdd; background: rgba(40, 40, 48, 0.6); }
+.modal-tab.active {
+  color: #8ec;
+  background: #15151c;
+  border-color: #333;
+  border-bottom: 1px solid #15151c;
+  margin-bottom: -1px;
+  font-weight: bold;
+}
+
+/* The active tab's body scrolls; the header and tab bar stay fixed. */
+.modal-tab-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+/* --- Players tab --- */
+
+.players-wrap {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.players-header {
+  font-size: 14px;
+  font-weight: bold;
+  color: #cdd;
+}
+.players-subtitle {
+  font-size: 11px;
+  color: #777;
+  margin-bottom: 10px;
+}
+.players-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.player-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(40, 40, 48, 0.6);
+  border: 1px solid #3a3a44;
+  border-radius: 5px;
+  padding: 8px 10px;
+}
+.player-row.player-you {
+  border-color: #4a8;
+  background: rgba(46, 58, 58, 0.6);
+}
+.player-name { font-weight: 600; flex: 1 1 auto; min-width: 0; }
+.player-you-tag { color: #8ec; font-weight: bold; font-size: 11px; }
+.player-level { color: #9aa; font-size: 12px; flex: 0 0 auto; }
+.player-loc {
+  color: #bcc; font-size: 12px; flex: 0 0 auto;
+  min-width: 72px; text-align: right;
 }

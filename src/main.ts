@@ -49,6 +49,16 @@ const blockHeightEl = document.getElementById("block-height")!;
 const modeOverworldBtn = document.getElementById("mode-overworld") as HTMLButtonElement;
 const modeDungeonBtn = document.getElementById("mode-dungeon") as HTMLButtonElement;
 
+// Persistent Help entry point.  index.html isn't edited here, so the button
+// is injected into the topbar (always visible, next to the mode buttons).
+const helpBtn = document.createElement("button");
+helpBtn.id = "open-help-btn";
+helpBtn.className = "mode-btn";
+helpBtn.dataset.action = "open-help";
+helpBtn.textContent = "Help (?)";
+helpBtn.title = "Show controls and help (press ? or H)";
+document.getElementById("topbar")?.appendChild(helpBtn);
+
 // --- State ---
 
 type AppMode = "overworld" | "dungeon";
@@ -279,6 +289,23 @@ function ensureHubSessionIfAtHub(entryDirection: string = ""): void {
 
 gspUrlInput.value = DEFAULT_GSP_URL;
 
+// --- Landing / title screen ---
+
+// Dismisses the title screen and reveals the game UI (topbar + app).  Safe to
+// call repeatedly; a no-op once the landing is already gone.  It is invoked
+// both from the Play button and from the connect flow, so a programmatic
+// connect (the ?e2e=1 hook calls connectBtn.click() directly, never Play)
+// still reveals the game without a manual Play click.
+function hideLanding(): void {
+  const landing = document.getElementById("landing-screen");
+  if (landing) landing.classList.add("hidden");
+}
+
+document.getElementById("landing-play-btn")?.addEventListener("click", () => {
+  hideLanding();
+  playerNameInput.focus();
+});
+
 connectBtn.addEventListener("click", () => {
   if (connState?.status === "connected" || connState?.status === "connecting") {
     connection.disconnect();
@@ -289,6 +316,9 @@ connectBtn.addEventListener("click", () => {
     hubBuiltAtSegment = -1;
     reconnectPromptShown = false;
   } else {
+    // Reveal the game in case connect was triggered programmatically (e2e
+    // hook) or before the landing screen was dismissed.
+    hideLanding();
     const url = gspUrlInput.value.trim();
     const name = playerNameInput.value.trim();
     moves = createMoveClient({ proxyUrl: DEFAULT_PROXY_URL });
@@ -714,6 +744,13 @@ async function doUseItem(itemId: string): Promise<void> {
   const ctx = validatorContext();
   if (!ctx) return;
   if (!handleValidation(validateUseItem(ctx, itemId))) return;
+
+  // Drinking a health potion at full HP would silently waste it, so guard
+  // against it here (covers greater_health_potion too via the substring).
+  if (itemId.includes("health_potion") && ctx.player.hp >= ctx.player.max_hp) {
+    addOverworldMessage("Already at full HP.", "info");
+    return;
+  }
 
   const beforeHp = ctx.player.hp;
   const beforeQty = ctx.player.inventory
@@ -1262,12 +1299,19 @@ function confirmGateWalk(dir: string): void {
 
 document.addEventListener("keydown", (e) => {
   if (isEditableTarget(e.target)) return;
-  if (e.key === "Escape" && inventoryOpen) {
-    setInventoryOpen(false);
+  if (e.key === "Escape" && activeModalTab) {
+    setModalTab(null);
+    return;
+  }
+  // "?" (Shift+/) or H opens the modal on the Help tab (toggles closed if
+  // it's already the active tab).  Available everywhere (even before
+  // connecting); neither key is bound to gameplay movement.
+  if (e.key === "?" || e.key.toLowerCase() === "h") {
+    setModalTab(activeModalTab === "help" ? null : "help");
     return;
   }
   if (e.key.toLowerCase() === "i" && connState?.player) {
-    setInventoryOpen(!inventoryOpen);
+    setModalTab(activeModalTab === "inventory" ? null : "inventory");
     return;
   }
   if (mode === "dungeon" && e.key.toLowerCase() === "n" && !channelSession) {
@@ -1322,10 +1366,16 @@ document.addEventListener("click", (e) => {
       doDiscard(Number(target.dataset.rowid));
       break;
     case "open-inventory":
-      setInventoryOpen(true);
+      setModalTab("inventory");
       break;
-    case "close-inventory":
-      setInventoryOpen(false);
+    case "open-help":
+      setModalTab("help");
+      break;
+    case "switch-tab":
+      setModalTab(target.dataset.tab as ModalTab);
+      break;
+    case "close-modal":
+      setModalTab(null);
       break;
   }
 });
@@ -1343,12 +1393,19 @@ const EQUIP_SLOTS: Array<{ slot: string; label: string; icon: string }> = [
   { slot: "amulet",  label: "Amulet",   icon: "📿" },
 ];
 
-let inventoryOpen = false;
+// The persistent game modal is a single element with a tab bar.  `null`
+// means closed; otherwise the value is the active tab.  A topbar button
+// (or key) opens it on a specific tab; the tab bar switches between them
+// without closing.
+type ModalTab = "inventory" | "players" | "help";
+let activeModalTab: ModalTab | null = null;
 
-function setInventoryOpen(open: boolean): void {
-  inventoryOpen = open;
-  document.body.classList.toggle("inv-open", open);
-  renderInventoryModal();
+function setModalTab(tab: ModalTab | null): void {
+  activeModalTab = tab;
+  // The InputHandler suppresses gameplay movement while "inv-open" is set;
+  // keep it on whenever the modal is open on ANY tab.
+  document.body.classList.toggle("inv-open", activeModalTab !== null);
+  renderGameModal();
 }
 
 /** Short stat-bonus summary for an item, e.g. "ATK +5, STR +1". */
@@ -1377,12 +1434,17 @@ function itemColor(itemId: string): string {
   return lookupItem(itemId)?.color ?? "#ccc";
 }
 
-function renderInventoryModal(): void {
-  document.getElementById("inventory-modal")?.remove();
-  if (!inventoryOpen) return;
-
+/**
+ * Builds the Inventory tab body (bag + equipped + pending finds).  This is
+ * the exact content the standalone inventory overlay used to render; it is
+ * now returned as HTML and mounted inside the unified game modal.  Returns a
+ * placeholder when there is no player yet.
+ */
+function renderInventoryTabBody(): string {
   const p = connState?.player;
-  if (!p) { inventoryOpen = false; document.body.classList.remove("inv-open"); return; }
+  if (!p) {
+    return `<div class="inv-body"><div class="inv-empty">Connect and register to see your inventory.</div></div>`;
+  }
 
   // On-chain inventory is the truth everywhere.  Equip/use/discard are
   // chain moves the GSP rejects mid-channel, so they're only active in
@@ -1449,16 +1511,7 @@ function renderInventoryModal(): void {
     ? '<div class="inv-note">In a dungeon: inventory is locked until you settle.</div>'
     : "";
 
-  const root = document.createElement("div");
-  root.id = "inventory-modal";
-  root.className = "modal-overlay";
-  root.innerHTML = `
-    <div class="inv-modal" role="dialog" aria-modal="true">
-      <div class="inv-header">
-        <span class="inv-title">Inventory &amp; Equipment</span>
-        <span class="inv-gold">🪙 ${p.gold}</span>
-        <button class="inv-close" data-action="close-inventory">✕</button>
-      </div>
+  return `
       ${note}
       <div class="inv-body">
         <div class="inv-bag">
@@ -1470,12 +1523,146 @@ function renderInventoryModal(): void {
           <div class="inv-col-title">Equipped</div>
           ${equipHtml}
         </div>
+      </div>`;
+}
+
+// --- Players tab ---
+
+/**
+ * Builds the Players tab body: a list of every player who has joined this
+ * world.  Data comes from `connState.fullState.players` (name, level,
+ * current_segment); locations are resolved against `connState.segments`.
+ * The chain does not track presence, so this is deliberately NOT labelled
+ * "online"; it is everyone who has ever joined.
+ */
+function renderPlayersTabBody(): string {
+  const fs = connState?.fullState;
+  if (!fs) {
+    return `<div class="players-wrap"><div class="inv-empty">Connect to see other players.</div></div>`;
+  }
+
+  const players = fs.players ?? [];
+  const me = connState?.playerName ?? "";
+
+  const rows = players.map(pl => {
+    const isYou = pl.name === me;
+    let loc: string;
+    if (pl.current_segment === 0) {
+      loc = "Hub";
+    } else {
+      const seg = connState?.segments.get(pl.current_segment);
+      loc = seg ? `(${seg.world_x}, ${seg.world_y})` : `seg ${pl.current_segment}`;
+    }
+    const youTag = isYou ? ' <span class="player-you-tag">(you)</span>' : "";
+    return `<div class="player-row${isYou ? " player-you" : ""}">
+      <span class="player-name">${pl.name}${youTag}</span>
+      <span class="player-level">Lv${pl.level}</span>
+      <span class="player-loc">${loc}</span>
+    </div>`;
+  }).join("");
+
+  const list = players.length > 0
+    ? `<div class="players-list">${rows}</div>`
+    : `<div class="inv-empty">No players have joined this world yet.</div>`;
+
+  return `<div class="players-wrap">
+    <div class="players-header">Players in this world: ${players.length}</div>
+    <div class="players-subtitle">Everyone who has joined this world (presence is not tracked on-chain).</div>
+    ${list}
+  </div>`;
+}
+
+// --- Help tab ---
+
+/**
+ * Builds the Help tab body (controls and objective).  The key bindings
+ * listed here match game/input.ts (movement, pickup, wait, gate, potion)
+ * and the "n" / "i" handlers in the keydown listener above.
+ */
+function renderHelpTabBody(): string {
+  return `
+      <div class="help-body">
+        <div class="help-section">
+          <div class="help-section-title">Overworld / Hub</div>
+          <div class="help-row"><span class="help-keys"><kbd>I</kbd></span><span>Open inventory and equipment</span></div>
+          <div class="help-row"><span class="help-keys"><span class="help-key-text">In inventory</span></span><span>Click Equip / Unequip, Drink, or Drop on an item</span></div>
+          <div class="help-row"><span class="help-keys"><span class="help-key-text">Gate / Travel / Discover</span></span><span>Buttons move you between segments</span></div>
+          <div class="help-row"><span class="help-keys"><kbd>?</kbd><kbd>H</kbd></span><span>Open this help</span></div>
+        </div>
+        <div class="help-section">
+          <div class="help-section-title">In a Dungeon</div>
+          <div class="help-row"><span class="help-keys"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></span><span>or Arrow keys: move</span></div>
+          <div class="help-row"><span class="help-keys"><kbd>Q</kbd><kbd>E</kbd><kbd>Z</kbd><kbd>C</kbd></span><span>Move diagonally</span></div>
+          <div class="help-row"><span class="help-keys"><kbd>G</kbd></span><span>Pick up item</span></div>
+          <div class="help-row"><span class="help-keys"><kbd>P</kbd></span><span>Drink health potion</span></div>
+          <div class="help-row"><span class="help-keys"><kbd>Space</kbd></span><span>Wait a turn</span></div>
+          <div class="help-row"><span class="help-keys"><kbd>Enter</kbd></span><span>Step through a gate</span></div>
+          <div class="help-row"><span class="help-keys"><kbd>N</kbd></span><span>New dungeon (standalone mode)</span></div>
+        </div>
+        <div class="help-note">
+          Goal: explore segments and survive to a gate to confirm newly discovered ones.
+          If you die in a dungeon you forfeit any loot picked up on that run.
+        </div>
+        <div class="help-credit">
+          &copy; 2026 Edward Thomson (<a href="https://octonion.io" target="_blank" rel="noopener noreferrer">Octonion Software</a>)
+        </div>
+      </div>`;
+}
+
+// --- Unified tabbed game modal ---
+
+/**
+ * Renders the single persistent game modal (Inventory / Players / Help).
+ * Wipes any existing instance, bails when closed, and rebuilds one
+ * `#game-modal` overlay appended to the body.  Closes on the ✕ button and
+ * on a backdrop click.  Tab buttons switch the active body without closing.
+ */
+function renderGameModal(): void {
+  document.getElementById("game-modal")?.remove();
+  if (!activeModalTab) return;
+
+  const tabs: Array<{ id: ModalTab; label: string }> = [
+    { id: "inventory", label: "Inventory" },
+    { id: "players",   label: "Players" },
+    { id: "help",      label: "Help" },
+  ];
+  const tabBar = tabs.map(t =>
+    `<button class="modal-tab${t.id === activeModalTab ? " active" : ""}" data-action="switch-tab" data-tab="${t.id}">${t.label}</button>`
+  ).join("");
+
+  let title = "";
+  let headerExtra = "";
+  let body = "";
+  if (activeModalTab === "inventory") {
+    title = "Inventory &amp; Equipment";
+    const p = connState?.player;
+    if (p) headerExtra = `<span class="inv-gold">🪙 ${p.gold}</span>`;
+    body = renderInventoryTabBody();
+  } else if (activeModalTab === "players") {
+    title = "Players";
+    body = renderPlayersTabBody();
+  } else {
+    title = "Help &amp; Controls";
+    body = renderHelpTabBody();
+  }
+
+  const root = document.createElement("div");
+  root.id = "game-modal";
+  root.className = "modal-overlay";
+  root.innerHTML = `
+    <div class="game-modal-panel" role="dialog" aria-modal="true">
+      <div class="inv-header">
+        <span class="inv-title">${title}</span>
+        ${headerExtra}
+        <button class="inv-close" data-action="close-modal">✕</button>
       </div>
-      <div class="inv-foot">Press I or Esc to close</div>
+      <div class="modal-tabs">${tabBar}</div>
+      <div class="modal-tab-body">${body}</div>
+      <div class="inv-foot">Press Esc to close</div>
     </div>`;
   // Backdrop click closes.
   root.addEventListener("click", (e) => {
-    if (e.target === root) setInventoryOpen(false);
+    if (e.target === root) setModalTab(null);
   });
   document.body.appendChild(root);
 }
@@ -1496,8 +1683,8 @@ function updateSidebar(): void {
     updateDungeonInventory();
     updateDungeonMessages();
   }
-  // Keep the inventory modal (if open) in sync with state polls.
-  if (inventoryOpen) renderInventoryModal();
+  // Keep the unified game modal (if open) in sync with state polls.
+  if (activeModalTab) renderGameModal();
 }
 
 // --- Overworld sidebar ---
@@ -1664,12 +1851,17 @@ function updateOverworldInventory(): void {
     const def = lookupItem(item.item_id);
     const isEquipable = def && def.slot !== "" && def.type !== "potion"
         && def.type !== "misc";
+    const isPotion = def && def.type === "potion";
 
     let btn = "";
     if (canMutate && item.slot === "bag" && isEquipable) {
       btn = `<button data-action="equip" data-rowid="${item.rowid}"
         data-slot="${def!.slot}" class="inv-btn"
         ${busy ? "disabled" : ""}>Equip</button>`;
+    } else if (canMutate && item.slot === "bag" && isPotion) {
+      btn = `<button data-action="use-item" data-item="${item.item_id}"
+        class="inv-btn"
+        ${busy ? "disabled" : ""}>Drink</button>`;
     } else if (canMutate && item.slot !== "bag") {
       btn = `<button data-action="unequip" data-rowid="${item.rowid}"
         class="inv-btn"
