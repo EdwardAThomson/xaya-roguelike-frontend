@@ -1299,19 +1299,29 @@ function confirmGateWalk(dir: string): void {
 
 document.addEventListener("keydown", (e) => {
   if (isEditableTarget(e.target)) return;
-  if (e.key === "Escape" && activeModalTab) {
-    setModalTab(null);
-    return;
+  if (e.key === "Escape") {
+    if (helpOpen) { setHelpOpen(false); return; }
+    if (activeModalTab) { setModalTab(null); return; }
   }
-  // "?" (Shift+/) or H opens the modal on the Help tab (toggles closed if
-  // it's already the active tab).  Available everywhere (even before
-  // connecting); neither key is bound to gameplay movement.
+  // "?" (Shift+/) or H toggles help.  In game (connected) it opens the
+  // in-game modal on the Help tab; before connecting it opens the
+  // standalone title-screen help overlay, so it never spawns the in-game
+  // modal machinery pre-connect.  Neither key is bound to movement.
   if (e.key === "?" || e.key.toLowerCase() === "h") {
-    setModalTab(activeModalTab === "help" ? null : "help");
+    if (connState?.player) {
+      setModalTab(activeModalTab === "help" ? null : "help");
+    } else {
+      setHelpOpen(!helpOpen);
+    }
     return;
   }
   if (e.key.toLowerCase() === "i" && connState?.player) {
     setModalTab(activeModalTab === "inventory" ? null : "inventory");
+    return;
+  }
+  // "M" toggles the world map (overworld view) against the dungeon view.
+  if (e.key.toLowerCase() === "m" && connState?.player) {
+    setMode(mode === "overworld" ? "dungeon" : "overworld");
     return;
   }
   if (mode === "dungeon" && e.key.toLowerCase() === "n" && !channelSession) {
@@ -1369,7 +1379,15 @@ document.addEventListener("click", (e) => {
       setModalTab("inventory");
       break;
     case "open-help":
+      // In-game (topbar) Help: the modal's Help tab.
       setModalTab("help");
+      break;
+    case "open-help-home":
+      // Title-screen Help: the standalone overlay (no in-game modal).
+      setHelpOpen(true);
+      break;
+    case "close-help":
+      setHelpOpen(false);
       break;
     case "switch-tab":
       setModalTab(target.dataset.tab as ModalTab);
@@ -1399,13 +1417,29 @@ const EQUIP_SLOTS: Array<{ slot: string; label: string; icon: string }> = [
 // without closing.
 type ModalTab = "inventory" | "players" | "help";
 let activeModalTab: ModalTab | null = null;
+// The in-game modal carries a Help tab (alongside Inventory / Players).
+// Separately, the title screen has its OWN standalone help overlay
+// (`helpOpen` below): it shows the same information but is deliberately
+// decoupled from the in-game modal, so opening help from the homepage
+// never instantiates the inventory/players game-state machinery.
+let helpOpen = false;
+
+// The InputHandler suppresses gameplay movement while "inv-open" is set;
+// keep it on whenever any overlay (the game modal or help) is open.
+function syncModalBodyClass(): void {
+  document.body.classList.toggle("inv-open", activeModalTab !== null || helpOpen);
+}
 
 function setModalTab(tab: ModalTab | null): void {
   activeModalTab = tab;
-  // The InputHandler suppresses gameplay movement while "inv-open" is set;
-  // keep it on whenever the modal is open on ANY tab.
-  document.body.classList.toggle("inv-open", activeModalTab !== null);
+  syncModalBodyClass();
   renderGameModal();
+}
+
+function setHelpOpen(open: boolean): void {
+  helpOpen = open;
+  syncModalBodyClass();
+  renderHelpOverlay();
 }
 
 /** Short stat-bonus summary for an item, e.g. "ATK +5, STR +1". */
@@ -1579,7 +1613,7 @@ function renderPlayersTabBody(): string {
  * listed here match game/input.ts (movement, pickup, wait, gate, potion)
  * and the "n" / "i" handlers in the keydown listener above.
  */
-function renderHelpTabBody(): string {
+function renderHelpBody(): string {
   return `
       <div class="help-body">
         <div class="help-section">
@@ -1587,6 +1621,7 @@ function renderHelpTabBody(): string {
           <div class="help-row"><span class="help-keys"><kbd>I</kbd></span><span>Open inventory and equipment</span></div>
           <div class="help-row"><span class="help-keys"><span class="help-key-text">In inventory</span></span><span>Click Equip / Unequip, Drink, or Drop on an item</span></div>
           <div class="help-row"><span class="help-keys"><span class="help-key-text">Gate / Travel / Discover</span></span><span>Buttons move you between segments</span></div>
+          <div class="help-row"><span class="help-keys"><kbd>M</kbd></span><span>Toggle the world map</span></div>
           <div class="help-row"><span class="help-keys"><kbd>?</kbd><kbd>H</kbd></span><span>Open this help</span></div>
         </div>
         <div class="help-section">
@@ -1606,7 +1641,37 @@ function renderHelpTabBody(): string {
         <div class="help-credit">
           &copy; 2026 Edward Thomson (<a href="https://octonion.io" target="_blank" rel="noopener noreferrer">Octonion Software</a>)
         </div>
+        <div class="help-credit">
+          Built on the <a href="https://xaya.io" target="_blank" rel="noopener noreferrer">Xaya</a> game framework.
+        </div>
       </div>`;
+}
+
+/**
+ * Standalone help overlay (controls + credits).  Deliberately independent
+ * of the in-game modal and of any game state, so it is safe to open from
+ * the title screen before the player has connected.
+ */
+function renderHelpOverlay(): void {
+  document.getElementById("help-modal")?.remove();
+  if (!helpOpen) return;
+
+  const root = document.createElement("div");
+  root.id = "help-modal";
+  root.className = "modal-overlay";
+  root.innerHTML = `
+    <div class="game-modal-panel help-modal" role="dialog" aria-modal="true">
+      <div class="inv-header">
+        <span class="inv-title">Help &amp; Controls</span>
+        <button class="inv-close" data-action="close-help">✕</button>
+      </div>
+      <div class="modal-tab-body">${renderHelpBody()}</div>
+      <div class="inv-foot">Press Esc to close</div>
+    </div>`;
+  root.addEventListener("click", (e) => {
+    if (e.target === root) setHelpOpen(false);
+  });
+  document.body.appendChild(root);
 }
 
 // --- Unified tabbed game modal ---
@@ -1643,7 +1708,7 @@ function renderGameModal(): void {
     body = renderPlayersTabBody();
   } else {
     title = "Help &amp; Controls";
-    body = renderHelpTabBody();
+    body = renderHelpBody();
   }
 
   const root = document.createElement("div");
