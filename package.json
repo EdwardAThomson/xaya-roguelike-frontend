@@ -9,7 +9,8 @@
     "e2e": "node tests/e2e/run.mjs",
     "agent": "node tests/e2e/agent.mjs",
     "multi": "node tests/e2e/multi.mjs",
-    "compete": "node tests/e2e/compete.mjs"
+    "compete": "node tests/e2e/compete.mjs",
+    "persist": "node tests/e2e/persist.mjs"
   },
   "repository": {
     "type": "git",

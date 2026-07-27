@@ -59,7 +59,7 @@ function check(gs) {
 let stop = false;
 async function referee() {
   while (!stop) {
-    try { check(await gsp("getcurrentstate")); } catch { /* transient */ }
+    try { check((await gsp("getcurrentstate"))?.gamestate); } catch { /* transient */ }
     await sleep(2000);
   }
 }
@@ -89,7 +89,7 @@ const summaries = await Promise.all(agents.map((a, i) =>
 
 stop = true;
 await refPromise;
-check(await gsp("getcurrentstate").catch(() => null)); // final consistency snapshot
+check((await gsp("getcurrentstate").catch(() => null))?.gamestate); // final consistency snapshot
 await browser.close();
 
 console.log("\nsummaries:");
