@@ -286,14 +286,9 @@ export function validateGateWalk(
   }
 
   if (!targetExists) {
-    // Would need to discover.  Cooldown + coord-occupied checks.
-    const remaining = discoveryCooldownRemaining(p, ctx.currentHeight);
-    if (remaining > 0) {
-      return err("cooldown", "Cooldown",
-        `Walking through an unexplored gate needs a discover, but you're on cooldown for ${remaining} more block${remaining === 1 ? "" : "s"}.`);
-    }
-
-    // Compute target world coord.
+    // No direct link from curSeg in dir.  What happens next depends on
+    // WHAT (if anything) occupies the target coordinate.  A segment already
+    // there was discovered independently from a different parent.
     let srcX = 0, srcY = 0;
     if (curSeg !== 0) {
       const segInfo = ctx.segments.get(curSeg)!;
@@ -302,10 +297,31 @@ export function validateGateWalk(
     }
     const targetX = srcX + (DIR_DX[dir] ?? 0);
     const targetY = srcY + (DIR_DY[dir] ?? 0);
+
+    let occupant: SegmentInfo | undefined;
     for (const seg of ctx.segments.values()) {
       if (seg.world_x === targetX && seg.world_y === targetY) {
-        return err("coord_occupied", "Coordinate already claimed",
-          `Another player has claimed the segment at (${targetX}, ${targetY}). Pick a different gate.`);
+        occupant = seg;
+        break;
+      }
+    }
+
+    if (occupant) {
+      // Confirmed occupant -> free transit into the coord-adjacent neighbour
+      // (the chain creates the missing link).  Not a discovery, so no
+      // cooldown.  Provisional occupant -> discoverer-only, same as an
+      // existing provisional neighbour reached through a link.
+      if (!occupant.confirmed && occupant.discoverer !== p.name) {
+        return err("not_discoverer", "Segment is provisional",
+          `Only ${occupant.discoverer} can enter the segment at (${targetX}, ${targetY}) while it is provisional. Wait for them to confirm it, then you can join.`);
+      }
+      // else: allowed transit; fall through.
+    } else {
+      // Empty coord -> genuine discovery.  Cooldown applies.
+      const remaining = discoveryCooldownRemaining(p, ctx.currentHeight);
+      if (remaining > 0) {
+        return err("cooldown", "Cooldown",
+          `Walking through an unexplored gate needs a discover, but you're on cooldown for ${remaining} more block${remaining === 1 ? "" : "s"}.`);
       }
     }
   } else if (targetSeg !== undefined && targetSeg !== 0) {
