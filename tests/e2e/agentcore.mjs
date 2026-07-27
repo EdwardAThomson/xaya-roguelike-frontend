@@ -199,8 +199,9 @@ export async function playAgent(page, cfg) {
       const cd = pl.last_discover_height > 0
         ? Math.max(0, (pl.last_discover_height + 50) - (s.height ?? 0)) : 0;
 
+      const depthProxy = Math.abs(curX) + Math.abs(curY);
       let dir = null, discovering = false;
-      if (cd === 0 && emptyDirs.length && s.segments.length < WORLD_CAP) {
+      if (cd === 0 && emptyDirs.length && depthProxy < 2 && s.segments.length < WORLD_CAP) {
         dir = emptyDirs[0]; discovering = true;
       } else if (confirmedDirs.length) {
         dir = confirmedDirs[tick % confirmedDirs.length];
@@ -247,14 +248,20 @@ export async function playAgent(page, cfg) {
       const cd = p.last_discover_height > 0
         ? Math.max(0, (p.last_discover_height + 50) - (s.height ?? 0)) : 0;
       const frontier = sess.gates.filter(g => !occupied.has(g.direction));
-      // Push the frontier (exit through an unexplored gate -> discover a new
-      // segment on the far side) when off cooldown and under the world cap.
-      // Otherwise transit laterally to a confirmed neighbour so bots spread
-      // across the graph instead of parking at the hub; else head home.
+      // Distance from the hub is a proxy for dungeon depth (the e2e state has
+      // no depth field); deeper segments have tougher monsters that kill a
+      // level-1 bot, so only push the frontier from shallow segments and when
+      // healthy. When hurt, retreat through the entry gate to survive rather
+      // than diving deeper and dying (which just dumps the bot back at the hub).
+      const depthProxy = Math.abs(cx0) + Math.abs(cy0);
+      const healthy = p.hp > p.max_hp * 0.6;
       let gate;
-      if (cd === 0 && frontier.length && s.segments.length < WORLD_CAP) {
+      if (!healthy) {
+        gate = sess.gates.find(g => g.direction === entryDir) || sess.gates[0];
+      } else if (cd === 0 && frontier.length && depthProxy < 2 && s.segments.length < WORLD_CAP) {
         gate = frontier[0];
       } else {
+        // Roam the confirmed graph (spread out) or head home.
         gate = sess.gates.find(g => g.direction !== entryDir && occupied.has(g.direction))
             || sess.gates.find(g => g.direction === entryDir)
             || sess.gates[0];
