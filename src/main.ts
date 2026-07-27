@@ -1599,7 +1599,7 @@ function renderPlayersTabBody(): string {
   const players = fs.players ?? [];
   const me = connState?.playerName ?? "";
 
-  const rows = players.map(pl => {
+  const rowHtml = (pl: typeof players[number]) => {
     const isYou = pl.name === me;
     let loc: string;
     if (pl.current_segment === 0) {
@@ -1609,21 +1609,34 @@ function renderPlayersTabBody(): string {
       loc = seg ? `(${seg.world_x}, ${seg.world_y})` : `seg ${pl.current_segment}`;
     }
     const youTag = isYou ? ' <span class="player-you-tag">(you)</span>' : "";
+    const badge = pl.in_channel ? ' <span class="player-badge">in dungeon</span>' : "";
     return `<div class="player-row${isYou ? " player-you" : ""}">
-      <span class="player-name">${pl.name}${youTag}</span>
+      <span class="player-name">${pl.name}${youTag}${badge}</span>
       <span class="player-level">Lv${pl.level}</span>
       <span class="player-loc">${loc}</span>
     </div>`;
-  }).join("");
+  };
 
-  const list = players.length > 0
-    ? `<div class="players-list">${rows}</div>`
+  // "Active" = currently in a dungeon or out on a segment (not idling in the
+  // hub). Show them first; players parked in the hub (incl. long-idle ones)
+  // drop to the bottom. Put yourself at the top of your group.
+  const youFirst = (a: typeof players[number], b: typeof players[number]) =>
+    (a.name === me ? -1 : 0) - (b.name === me ? -1 : 0);
+  const active = players.filter(p => p.in_channel || p.current_segment !== 0).sort(youFirst);
+  const idle = players.filter(p => !p.in_channel && p.current_segment === 0).sort(youFirst);
+
+  const section = (title: string, arr: typeof players) =>
+    arr.length ? `<div class="players-section-title">${title} (${arr.length})</div>
+      <div class="players-list">${arr.map(rowHtml).join("")}</div>` : "";
+
+  const body = players.length > 0
+    ? `${section("Active", active)}${section("In hub", idle)}`
     : `<div class="inv-empty">No players have joined this world yet.</div>`;
 
   return `<div class="players-wrap">
     <div class="players-header">Players in this world: ${players.length}</div>
-    <div class="players-subtitle">Everyone who has joined this world (presence is not tracked on-chain).</div>
-    ${list}
+    <div class="players-subtitle">Active = currently in a dungeon or out on a segment (presence is not tracked on-chain).</div>
+    ${body}
   </div>`;
 }
 

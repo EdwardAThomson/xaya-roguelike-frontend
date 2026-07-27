@@ -593,10 +593,10 @@ body {
   background: #15151c;
   border: 1px solid #444;
   border-radius: 8px;
-  width: min(720px, 94vw);
+  width: min(900px, 96vw);
   /* Fixed height (not just max-height) so switching tabs does not resize the
      panel; the active tab body scrolls inside it instead. */
-  height: min(640px, 88vh);
+  height: min(760px, 90vh);
   display: flex;
   flex-direction: column;
   color: #ddd;
@@ -657,6 +657,21 @@ body {
   font-size: 11px;
   color: #777;
   margin-bottom: 10px;
+}
+.players-section-title {
+  font-size: 11px;
+  color: #8ec;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin: 12px 0 6px;
+  border-bottom: 1px solid #2f4a44;
+  padding-bottom: 4px;
+}
+.player-badge {
+  color: #2b9fd0;
+  font-size: 10px;
+  font-weight: normal;
 }
 .players-list {
   display: flex;
