@@ -86,7 +86,14 @@ export function layoutSegments(segments: Map<number, SegmentInfo>): Map<number, 
   return nodes;
 }
 
-/** Find which segment node is at a given canvas position. */
+/**
+ * Find which segment node is at a given canvas position.
+ *
+ * `view` mirrors the pan/zoom transform used by the renderer so hit-testing
+ * stays correct when the map is panned or zoomed.  Omitting it (or passing the
+ * identity `{ panX: 0, panY: 0, zoom: 1 }`) reproduces the classic centered
+ * hit test.
+ */
 export function hitTestSegment(
   nodes: Map<number, SegmentNode>,
   canvasX: number,
@@ -96,14 +103,20 @@ export function hitTestSegment(
   canvasH: number,
   nodeSize: number,
   cellSize: number,
+  view?: { panX: number; panY: number; zoom: number },
 ): number | null {
-  const offsetX = canvasW / 2 - centerNode.gridX * cellSize;
-  const offsetY = canvasH / 2 - centerNode.gridY * cellSize;
+  const zoom = view?.zoom ?? 1;
+  const panX = view?.panX ?? 0;
+  const panY = view?.panY ?? 0;
+  const cell = cellSize * zoom;
+  const size = nodeSize * zoom;
+  const offsetX = canvasW / 2 - centerNode.gridX * cell + panX;
+  const offsetY = canvasH / 2 - centerNode.gridY * cell + panY;
 
   for (const node of nodes.values()) {
-    const cx = node.gridX * cellSize + offsetX;
-    const cy = node.gridY * cellSize + offsetY;
-    const half = nodeSize / 2;
+    const cx = node.gridX * cell + offsetX;
+    const cy = node.gridY * cell + offsetY;
+    const half = size / 2;
 
     if (canvasX >= cx - half && canvasX <= cx + half &&
         canvasY >= cy - half && canvasY <= cy + half) {

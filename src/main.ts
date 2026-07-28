@@ -21,7 +21,7 @@ import { PlayerInfo, SegmentInfo } from "./net/rpc.js";
 import { Gate } from "./game/dungeon.js";
 import { MoveClient, createMoveClient } from "./net/moves.js";
 import { layoutSegments, SegmentNode, hitTestSegment, areLinked } from "./game/overworld.js";
-import { drawOverworld, NODE_SIZE, CELL, PlayerMarker } from "./render/overworld.js";
+import { drawOverworld, NODE_SIZE, CELL, PlayerMarker, OverworldView } from "./render/overworld.js";
 import { DEFAULT_GSP_URL, DEFAULT_PROXY_URL } from "./config.js";
 import {
   ValidatorContext, ValidationResult,
@@ -59,6 +59,18 @@ helpBtn.textContent = "Help (?)";
 helpBtn.title = "Show controls and help (press ? or H)";
 document.getElementById("topbar")?.appendChild(helpBtn);
 
+// Recenter control for the overworld map: resets pan/zoom and re-enables
+// follow mode.  Injected here (index.html isn't edited); shown only in the
+// overworld view via setMode().
+const recenterBtn = document.createElement("button");
+recenterBtn.id = "recenter-map-btn";
+recenterBtn.className = "mode-btn";
+recenterBtn.dataset.action = "recenter-map";
+recenterBtn.textContent = "Recenter (C)";
+recenterBtn.title = "Recenter the map on your segment and reset zoom (press C)";
+recenterBtn.style.display = "none";
+document.getElementById("topbar")?.appendChild(recenterBtn);
+
 // --- State ---
 
 type AppMode = "overworld" | "dungeon";
@@ -88,6 +100,51 @@ let reconnectPromptShown = false;
 let overworldNodes: Map<number, SegmentNode> = new Map();
 let connState: ConnectionState | null = null;
 let selectedSegment: number | null = null;
+
+// Overworld map view transform: a manual pixel pan plus a zoom scale layered
+// on top of the auto-centering on the current segment.  `mapFollow` (the
+// default) keeps the view centered on the current segment and forces the pan
+// to zero; dragging or zooming turns it off, and "Recenter" turns it back on.
+let panX = 0;
+let panY = 0;
+let zoom = 1;
+let mapFollow = true;
+const ZOOM_MIN = 0.4;
+const ZOOM_MAX = 2.2;
+/** Last current-segment we auto-centered on, so a segment change while in
+ *  follow mode re-snaps the view. */
+let followSeg = -1;
+
+// Drag-to-pan bookkeeping.  A press that stays within DRAG_THRESHOLD pixels is
+// treated as a click (segment select); anything larger is a pan.
+const DRAG_THRESHOLD = 5;
+let isPanning = false;
+let panMoved = false;
+let panDownX = 0;
+let panDownY = 0;
+let lastClientX = 0;
+let lastClientY = 0;
+
+function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+/** The effective view transform passed to the renderer and hit-test.  In
+ *  follow mode the pan is pinned to zero (pure centering). */
+function overworldView(): OverworldView {
+  return mapFollow
+    ? { panX: 0, panY: 0, zoom }
+    : { panX, panY, zoom };
+}
+
+/** Reset to the default centered, unscaled view and re-enable follow mode. */
+function recenterMap(): void {
+  panX = 0;
+  panY = 0;
+  zoom = 1;
+  mapFollow = true;
+  if (mode === "overworld") render();
+}
 
 // Move client.
 let moves: MoveClient | null = null;
@@ -369,6 +426,8 @@ function setMode(m: AppMode): void {
   modeDungeonBtn.classList.toggle("active", m === "dungeon");
   modeOverworldBtn.disabled = m === "overworld";
   modeDungeonBtn.disabled = m === "dungeon";
+  recenterBtn.style.display = m === "overworld" ? "" : "none";
+  canvas.style.cursor = m === "overworld" ? "grab" : "";
   render();
   updateSidebar();
 }
@@ -387,9 +446,11 @@ function rebuildOverworld(): void {
   }
 }
 
-// Canvas click handler for overworld segment selection.
+// Canvas click handler for overworld segment selection.  The click event
+// fires after mouseup, so a drag-pan sets `panMoved` and we skip selection.
 canvas.addEventListener("click", (e) => {
   if (mode !== "overworld" || overworldNodes.size === 0) return;
+  if (panMoved) { panMoved = false; return; }  // this was a drag, not a click
 
   const rect = canvas.getBoundingClientRect();
   const x = e.clientX - rect.left;
@@ -398,11 +459,77 @@ canvas.addEventListener("click", (e) => {
   const currentSeg = connState?.player?.current_segment ?? 0;
   const centerNode = overworldNodes.get(currentSeg) ?? overworldNodes.get(0) ?? overworldNodes.values().next().value!;
 
-  const hit = hitTestSegment(overworldNodes, x, y, centerNode, canvas.width, canvas.height, NODE_SIZE, CELL);
+  const hit = hitTestSegment(overworldNodes, x, y, centerNode,
+    canvas.width, canvas.height, NODE_SIZE, CELL, overworldView());
   selectedSegment = hit;
   render();
   updateSidebar();
 });
+
+// Drag-to-pan.  mousedown starts a potential drag; movement past the threshold
+// commits it (turning off follow mode), and the pan follows the pointer.  The
+// move/up listeners live on window so a drag keeps working outside the canvas.
+canvas.addEventListener("mousedown", (e) => {
+  if (mode !== "overworld" || e.button !== 0) return;
+  isPanning = true;
+  panMoved = false;
+  panDownX = e.clientX;
+  panDownY = e.clientY;
+  lastClientX = e.clientX;
+  lastClientY = e.clientY;
+});
+
+window.addEventListener("mousemove", (e) => {
+  if (!isPanning) return;
+  if (!panMoved && Math.hypot(e.clientX - panDownX, e.clientY - panDownY) >= DRAG_THRESHOLD) {
+    panMoved = true;
+    canvas.style.cursor = "grabbing";
+    // Detach from follow: seed the manual pan from the current effective pan
+    // (zero while following) so the map does not jump when the drag begins.
+    if (mapFollow) { panX = 0; panY = 0; mapFollow = false; }
+  }
+  if (panMoved) {
+    panX += e.clientX - lastClientX;
+    panY += e.clientY - lastClientY;
+    render();
+  }
+  lastClientX = e.clientX;
+  lastClientY = e.clientY;
+});
+
+window.addEventListener("mouseup", () => {
+  if (!isPanning) return;
+  isPanning = false;
+  if (mode === "overworld") canvas.style.cursor = "grab";
+  // `panMoved` is left set for the click handler (which fires next) to inspect.
+});
+
+// Wheel to zoom, centered on the cursor.  Adjusts the pan so the world point
+// under the pointer stays fixed while zooming.
+canvas.addEventListener("wheel", (e) => {
+  if (mode !== "overworld" || overworldNodes.size === 0) return;
+  e.preventDefault();
+
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+
+  const oldZoom = zoom;
+  const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+  const newZoom = clamp(oldZoom * factor, ZOOM_MIN, ZOOM_MAX);
+  if (newZoom === oldZoom) return;
+
+  // Effective pan before the change (zero while following).
+  const ex = mapFollow ? 0 : panX;
+  const ey = mapFollow ? 0 : panY;
+  const ratio = newZoom / oldZoom;
+  // Keep the point under the cursor fixed relative to the canvas center.
+  panX = mx - canvas.width / 2 - (mx - canvas.width / 2 - ex) * ratio;
+  panY = my - canvas.height / 2 - (my - canvas.height / 2 - ey) * ratio;
+  zoom = newZoom;
+  mapFollow = false;
+  render();
+}, { passive: false });
 
 // --- Dungeon mode ---
 
@@ -1139,6 +1266,13 @@ function playerLocationSegment(p: PlayerInfo): number {
 function renderOverworld(): void {
   const p = connState?.player;
   const currentSeg = p ? playerLocationSegment(p) : 0;
+  // Snap back to the current segment when it changes while following, so the
+  // view tracks the player between segments (any stray pan is cleared).
+  if (mapFollow && currentSeg !== followSeg) {
+    panX = 0;
+    panY = 0;
+  }
+  followSeg = currentSeg;
   // Presence tokens for OTHER players, keyed by the segment they are on
   // (from the on-chain world state).  The current player is already shown
   // via the "@" marker, so exclude self here.
@@ -1151,7 +1285,8 @@ function renderOverworld(): void {
     arr.push({ name: pl.name, inChannel: pl.in_channel });
     presence.set(pl.current_segment, arr);
   }
-  drawOverworld(ctx, overworldNodes, currentSeg, selectedSegment, canvas.width, canvas.height, presence);
+  drawOverworld(ctx, overworldNodes, currentSeg, selectedSegment,
+    canvas.width, canvas.height, presence, overworldView());
 }
 
 function renderDungeon(): void {
@@ -1378,6 +1513,11 @@ document.addEventListener("keydown", (e) => {
     setMode(mode === "overworld" ? "dungeon" : "overworld");
     return;
   }
+  // "C" recenters the overworld map (reset pan/zoom, re-enable follow).
+  if (mode === "overworld" && e.key.toLowerCase() === "c") {
+    recenterMap();
+    return;
+  }
   if (mode === "dungeon" && e.key.toLowerCase() === "n" && !channelSession) {
     newStandaloneDungeon();
   }
@@ -1439,6 +1579,9 @@ document.addEventListener("click", (e) => {
     case "open-help":
       // In-game (topbar) Help: the modal's Help tab.
       setModalTab("help");
+      break;
+    case "recenter-map":
+      recenterMap();
       break;
     case "open-help-home":
       // Title-screen Help: the standalone overlay (no in-game modal).
@@ -2235,6 +2378,9 @@ if (typeof location !== "undefined"
     discard: (rowid: number) => doDiscard(rowid),
     allocateStat: (stat: string) => doAllocateStat(stat),
     dismissModal: () => document.querySelector<HTMLElement>(".modal-dismiss")?.click(),
+    // Overworld map view transform, for pan/zoom tests.
+    mapView: () => ({ panX, panY, zoom, mapFollow, selectedSegment }),
+    recenter: () => recenterMap(),
   };
 }
 
