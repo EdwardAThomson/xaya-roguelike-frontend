@@ -234,7 +234,7 @@ export function drawOverworld(
   ctx.fillStyle = "#666";
   ctx.font = "11px monospace";
   ctx.fillText(
-    "Overworld Map \u2014 click a segment to select \u00b7 drag to pan, scroll to zoom, Recenter to reset (dashed = provisional)",
+    "Overworld Map \u00b7 click a segment to select \u00b7 drag to pan, scroll to zoom, Recenter to reset (dashed = provisional)",
     12, 12,
   );
   if (zoom !== DEFAULT_VIEW.zoom || panX !== DEFAULT_VIEW.panX || panY !== DEFAULT_VIEW.panY) {
