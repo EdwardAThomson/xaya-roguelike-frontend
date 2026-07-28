@@ -9,6 +9,28 @@
  * CORS issues and means the GSP RPC port never has to be public.
  */
 
+/**
+ * Optional endpoint overrides. A test harness (or a hosted deploy) can point
+ * the frontend at a different GSP / move proxy without touching the defaults,
+ * via `?gsp=` / `?proxy=` query params or globals set before this module
+ * loads (`window.__ROG_GSP` / `window.__ROG_PROXY`). Returns null when no
+ * override is present, so default behaviour is unchanged. Purely additive.
+ */
+function endpointOverrides(): { gsp?: string; proxy?: string } {
+  const out: { gsp?: string; proxy?: string } = {};
+  if (typeof location !== "undefined") {
+    const q = new URLSearchParams(location.search);
+    const gsp = q.get("gsp");
+    const proxy = q.get("proxy");
+    if (gsp) out.gsp = gsp;
+    if (proxy) out.proxy = proxy;
+  }
+  const g = globalThis as unknown as { __ROG_GSP?: string; __ROG_PROXY?: string };
+  if (!out.gsp && typeof g.__ROG_GSP === "string" && g.__ROG_GSP) out.gsp = g.__ROG_GSP;
+  if (!out.proxy && typeof g.__ROG_PROXY === "string" && g.__ROG_PROXY) out.proxy = g.__ROG_PROXY;
+  return out;
+}
+
 function defaultEndpoints(): { gsp: string; proxy: string } {
   // Node / non-browser contexts (tests): fall back to the devnet ports.
   if (typeof location === "undefined") {
@@ -27,7 +49,12 @@ function defaultEndpoints(): { gsp: string; proxy: string } {
   return { gsp: `${location.origin}/gsp`, proxy: `${location.origin}/proxy` };
 }
 
-const endpoints = defaultEndpoints();
+const overrides = endpointOverrides();
+const base = defaultEndpoints();
+const endpoints = {
+  gsp: overrides.gsp ?? base.gsp,
+  proxy: overrides.proxy ?? base.proxy,
+};
 
 export const DEFAULT_GSP_URL = endpoints.gsp;
 export const DEFAULT_PROXY_URL = endpoints.proxy;
