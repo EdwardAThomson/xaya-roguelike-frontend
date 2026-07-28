@@ -222,9 +222,13 @@ export class DungeonSession {
               `You hit ${target.name} for ${result.damage}${critText}`, "combat");
             if (target.hp <= 0) {
               target.alive = false;
-              this.totalXp += target.xpValue;
+              // XP per kill scales with depth so pushing deeper levels
+              // faster: floor(xpValue * (1 + (depth-1) * 0.15)).
+              const xpGain = Math.floor(
+                target.xpValue * (1.0 + (this.depth - 1) * 0.15));
+              this.totalXp += xpGain;
               this.totalKills++;
-              this.addMessage(`${target.name} defeated! +${target.xpValue} XP`, "combat");
+              this.addMessage(`${target.name} defeated! +${xpGain} XP`, "combat");
 
               // Monster drops (35% chance).
               if (this.rng.nextRange(1, 100) <= 35) {

@@ -87,8 +87,8 @@ const ITEMS: ItemDef[] = [
   item({ id: "amulet_of_health",   name: "Amulet of Health",   type: "accessory", slot: "amulet", icon: "📿", color: "#f1c40f", constitution: 1, maxHealth: 15,         value: 75 }),
 
   /* Potions */
-  item({ id: "health_potion",         name: "Health Potion",         type: "potion", slot: "", icon: "⚗️", color: "#2ecc71", healAmount: 20, value: 15, consumable: true, stackable: true }),
-  item({ id: "greater_health_potion", name: "Greater Health Potion", type: "potion", slot: "", icon: "⚗️", color: "#27ae60", healAmount: 50, value: 40, consumable: true, stackable: true }),
+  item({ id: "health_potion",         name: "Health Potion",         type: "potion", slot: "", icon: "⚗️", color: "#2ecc71", healAmount: 35, value: 15, consumable: true, stackable: true }),
+  item({ id: "greater_health_potion", name: "Greater Health Potion", type: "potion", slot: "", icon: "⚗️", color: "#27ae60", healAmount: 70, value: 40, consumable: true, stackable: true }),
   item({ id: "mana_potion",           name: "Mana Potion",           type: "potion", slot: "", icon: "⚗️", color: "#3498db", healAmount: 0,  value: 15, consumable: true, stackable: true }),
 
   /* Misc */
@@ -108,7 +108,7 @@ export function getSpawnableItems(depth: number): ItemDef[] {
   return ITEMS.filter(it => {
     if (it.id === "gold_coins" || it.id === "mana_potion") return false;
     if (it.type === "potion") {
-      if (it.id === "greater_health_potion" && depth < 3) return false;
+      if (it.id === "greater_health_potion" && depth < 2) return false;
       return true;
     }
     if (it.type === "weapon" || it.type === "armor" || it.type === "accessory") {

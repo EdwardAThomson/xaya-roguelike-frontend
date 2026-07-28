@@ -60,8 +60,8 @@ const TEMPLATES: MonsterTemplate[] = [
 
 function createMonster(tmpl: MonsterTemplate, x: number, y: number,
                         depth: number): Monster {
-  const hpScale = 1.0 + (depth - 1) * 0.4;
-  const atkScale = 1.0 + (depth - 1) * 0.3;
+  const hpScale = 1.0 + (depth - 1) * 0.30;
+  const atkScale = 1.0 + (depth - 1) * 0.15;
 
   return {
     name: depth >= 7 ? "Elite " + tmpl.name : tmpl.name,
