@@ -1,6 +1,8 @@
 # Xaya Roguelike Frontend
 
-Browser-based frontend for the [Xaya Roguelike](../xayaroguelike/) blockchain game. Connects to the GSP via JSON-RPC, displays the overworld segment map, and runs dungeon sessions locally with on-chain settlement via action replay proofs.
+Browser-based frontend for the [Xaya Roguelike](https://github.com/EdwardAThomson/xaya-roguelike) blockchain game. Connects to the GSP via JSON-RPC, displays the overworld segment map, and runs dungeon sessions locally with on-chain settlement via action replay proofs.
+
+> **This repo** is the TypeScript browser client. The C++ backend (on-chain Game State Processor) lives in the companion repo: **[xaya-roguelike](https://github.com/EdwardAThomson/xaya-roguelike)**. The two must stay in lockstep on the deterministic dungeon/combat code (byte-for-byte parity).
 
 **Zero runtime dependencies** -- pure TypeScript compiled with `tsc`, no npm packages in production. All rendering is Canvas 2D with procedural sprites.
 
