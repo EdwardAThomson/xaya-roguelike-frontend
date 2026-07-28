@@ -39,6 +39,112 @@ export function bfsStep(walls, fx, fy, tx, ty) {
   return null;
 }
 
+const OPPOSITE = { north: "south", south: "north", east: "west", west: "east" };
+
+/** Coordinate of a segment id (hub id 0 is the origin). */
+function segCoord(segs, id) {
+  if (id === 0) return [0, 0];
+  const z = segs.find((s) => s.id === id);
+  return z ? [z.world_x, z.world_y] : [0, 0];
+}
+/** Gate directions a segment exposes (the hub has all four). */
+function gateDirsOf(segs, id) {
+  if (id === 0) return ["north", "south", "east", "west"];
+  const z = segs.find((s) => s.id === id);
+  return z && z.gates ? Object.keys(z.gates) : [];
+}
+function segByCoord(segs, x, y) {
+  return segs.find((s) => s.world_x === x && s.world_y === y);
+}
+/**
+ * Directions from segment `id` whose gate opens onto an UNEXPLORED coord
+ * within the depth budget: the real discovery opportunities from here.
+ */
+export function frontierDirsOf(segs, id, maxD) {
+  const [x, y] = segCoord(segs, id);
+  const out = [];
+  for (const d of gateDirsOf(segs, id)) {
+    const [dx, dy] = OFFSET[d];
+    const nx = x + dx, ny = y + dy;
+    // (0,0) is the hub - it always exists (id 0, not in the segment list), so a
+    // gate pointing at it is a plain transit home, NOT a discovery. Treating it
+    // as unexplored made a hub-adjacent segment look "frontier-capable" and
+    // bounced bots hub<->that-segment forever. Exclude it.
+    if (nx === 0 && ny === 0) continue;
+    if (!segByCoord(segs, nx, ny) && Math.abs(nx) + Math.abs(ny) <= maxD) out.push(d);
+  }
+  return out;
+}
+/** Deepest coord this segment can discover into (-1 if not frontier-capable). */
+export function frontierBestDepth(segs, id, maxD) {
+  const [x, y] = segCoord(segs, id);
+  let best = -1;
+  for (const d of frontierDirsOf(segs, id, maxD)) {
+    const [dx, dy] = OFFSET[d];
+    best = Math.max(best, Math.abs(x + dx) + Math.abs(y + dy));
+  }
+  return best;
+}
+/**
+ * BFS over the graph of CONFIRMED segments (an edge is a real gate onto a
+ * coord-adjacent confirmed neighbour, and the hub (0,0) is a traversable node
+ * that links every quadrant) from `fromId`. Among every reachable
+ * frontier-capable segment (including `fromId`), pick the one that can discover
+ * the DEEPEST coord, tie-broken by nearest, and return the first transit step
+ * toward it - or { atGoal: true } when standing on it already.
+ *
+ * The depth bias is deliberate and is what makes max distance actually CLIMB:
+ * routing to the merely-nearest frontier just refills the interior rings and
+ * leaves the edge flat, whereas heading for the deepest reachable edge pushes
+ * the frontier outward ring by ring. It is still a shortest-path first step
+ * toward a single chosen target, so it does not oscillate; the hub node lets a
+ * bot in one arm reach a deeper frontier in another arm.
+ */
+export function planToFrontier(segs, fromId, maxD) {
+  const q = [fromId];
+  const seen = new Set([fromId]);
+  const firstDir = new Map([[fromId, null]]);
+  const dist = new Map([[fromId, 0]]);
+  let bestId = -1, bestDepth = -1, bestDist = Infinity;
+  const consider = (id) => {
+    const fd = frontierBestDepth(segs, id, maxD);
+    if (fd < 0) return;
+    const dd = dist.get(id) ?? Infinity;
+    if (fd > bestDepth || (fd === bestDepth && dd < bestDist)) {
+      bestDepth = fd; bestDist = dd; bestId = id;
+    }
+  };
+  consider(fromId);
+  while (q.length) {
+    const cur = q.shift();
+    const [x, y] = segCoord(segs, cur);
+    for (const d of gateDirsOf(segs, cur)) {
+      const [dx, dy] = OFFSET[d];
+      const nx = x + dx, ny = y + dy;
+      // The hub (0,0) is real and traversable even though it is not in the
+      // segment list; without it BFS cannot cross from one arm of the map to a
+      // deeper frontier in another arm.
+      let nbId, nbConfirmed = true;
+      if (nx === 0 && ny === 0) {
+        nbId = 0;
+      } else {
+        const nb = segByCoord(segs, nx, ny);
+        if (!nb) continue;
+        nbId = nb.id; nbConfirmed = !!nb.confirmed;
+      }
+      if (!nbConfirmed || seen.has(nbId)) continue;
+      seen.add(nbId);
+      firstDir.set(nbId, cur === fromId ? d : firstDir.get(cur));
+      dist.set(nbId, (dist.get(cur) ?? 0) + 1);
+      consider(nbId);
+      q.push(nbId);
+    }
+  }
+  if (bestId < 0) return { atGoal: false, stepDir: null };
+  if (bestId === fromId) return { atGoal: true, stepDir: null };
+  return { atGoal: false, stepDir: firstDir.get(bestId) };
+}
+
 /**
  * Drives the player (already in a channel) to a gate and out, fighting
  * monsters in the way and healing when low. `preferDir` chooses which gate
@@ -116,7 +222,7 @@ export async function playAgent(page, cfg) {
     const confirm = await page.$(".modal-confirm");
     if (confirm) { await confirm.click(); await sleep(300); return true; }
     // Record genuine anomalies; ignore expected feedback (cooldowns,
-    // completion, respawn, coord-claim races, provisional-access blocks —
+    // completion, respawn, coord-claim races, provisional-access blocks,
     // all legitimate in a competitive multiplayer world).
     if (!/dungeon complete|respawn|welcome|cooldown|already claimed|provisional/i.test(s.modal))
       findings.push(`[${name}] modal: ${s.modal.slice(0, 120).replace(/\s+/g, " ").trim()}`);
@@ -182,10 +288,24 @@ export async function playAgent(page, cfg) {
   // so a bot can safely reach a bit beyond its "grind" depth; deaths are still
   // guarded by the depth-aware HP retreat. As the bot levels, this rises and
   // the frontier advances until monster difficulty genuinely outpaces it.
+  // There is NO on-chain depth cap (validateGateWalk gates a discovery only on
+  // the cooldown and hp>0), so this ceiling is purely a self-imposed guard
+  // against diving to death. With the survival heal on gate-walk and a full heal
+  // on level-up, bots are durable, so keep it generous and let the depth-aware
+  // HP retreat (retreatAt) do the actual death-avoidance. A too-tight cap was
+  // wedging capped bots at the edge with nothing to do (see the oscillation
+  // fix): level 1 -> depth 5, and it climbs 1:1 with level from there.
   const DEPTH_CEIL = Number(cfg.maxDepth ?? 99);
-  const allowedDepth = (lvl) => Math.min(DEPTH_CEIL, Math.max(3, (lvl ?? 1) + 2));
+  const allowedDepth = (lvl) => Math.min(DEPTH_CEIL, Math.max(5, (lvl ?? 1) + 4));
 
   let discoveries = 0, lastSig = "", stuck = 0;
+  // Anti-backtrack bookkeeping: the segment we were in before the current one.
+  // Used so a wedge-escape never turns a bot straight back the way it came.
+  let cameFrom = null, lastSeg = null;
+  // Recent segment-entry history (ids), for a branch-agnostic two-segment
+  // oscillation detector: if the last four entries alternate between just two
+  // segments, the bot is ping-ponging and must stop transiting (grind or park).
+  let segHist = [];
   let mapCache = { visitId: null, walls: null };
   // Per-visit combat budget: on entering a segment a bot hunts monsters for
   // up to this many action-turns before it is allowed to head for a gate.
@@ -200,6 +320,19 @@ export async function playAgent(page, cfg) {
 
   for (let tick = 0; tick < MAX_TICKS; tick++) {
     s = await state();
+
+    // Track the segment we just came from (updated whenever current_segment
+    // changes) so the navigation can refuse to immediately transit back to it.
+    if (s.player && s.player.current_segment !== lastSeg) {
+      if (lastSeg !== null) cameFrom = lastSeg;
+      lastSeg = s.player.current_segment;
+      segHist.push(s.player.current_segment);
+      if (segHist.length > 4) segHist.shift();
+    }
+    // Two-segment ping-pong: the last four DISTINCT-pairwise entries are A,B,A,B.
+    const oscillating = segHist.length >= 4
+      && segHist[0] === segHist[2] && segHist[1] === segHist[3]
+      && segHist[0] !== segHist[1];
 
     // Progress signature: include LIVE session hp and the alive-monster count
     // so that fighting an adjacent monster in place (position and on-chain
@@ -234,41 +367,50 @@ export async function playAgent(page, cfg) {
       await manageInventory(s);
       s = await state();
       const pl = s.player;
-      const curX = pl.current_segment === 0 ? 0
-        : (s.segments.find(x => x.id === pl.current_segment)?.world_x ?? 0);
-      const curY = pl.current_segment === 0 ? 0
-        : (s.segments.find(x => x.id === pl.current_segment)?.world_y ?? 0);
-      const confirmedNbr = {};
-      const occupied = new Set();
-      for (const [dir, [dx, dy]] of Object.entries(OFFSET)) {
-        const seg = s.segments.find(x => x.world_x === curX + dx && x.world_y === curY + dy);
-        if (seg) { occupied.add(dir); if (seg.confirmed) confirmedNbr[dir] = seg.id; }
-      }
-      const confirmedDirs = Object.keys(confirmedNbr);
-      const emptyDirs = Object.keys(OFFSET).filter(d => !occupied.has(d));
+      const segs = s.segments;
+      const maxD = allowedDepth(pl.level);
       const cd = pl.last_discover_height > 0
         ? Math.max(0, (pl.last_discover_height + 50) - (s.height ?? 0)) : 0;
+      const [curX, curY] = segCoord(segs, pl.current_segment);
+      const distFromHub = (d) => { const [dx, dy] = OFFSET[d]; return Math.abs(curX + dx) + Math.abs(curY + dy); };
+      // Real gates from HERE that open onto unexplored ground (deepest first),
+      // and the BFS route to the nearest segment that CAN push the frontier.
+      const frontierHere = frontierDirsOf(segs, pl.current_segment, maxD)
+        .sort((a, b) => distFromHub(b) - distFromHub(a));
+      const plan = planToFrontier(segs, pl.current_segment, maxD);
+      const owHealthy = pl.max_hp > 0 ? pl.hp >= pl.max_hp * 0.5 : true;
+      // Direction back to the segment we just came from (anti-backtrack).
+      const owBackDir = (() => {
+        if (cameFrom == null) return null;
+        for (const d of Object.keys(OFFSET)) {
+          const [dx, dy] = OFFSET[d];
+          if (cameFrom === 0) { if (curX + dx === 0 && curY + dy === 0) return d; }
+          else { const nb = segByCoord(segs, curX + dx, curY + dy); if (nb && nb.id === cameFrom) return d; }
+        }
+        return null;
+      })();
 
-      const depthProxy = Math.abs(curX) + Math.abs(curY);
-      const dist = (d) => { const [dx, dy] = OFFSET[d]; return Math.abs(curX + dx) + Math.abs(curY + dy); };
-      const emptyOut = [...emptyDirs].sort((a, b) => dist(b) - dist(a));
-      // Transit outward too: prefer the confirmed neighbour that leads
-      // furthest from the hub, so bots march toward the frontier instead of
-      // orbiting the hub. From inside that confirmed segment the dungeon-loop
-      // pushes another step out (and discovers when the outward tile is empty).
-      const confirmedOut = [...confirmedDirs].sort((a, b) => dist(b) - dist(a));
-      const maxD = allowedDepth(pl.level);
       let dir = null, discovering = false;
-      if (cd === 0 && emptyDirs.length && depthProxy < maxD && s.segments.length < WORLD_CAP) {
-        dir = emptyOut[0]; discovering = true;
-      } else if (confirmedOut.length) {
-        dir = confirmedOut[0];
-      } else if (emptyDirs.length && cd > 0) {
+      if (cd === 0 && segs.length < WORLD_CAP && frontierHere.length && plan.atGoal && owHealthy) {
+        // Standing on the DEEPEST reachable frontier: discover its deepest gate,
+        // pushing the edge out. (If a deeper frontier is reachable, plan.atGoal
+        // is false and we route toward it below instead of filling a shallow ring.)
+        dir = frontierHere[0]; discovering = true;
+      } else if (plan.stepDir && plan.stepDir !== owBackDir) {
+        // Otherwise transit ONE step toward the nearest frontier-capable
+        // segment (never straight back the way we came). That enters its
+        // channel, where the dungeon loop grinds, heals and discovers. This is a
+        // shortest-path step, never an orbit.
+        dir = plan.stepDir;
+      } else {
+        // No reachable frontier right now (world capped, hurt at a frontier we
+        // must heal for, or on cooldown at the only reachable frontier): PARK.
+        // Do nothing on-chain rather than churn transits. It clears shortly.
         await sleep(1500); continue;
-      } else { await sleep(500); continue; }
+      }
 
       if (cfg.debug && name === "bot_0")
-        console.error(`[ow bot_0 t${tick}] seg${pl.current_segment} dir=${dir} disc=${discovering} cd=${cd} empty=${emptyDirs} confOut=${confirmedOut}`);
+        console.error(`[ow bot_0 t${tick}] seg${pl.current_segment} dir=${dir} disc=${discovering} cd=${cd} frontierHere=${frontierHere} step=${plan.stepDir}`);
       await call("gateWalk", dir);
       const after = await waitIdle(15000);
       if (after.player?.in_channel && discovering) discoveries++;
@@ -356,119 +498,154 @@ export async function playAgent(page, cfg) {
     const HUNT_BUDGET = cfg.huntBudget ?? 24;
     const entryGate = () => sess.gates.find(g => g.direction === entryDir) || sess.gates[0];
 
-    // Nearest gate we can actually path to (optionally preferring outward ones).
-    const gateToward = (prefer) => {
-      const cand = [...prefer, ...sess.gates];
-      let best = null, bestLen = Infinity;
-      for (const g of cand) {
-        if (!g) continue;
-        const st = bfsStep(walls, sess.playerX, sess.playerY, g.x, g.y);
-        if (st && (st[0] || st[1])) {
-          const len = Math.abs(g.x - sess.playerX) + Math.abs(g.y - sess.playerY);
-          if (len < bestLen) { bestLen = len; best = g; }
-        }
-      }
-      return best || entryGate();
-    };
-
-    // The frontend banks a run's XP/gold/kills whenever it exits a gate having
-    // earned anything (see doGateWalk: earnedRewards). So combat XP is banked
-    // on gate-exit from BOTH provisional and confirmed segments. That makes the
-    // efficient loop: GRIND xp where it is SAFE (already-confirmed segments,
-    // whose depth the character has proven it survives) to level up, and make a
-    // QUICK, low-risk confirm run whenever we punch the frontier one step out.
-    const occupied = new Set();
-    for (const [d, [dx, dy]] of Object.entries(OFFSET)) {
-      if (s.segments.find(x => x.world_x === cx0 + dx && x.world_y === cy0 + dy)) occupied.add(d);
-    }
+    // --- Frontier-directed navigation (anti-oscillation core) ---
     const cd = p.last_discover_height > 0
       ? Math.max(0, (p.last_discover_height + 50) - (s.height ?? 0)) : 0;
     const distOf = (dir) => { const [dx, dy] = OFFSET[dir]; return Math.abs(cx0 + dx) + Math.abs(cy0 + dy); };
-    const outward = (g) => distOf(g.direction) > depthProxy;
-    const frontier = sess.gates.filter(g => !occupied.has(g.direction));
-    // Pick the outward-most gate to leave by: discover a deeper frontier when
-    // cooldown/cap allow (pushes AND confirms the next ring), else transit an
-    // outward confirmed neighbour, else any frontier, else lateral, else back.
-    const canDiscover = cd === 0 && depthProxy < maxD && s.segments.length < WORLD_CAP;
-    const frontierOut = frontier.filter(outward).sort((a, b) => distOf(b.direction) - distOf(a.direction));
-    const confirmedOut = sess.gates.filter(g => occupied.has(g.direction) && g.direction !== entryDir && outward(g))
-      .sort((a, b) => distOf(b.direction) - distOf(a.direction));
-    const lateralAny = sess.gates.filter(g => g.direction !== entryDir && occupied.has(g.direction));
-    const outwardGate = () => (canDiscover && frontierOut[0])
-      || confirmedOut[0]
-      || (canDiscover && frontier[0])
-      || lateralAny[0]
-      || entryGate();
+    const segs = s.segments;
+    // Real gates from HERE onto unexplored ground (deepest first), and the BFS
+    // route toward the nearest segment that CAN push the frontier. planToFrontier
+    // is a shortest path over confirmed segments, so following it never orbits.
+    const frontierHere = frontierDirsOf(segs, p.current_segment, maxD)
+      .sort((a, b) => distOf(b) - distOf(a));
+    const plan = planToFrontier(segs, p.current_segment, maxD);
+    // Discover from HERE only when this is the DEEPEST reachable frontier
+    // (plan.atGoal), off cooldown and under the world cap. If a deeper frontier
+    // is reachable, plan.stepDir (below) routes toward it instead of filling a
+    // shallower ring - this is what makes max distance climb rather than stall.
+    const canDiscoverHere = curConfirmed && cd === 0
+      && segs.length < WORLD_CAP && plan.atGoal && frontierHere.length > 0;
+    // HP needed to safely cross a segment to a frontier gate and confirm the new
+    // ring. Below this we grind/heal first rather than bleed out mid-crossing.
+    const PUSH_HP = 0.5;
 
-    // Reasons to stop fighting and head for a gate right now:
-    //  - hurt (hpRatio at/under the depth-aware retreat line): leave BEFORE we
-    //    can bleed to death (there is no HP regen; a death is costly),
-    //  - no-progress / pinned on an unresolving action (mustLeave).
+    // Gate helpers: object by direction, path-reachability, nearest of a list.
+    const gateObj = (dir) => sess.gates.find(g => g.direction === dir);
+    const reachable = (g) => {
+      if (!g) return false;
+      const st = bfsStep(walls, sess.playerX, sess.playerY, g.x, g.y);
+      return !!(st && (st[0] || st[1]));
+    };
+    const nearestGate = (dirs) => {
+      let best = null, bl = Infinity;
+      for (const d of dirs) {
+        const g = gateObj(d);
+        if (g && reachable(g)) {
+          const l = Math.abs(g.x - sess.playerX) + Math.abs(g.y - sess.playerY);
+          if (l < bl) { bl = l; best = g; }
+        }
+      }
+      return best;
+    };
+    const allDirs = sess.gates.map(g => g.direction);
+    const backDir = entryDir;
+    // Direction (by COORD, reliable) that transits back to the segment we just
+    // came from. Anti-backtrack keys off this, NOT entryDir: entryDir is the
+    // gate side we arrived on, which does not match the travel direction of the
+    // return hop, so using it let a two-segment bounce slip through.
+    const backSegDir = (() => {
+      if (cameFrom == null) return null;
+      for (const d of allDirs) {
+        const [dx, dy] = OFFSET[d];
+        if (cameFrom === 0) { if (cx0 + dx === 0 && cy0 + dy === 0) return d; }
+        else { const nb = segByCoord(segs, cx0 + dx, cy0 + dy); if (nb && nb.id === cameFrom) return d; }
+      }
+      return null;
+    })();
     const hurt = hpRatio <= retreatAt;
     const pinned = mustLeave;
-    const healthy = hpRatio > retreatAt;
-    // A confirmed segment that can punch a deeper frontier: leaving through that
-    // gate is a FREE transit+discover (a confirmed source needs no survival), so
-    // it advances the frontier at ANY hp. We therefore push to it even when
-    // "hurt", down to a low floor (dying mid-crossing only costs a hub respawn -
-    // no prune, since the source is confirmed). This is the primary way max
-    // distance grows.
-    const canPushFrontier = curConfirmed && canDiscover && frontierOut.length
-      && hpRatio > 0.35;
 
-    let target = null;
-    if (pinned) {
-      // No-progress escape: nearest reachable gate (outward if we still can).
-      const g = gateToward(healthy ? [outwardGate()] : [entryGate()]);
-      target = { x: g.x, y: g.y };
+    let target = null, decision = "";
+    if (oscillating && curConfirmed && !(canDiscoverHere && hpRatio >= PUSH_HP)) {
+      // BREAK A DETECTED TWO-SEGMENT PING-PONG (branch-agnostic backstop): the
+      // bot has bounced A-B-A-B without discovering. Stop transiting entirely -
+      // grind a monster if one is reachable and we are healthy (productive and
+      // it changes the sig), otherwise PARK. Only a genuine frontier push is
+      // still allowed to leave. This guarantees no oscillation survives even if
+      // the routing keeps proposing the return hop.
+      if (!hurt && nearestMon) {
+        target = { x: nearestMon.x, y: nearestMon.y };
+        if (nd <= 1) huntTurns++;
+        decision = "osc-grind";
+      } else {
+        await call("input", "wait");
+        stuck = 0; lastSig = "PARK";
+        await sleep(600);
+        continue;
+      }
+    } else if (pinned) {
+      // No-progress escape: any reachable gate, preferring one that is NOT the
+      // way we came in, so a wedge never becomes a two-gate bounce.
+      const g = nearestGate(allDirs.filter(d => d !== backDir))
+        || nearestGate(allDirs) || entryGate();
+      target = { x: g.x, y: g.y }; decision = "pinned";
     } else if (!curConfirmed) {
-      // PROVISIONAL (frontier): risky ground. Do NOT grind - just survive to a
-      // gate to CONFIRM it (banking whatever this short run earned) and advance
-      // the frontier. We spawn ON the entry gate and an instant exit does not
-      // count as survived, so head to a gate (a few steps); fight only an
-      // adjacent blocker briefly.
+      // PROVISIONAL frontier: do NOT grind, just survive to a gate to CONFIRM it
+      // (banking whatever this short run earned) and advance the frontier. We
+      // spawn ON the entry gate, so head to a gate a few steps off; fight only an
+      // adjacent blocker briefly. The entry gate is the safe, guaranteed exit
+      // back to the confirmed source we came from.
       if (nearestMon && nd <= 1 && huntTurns < 3) {
-        target = { x: nearestMon.x, y: nearestMon.y }; huntTurns++;
+        target = { x: nearestMon.x, y: nearestMon.y }; huntTurns++; decision = "confirm-fight";
       } else {
-        const g = entryGate();
-        target = { x: g.x, y: g.y };
+        const g = nearestGate([backDir]) || nearestGate(allDirs) || entryGate();
+        target = { x: g.x, y: g.y }; decision = "confirm";
       }
-    } else if (canPushFrontier) {
-      // PRIMARY GOAL = push the frontier. Beeline to the outward frontier gate to
-      // discover the next ring. Fight only an adjacent blocker (nd<=1) so a
-      // monster does not stall the push; otherwise walk straight for the gate.
+    } else if (canDiscoverHere && hpRatio >= PUSH_HP) {
+      // PUSH THE FRONTIER (primary goal): beeline the nearest gate that opens
+      // onto unexplored ground (deepest preferred). Fight only an adjacent
+      // blocker so a monster does not stall the push. Walking through discovers
+      // the next ring - this is what makes max distance climb.
       if (nearestMon && nd <= 1 && huntTurns < HUNT_BUDGET) {
-        target = { x: nearestMon.x, y: nearestMon.y }; huntTurns++;
+        target = { x: nearestMon.x, y: nearestMon.y }; huntTurns++; decision = "push-fight";
       } else {
-        const g = frontierOut[0];
-        target = { x: g.x, y: g.y };
+        const g = nearestGate(frontierHere) || nearestGate(allDirs) || entryGate();
+        target = { x: g.x, y: g.y }; decision = "push";
       }
-    } else if (hurt) {
-      // Hurt with nothing to discover here: retreat to the nearest gate (biased
-      // back toward the hub / safety) and settle whatever we earned.
-      const g = gateToward([entryGate()]);
-      target = { x: g.x, y: g.y };
-    } else if (nearestMon && nd <= 3 && huntTurns < HUNT_BUDGET) {
-      // CONFIRMED + healthy, no frontier to punch here: fight a CLOSE monster
-      // (opportunistic - one on/near our outward path) to bank XP and level up.
-      // We do not trek across the map to a distant monster; the else branch
-      // heads outward toward a frontier-capable segment. Levelling raises
-      // constitution/max_hp/defense and allowedDepth so the frontier can advance.
-      // Budget counts actual attacks (nd<=1); hurt->leave and the stuck guard
-      // cap the risk (retreat before we can die).
+    } else if (!hurt && nearestMon && huntTurns < HUNT_BUDGET) {
+      // GRIND (safe, confirmed segment; cannot discover here yet): fight the
+      // nearest monster - ANY distance, not just adjacent - to bank XP. Levelling
+      // up FULLY HEALS and raises the depth budget, which is exactly what lets a
+      // capped bot escape the edge and the frontier advance. Seeking distant
+      // monsters (not just ones next to the gate) is the fix for the "no-reward"
+      // transits that left bots stuck at low level.
       target = { x: nearestMon.x, y: nearestMon.y };
       if (nd <= 1) huntTurns++;
+      decision = "grind";
+    } else if (hurt) {
+      // RETREAT toward the hub: the reachable gate with the SMALLEST hub distance.
+      // Monotonically hubward, so it never bounces - it walks to shallower, safer
+      // ground (where retreatAt is lower, so it is "healthy" again) and there it
+      // grinds and heals. This replaces the old retreat-to-entry-gate that, paired
+      // with a healthy segment marching back outward, was the ping-pong.
+      const hubward = [...allDirs].sort((a, b) => distOf(a) - distOf(b));
+      const g = nearestGate(hubward) || entryGate();
+      target = { x: g.x, y: g.y }; decision = "retreat";
     } else {
-      // Nothing worth fighting nearby (or budget spent): leave via an outward
-      // gate - discover the next ring when cooldown/level allow, else transit
-      // outward toward the frontier.
-      const g = outwardGate();
-      target = { x: g.x, y: g.y };
+      // Healthy, nothing to fight here, cannot discover here: TRANSIT one step
+      // toward the nearest frontier-capable segment (BFS route). ANTI-BACKTRACK:
+      // never take a route step that leads straight back to the segment we just
+      // came from - in a densely-filled region two frontier-capable-but-on-
+      // cooldown segments can otherwise point at each other and 2-cycle. When
+      // the only route is back (or there is none: we ARE the nearest frontier
+      // but on cooldown, or the world is capped) PARK in place - wait, doing
+      // nothing on-chain, instead of churning transits. The stuck signature is
+      // reset so the wait is not mistaken for a wedge and does not trip escape.
+      const routeDir = plan.stepDir;
+      const g = (routeDir && routeDir !== backSegDir) ? gateObj(routeDir) : null;
+      if (g && reachable(g)) {
+        target = { x: g.x, y: g.y }; decision = "route";
+      } else {
+        await call("input", "wait");
+        stuck = 0; lastSig = "PARK";
+        await sleep(600);
+        continue;
+      }
     }
 
     const step = bfsStep(walls, sess.playerX, sess.playerY, target.x, target.y);
     if (cfg.debug && name === "bot_0" && tick % 3 === 0) {
-      console.error(`[dbg ${name} t${tick}] seg${p.current_segment} d${depthProxy} conf=${curConfirmed} hp=${hpRatio.toFixed(2)} hurt=${hurt} cd=${cd} canDisc=${canDiscover} frOut=${frontierOut.map(g=>g.direction)} nd=${nd} tgt=${target.x},${target.y}`);
+      console.error(`[dbg ${name} t${tick}] seg${p.current_segment} d${depthProxy} conf=${curConfirmed} hp=${hpRatio.toFixed(2)} ${decision} cd=${cd} discHere=${canDiscoverHere} frontierHere=${frontierHere} step=${plan.stepDir} nd=${nd} tgt=${target.x},${target.y}`);
     }
     if (!step || (step[0] === 0 && step[1] === 0)) {
       let moved = false;
