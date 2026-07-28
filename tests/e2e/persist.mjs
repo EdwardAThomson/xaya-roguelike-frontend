@@ -73,6 +73,12 @@ let stop = false;
 process.on("SIGINT", () => { stop = true; });
 process.on("SIGTERM", () => { stop = true; });
 
+// Manhattan distance of a segment from the hub (0,0). This is the DEPTH proxy
+// and the "how far can a character get" metric the soak is measuring.
+const segDist = (s) => Math.abs(s.world_x) + Math.abs(s.world_y);
+let maxDistEver = 0;
+let maxDistFirstSeen = null;
+
 async function referee() {
   let beats = 0;
   while (!stop) {
@@ -80,10 +86,35 @@ async function referee() {
       const gs = (await gsp("getcurrentstate"))?.gamestate;
       check(gs);
       if (beats % 6 === 0 && gs) {
-        const segs = (gs.segments || []).length;
-        const conf = (gs.segments || []).filter((s) => s.confirmed).length;
-        const inCh = (gs.players || []).filter((p) => p.in_channel).length;
-        console.log(`${ts()} .. world: ${(gs.players || []).length} players (${inCh} in dungeons), ${segs} segments (${conf} confirmed), ${seenViol.size} violations so far`);
+        const segments = gs.segments || [];
+        const players = gs.players || [];
+        const conf = segments.filter((s) => s.confirmed);
+        const inCh = players.filter((p) => p.in_channel).length;
+
+        // Max distance reached (confirmed segments are places you can actually
+        // stand; provisionals are unconfirmed claims, tracked separately).
+        const maxConf = conf.reduce((m, s) => Math.max(m, segDist(s)), 0);
+        const maxAny = segments.reduce((m, s) => Math.max(m, segDist(s)), 0);
+        if (maxConf > maxDistEver) { maxDistEver = maxConf; maxDistFirstSeen = ts(); }
+
+        // Distribution of CONFIRMED segments by distance ring.
+        const byDist = {};
+        for (const s of conf) byDist[segDist(s)] = (byDist[segDist(s)] || 0) + 1;
+        const dist = Object.keys(byDist).map(Number).sort((a, b) => a - b)
+          .map((d) => `d${d}:${byDist[d]}`).join(" ");
+
+        // Per-player level + current distance from hub.
+        const segById = new Map(segments.map((s) => [s.id, s]));
+        const perBot = players.map((p) => {
+          const seg = p.current_segment === 0 ? null : segById.get(p.current_segment);
+          const d = seg ? segDist(seg) : 0;
+          return `${p.name}=L${p.level}@d${d}`;
+        }).join(" ");
+
+        console.log(`${ts()} .. world: ${players.length} players (${inCh} in dungeons), ${segments.length} segments (${conf.length} confirmed), ${seenViol.size} violations`);
+        console.log(`${ts()} ** MAX DIST: ${maxDistEver} (confirmed; live max ${maxConf}, incl. provisional ${maxAny}); first reached ${maxDistFirstSeen}`);
+        console.log(`${ts()} ** rings (confirmed): ${dist || "(none)"}`);
+        console.log(`${ts()} ** bots: ${perBot}`);
       }
     } catch { /* transient */ }
     beats++;

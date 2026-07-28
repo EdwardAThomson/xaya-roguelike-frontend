@@ -66,8 +66,11 @@ export async function navigateOut(page, cfg, preferDir = "") {
     const sess = s.session;
     if (!sess) { await sleep(150); continue; }
     if (sess.gameOver) { await call("exitChannel"); await sleep(400); continue; }
-    if (s.player.hp < s.player.max_hp * 0.35
-        && s.player.inventory.some(i => i.slot === "bag" && i.item_id.includes("potion"))) {
+    // Live combat hp is on the session, not the frozen on-chain player.hp.
+    const liveHp = sess.hp ?? s.player.hp;
+    const liveMax = sess.maxHp ?? s.player.max_hp;
+    if (liveHp < liveMax * 0.4 && liveHp < liveMax
+        && s.player.inventory.some(i => i.slot === "bag" && i.item_id === "health_potion")) {
       await call("input", "use_potion"); await sleep(150); continue;
     }
     const dir = preferDir || s.player.active_visit?.entry_direction || sess.gates[0]?.direction;
@@ -130,7 +133,16 @@ export async function playAgent(page, cfg) {
     if (p.hp < p.max_hp * 0.5 && potions.length) {
       await call("useItem", potions[0].item_id); await waitIdle(); return;
     }
-    if (p.stat_points > 0) { await call("allocateStat", "strength"); await waitIdle(); return; }
+    if (p.stat_points > 0) {
+      // Durability-first: max_hp = 50 + constitution*5, so pumping
+      // constitution is what lets a character survive deeper. Keep a little
+      // strength flowing (kill faster = less exposure) at roughly a 1:2
+      // strength:constitution ratio.
+      const con = p.stats?.constitution ?? 10;
+      const str = p.stats?.strength ?? 5;
+      const stat = (str * 2 < con) ? "strength" : "constitution";
+      await call("allocateStat", stat); await waitIdle(); return;
+    }
     const gear = p.inventory.find(i => i.slot === "bag"
       && /sword|axe|mace|staff|armor|mail|plate|helmet|cap|boots|shield|ring|amulet|necklace/.test(i.item_id));
     if (gear) {
@@ -157,14 +169,21 @@ export async function playAgent(page, cfg) {
   if (s.status !== "connected") { fail("did not connect"); return; }
   if (!s.player) { await call("register"); await waitIdle(); }
 
-  // Stop growing the map once it is large, so the world does not sprawl
-  // without bound over a long soak; below the cap, bots keep pushing the
-  // frontier (cooldown-paced) so the world stays visibly active.
-  const WORLD_CAP = Math.max(24, OUTBOUND * 6);
-  // How far from the hub (Manhattan distance) bots will push the frontier.
-  // Higher = bots travel further out; too high risks level-1 bots dying in
-  // deep discovery runs (they still transit confirmed segments safely).
-  const MAX_DEPTH = Number(cfg.maxDepth ?? 6);
+  // Bound total segment count so the world does not sprawl without limit
+  // over a long soak. Kept generous so it never caps DISTANCE (a deep single
+  // arm needs few segments) - the binding limit on distance is survival.
+  const WORLD_CAP = Math.max(80, OUTBOUND * 10);
+  // The frontier push is gated by SURVIVAL, not an arbitrary constant: a bot
+  // only discovers a segment one step deeper than the hub if its level (a
+  // proxy for how much monster difficulty it can tank) allows it. As the bot
+  // banks XP and levels up, this allowance rises and the frontier advances.
+  // level 1 -> depth 3, level 2 -> depth 4, ... plus an optional hard ceiling.
+  // A frontier confirm is a quick in-and-out (survive a few turns to a gate),
+  // so a bot can safely reach a bit beyond its "grind" depth; deaths are still
+  // guarded by the depth-aware HP retreat. As the bot levels, this rises and
+  // the frontier advances until monster difficulty genuinely outpaces it.
+  const DEPTH_CEIL = Number(cfg.maxDepth ?? 99);
+  const allowedDepth = (lvl) => Math.min(DEPTH_CEIL, Math.max(3, (lvl ?? 1) + 2));
 
   let discoveries = 0, lastSig = "", stuck = 0;
   let mapCache = { visitId: null, walls: null };
@@ -209,13 +228,19 @@ export async function playAgent(page, cfg) {
         ? Math.max(0, (pl.last_discover_height + 50) - (s.height ?? 0)) : 0;
 
       const depthProxy = Math.abs(curX) + Math.abs(curY);
-      const distEmpty = (d) => { const [dx, dy] = OFFSET[d]; return Math.abs(curX + dx) + Math.abs(curY + dy); };
-      const emptyOut = [...emptyDirs].sort((a, b) => distEmpty(b) - distEmpty(a));
+      const dist = (d) => { const [dx, dy] = OFFSET[d]; return Math.abs(curX + dx) + Math.abs(curY + dy); };
+      const emptyOut = [...emptyDirs].sort((a, b) => dist(b) - dist(a));
+      // Transit outward too: prefer the confirmed neighbour that leads
+      // furthest from the hub, so bots march toward the frontier instead of
+      // orbiting the hub. From inside that confirmed segment the dungeon-loop
+      // pushes another step out (and discovers when the outward tile is empty).
+      const confirmedOut = [...confirmedDirs].sort((a, b) => dist(b) - dist(a));
+      const maxD = allowedDepth(pl.level);
       let dir = null, discovering = false;
-      if (cd === 0 && emptyDirs.length && depthProxy < MAX_DEPTH && s.segments.length < WORLD_CAP) {
+      if (cd === 0 && emptyDirs.length && depthProxy < maxD && s.segments.length < WORLD_CAP) {
         dir = emptyOut[0]; discovering = true;
-      } else if (confirmedDirs.length) {
-        dir = confirmedDirs[tick % confirmedDirs.length];
+      } else if (confirmedOut.length) {
+        dir = confirmedOut[0];
       } else if (emptyDirs.length && cd > 0) {
         await sleep(1500); continue;
       } else { await sleep(500); continue; }
@@ -230,8 +255,33 @@ export async function playAgent(page, cfg) {
     if (!sess) { await sleep(200); continue; }
     if (sess.gameOver) { await call("exitChannel"); await waitIdle(15000); continue; }
 
-    if (p.hp < p.max_hp * 0.35
-        && p.inventory.some(i => i.slot === "bag" && i.item_id.includes("potion"))) {
+    // LIVE combat HP comes from the running session (sess.hp/maxHp), NOT the
+    // on-chain player.hp, which is frozen until the run settles. Every in-run
+    // survival decision keys off the live value.
+    const liveHp = sess.hp ?? p.hp;
+    const liveMax = sess.maxHp ?? p.max_hp;
+    const hpRatio = liveMax > 0 ? liveHp / liveMax : 1;
+    const havePotion = p.inventory.some(i => i.slot === "bag"
+      && (i.item_id === "health_potion"));
+
+    // Depth-aware safety margin: monster damage scales with depth, so the
+    // deeper we are the earlier we bail. Shallow (near-hub) segments are cheap,
+    // so we fight down to a low HP there - which matters because the ONLY way
+    // to heal is drinking potions, and the only way to GET potions is killing
+    // monsters, so a timid bot at half HP would deadlock (never fight, never
+    // heal, never level). retreatAt rises from ~0.35 near the hub toward ~0.6
+    // deep, where a level-appropriate character has far more max HP to spend.
+    const depthProxyEarly = (() => {
+      const seg = s.segments.find(x => x.id === p.current_segment);
+      return seg ? Math.abs(seg.world_x) + Math.abs(seg.world_y) : 0;
+    })();
+    const retreatAt = Math.min(0.6, 0.32 + 0.045 * depthProxyEarly);
+
+    // Drink when hurt (and not already topped up). Drinking raises live hp,
+    // which is banked on a surviving exit, so it both saves the run and heals
+    // the character for future runs. Drink a bit before the retreat line so we
+    // can keep fighting rather than bail.
+    if (hpRatio < retreatAt + 0.2 && liveHp < liveMax && havePotion) {
       await call("input", "use_potion"); await sleep(150); continue;
     }
     if (sess.groundItems.some(g => g.x === sess.playerX && g.y === sess.playerY)) {
@@ -249,59 +299,70 @@ export async function playAgent(page, cfg) {
     const cx0 = curSeg?.world_x ?? 0, cy0 = curSeg?.world_y ?? 0;
     const depthProxy = Math.abs(cx0) + Math.abs(cy0);
     const curConfirmed = !curSeg || !!curSeg.confirmed;   // hub (id 0) counts as confirmed
-    const combatReady = p.hp > p.max_hp * 0.5;
+    const maxD = allowedDepth(p.level);
+
     let nearestMon = null, nd = Infinity;
     for (const m of sess.monsters) {
       const md = Math.abs(m.x - sess.playerX) + Math.abs(m.y - sess.playerY);
       if (md < nd) { nd = md; nearestMon = m; }
     }
-    const HUNT_BUDGET = cfg.huntBudget ?? 40;
+    const HUNT_BUDGET = cfg.huntBudget ?? 80;
+    const entryGate = () => sess.gates.find(g => g.direction === entryDir) || sess.gates[0];
+
+    // The frontend banks a run's XP/gold/kills whenever it exits a gate having
+    // earned anything (see doGateWalk: earnedRewards). So combat XP is banked
+    // on gate-exit from BOTH provisional and confirmed segments. That makes the
+    // efficient loop: GRIND xp where it is SAFE (already-confirmed segments,
+    // whose depth the character has proven it survives) to level up, and make a
+    // QUICK, low-risk confirm run whenever we punch the frontier one step out.
+    const occupied = new Set();
+    for (const [d, [dx, dy]] of Object.entries(OFFSET)) {
+      if (s.segments.find(x => x.world_x === cx0 + dx && x.world_y === cy0 + dy)) occupied.add(d);
+    }
+    const cd = p.last_discover_height > 0
+      ? Math.max(0, (p.last_discover_height + 50) - (s.height ?? 0)) : 0;
+    const distOf = (dir) => { const [dx, dy] = OFFSET[dir]; return Math.abs(cx0 + dx) + Math.abs(cy0 + dy); };
+    const outward = (g) => distOf(g.direction) > depthProxy;
+    const frontier = sess.gates.filter(g => !occupied.has(g.direction));
+    // Pick the outward-most gate to leave by: discover a deeper frontier when
+    // cooldown/cap allow (pushes AND confirms the next ring), else transit an
+    // outward confirmed neighbour, else any frontier, else lateral, else back.
+    const canDiscover = cd === 0 && depthProxy < maxD && s.segments.length < WORLD_CAP;
+    const frontierOut = frontier.filter(outward).sort((a, b) => distOf(b.direction) - distOf(a.direction));
+    const confirmedOut = sess.gates.filter(g => occupied.has(g.direction) && g.direction !== entryDir && outward(g))
+      .sort((a, b) => distOf(b.direction) - distOf(a.direction));
+    const lateralAny = sess.gates.filter(g => g.direction !== entryDir && occupied.has(g.direction));
+    const outwardGate = () => (canDiscover && frontierOut[0])
+      || confirmedOut[0]
+      || (canDiscover && frontier[0])
+      || lateralAny[0]
+      || entryGate();
 
     let target = null;
-    if (combatReady && nearestMon && nd <= 5 && huntTurns < HUNT_BUDGET) {
-      // Fight a NEARBY monster briefly (banks XP toward levelling, and stops
-      // the degenerate instant-transit oscillation). Only nearby and only
-      // while healthy, so we do not chase deep and die.
+    if (!curConfirmed) {
+      // PROVISIONAL (frontier): risky ground. Do NOT grind here - just survive
+      // to a gate to CONFIRM it (banking whatever this short run earned) and
+      // advance the frontier. Spawning is ON the entry gate and an instant exit
+      // does not count as survived, so take a few steps first; fight only an
+      // adjacent blocker and only while healthy.
+      if (hpRatio > retreatAt && nearestMon && nd <= 1 && huntTurns < 4) {
+        target = { x: nearestMon.x, y: nearestMon.y }; huntTurns++;
+      } else {
+        const g = entryGate();
+        target = { x: g.x, y: g.y };
+      }
+    } else if (hpRatio > retreatAt && nearestMon && nd <= 8 && huntTurns < HUNT_BUDGET) {
+      // CONFIRMED + healthy: GRIND. Hunt the nearest monster to bank XP (this is
+      // the safe, level-appropriate depth we already cleared). Levelling raises
+      // constitution/max_hp and defense, and raises allowedDepth so the frontier
+      // can push further next time.
       target = { x: nearestMon.x, y: nearestMon.y };
       huntTurns++;
-    } else if (!curConfirmed) {
-      // We are in our own freshly discovered PROVISIONAL segment. Confirm it
-      // by surviving to the entry gate (a short, safe retreat) instead of
-      // pushing deeper and dying (which prunes it). This marches the frontier
-      // outward one confirmed step at a time.
-      const gate = sess.gates.find(g => g.direction === entryDir) || sess.gates[0];
-      target = { x: gate.x, y: gate.y };
     } else {
-      // Confirmed segment: pick an exit gate, biased OUTWARD so bots travel
-      // far rather than orbit the hub.
-      const occupied = new Set();
-      for (const [d, [dx, dy]] of Object.entries(OFFSET)) {
-        if (s.segments.find(x => x.world_x === cx0 + dx && x.world_y === cy0 + dy)) occupied.add(d);
-      }
-      const cd = p.last_discover_height > 0
-        ? Math.max(0, (p.last_discover_height + 50) - (s.height ?? 0)) : 0;
-      const frontier = sess.gates.filter(g => !occupied.has(g.direction));
-      const distOf = (dir) => { const [dx, dy] = OFFSET[dir]; return Math.abs(cx0 + dx) + Math.abs(cy0 + dy); };
-      const outward = (g) => distOf(g.direction) > depthProxy;
-      const healthy = p.hp > p.max_hp * 0.6;
-      let gate;
-      if (!healthy) {
-        gate = sess.gates.find(g => g.direction === entryDir) || sess.gates[0];
-      } else {
-        // Prefer: discover an outward frontier, then transit an outward
-        // confirmed neighbour, then any frontier, then any lateral gate;
-        // fall back to the entry gate.
-        const canDiscover = cd === 0 && depthProxy < MAX_DEPTH && s.segments.length < WORLD_CAP;
-        const frontierOut = frontier.filter(outward);
-        const confirmedOut = sess.gates.filter(g => occupied.has(g.direction) && g.direction !== entryDir && outward(g));
-        const lateralAny = sess.gates.filter(g => g.direction !== entryDir && occupied.has(g.direction));
-        gate = (canDiscover && frontierOut[0])
-            || confirmedOut[0]
-            || (canDiscover && frontier[0])
-            || lateralAny[0]
-            || sess.gates.find(g => g.direction === entryDir)
-            || sess.gates[0];
-      }
+      // CONFIRMED and either done grinding or hurt: leave. Head outward to push
+      // toward/through the frontier when healthy; retreat toward the hub (entry
+      // gate) when hurt so we do not bleed out far from safety.
+      const gate = hpRatio > retreatAt ? outwardGate() : entryGate();
       target = { x: gate.x, y: gate.y };
     }
 
