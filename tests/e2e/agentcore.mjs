@@ -196,11 +196,28 @@ export async function playAgent(page, cfg) {
   for (let tick = 0; tick < MAX_TICKS; tick++) {
     s = await state();
 
-    const sig = `${s.player?.current_segment}:${s.session?.playerX}:${s.session?.playerY}:${s.player?.hp}`;
+    // Progress signature: include LIVE session hp and the alive-monster count
+    // so that fighting an adjacent monster in place (position and on-chain
+    // player.hp both unchanged, but session hp / monster count moving) counts
+    // as progress. If NONE of these move for several ticks the chosen action is
+    // a no-op (e.g. trying to attack a monster across a wall corner, an
+    // unreachable target): rather than kill the whole cycle, flip to
+    // "must-leave" and steer straight for a gate so the run SETTLES (banking
+    // its XP) and the bot moves on. Only a very long wedge breaks the cycle.
+    const aliveMons = s.session?.monsters?.length ?? 0;
+    // Total monster HP is in the signature so that DEALING DAMAGE (even to an
+    // unaware monster that never hits back, so player hp is flat) counts as
+    // progress. Travel changes position; combat changes monster hp/count; only
+    // a genuinely wedged action (an unreachable/unresolving target) leaves all
+    // of position, player hp, monster count AND monster hp unchanged.
+    const totalMonHp = (s.session?.monsters ?? []).reduce((a, m) => a + m.hp, 0);
+    const sig = `${s.player?.current_segment}:${s.session?.playerX}:${s.session?.playerY}:${s.session?.hp}:${aliveMons}:${totalMonHp}`;
     if (s.player?.in_channel && sig === lastSig && !s.modal && !s.busy) {
-      if (++stuck > 25) { fail(`stuck ${stuck} ticks in dungeon at ${sig}`); break; }
+      stuck++;
+      if (stuck > 250) { fail(`stuck ${stuck} ticks in dungeon at ${sig}`); break; }
     } else stuck = 0;
     lastSig = sig;
+    const mustLeave = stuck >= 10;
 
     if (s.modal) { await handleModal(s); continue; }
     if (s.busy) { await sleep(200); continue; }
@@ -245,6 +262,8 @@ export async function playAgent(page, cfg) {
         await sleep(1500); continue;
       } else { await sleep(500); continue; }
 
+      if (cfg.debug && name === "bot_0")
+        console.error(`[ow bot_0 t${tick}] seg${pl.current_segment} dir=${dir} disc=${discovering} cd=${cd} empty=${emptyDirs} confOut=${confirmedOut}`);
       await call("gateWalk", dir);
       const after = await waitIdle(15000);
       if (after.player?.in_channel && discovering) discoveries++;
@@ -254,6 +273,8 @@ export async function playAgent(page, cfg) {
     const sess = s.session;
     if (!sess) { await sleep(200); continue; }
     if (sess.gameOver) { await call("exitChannel"); await waitIdle(15000); continue; }
+    if (cfg.debug && name === "bot_0" && tick % 10 === 0)
+      console.error(`[dz bot_0 t${tick}] seg${p.current_segment} mons=${sess.monsters.length} pos=${sess.playerX},${sess.playerY} hp=${sess.hp}/${sess.maxHp}`);
 
     // LIVE combat HP comes from the running session (sess.hp/maxHp), NOT the
     // on-chain player.hp, which is frozen until the run settles. Every in-run
@@ -306,8 +327,26 @@ export async function playAgent(page, cfg) {
       const md = Math.abs(m.x - sess.playerX) + Math.abs(m.y - sess.playerY);
       if (md < nd) { nd = md; nearestMon = m; }
     }
-    const HUNT_BUDGET = cfg.huntBudget ?? 80;
+    // Modest per-visit combat budget: kill a FEW nearby monsters (banked on
+    // exit), then leave. Short runs bank XP steadily without wading deep into a
+    // monster cluster and dying (no HP regen exists, so a death is expensive).
+    const HUNT_BUDGET = cfg.huntBudget ?? 24;
     const entryGate = () => sess.gates.find(g => g.direction === entryDir) || sess.gates[0];
+
+    // Nearest gate we can actually path to (optionally preferring outward ones).
+    const gateToward = (prefer) => {
+      const cand = [...prefer, ...sess.gates];
+      let best = null, bestLen = Infinity;
+      for (const g of cand) {
+        if (!g) continue;
+        const st = bfsStep(walls, sess.playerX, sess.playerY, g.x, g.y);
+        if (st && (st[0] || st[1])) {
+          const len = Math.abs(g.x - sess.playerX) + Math.abs(g.y - sess.playerY);
+          if (len < bestLen) { bestLen = len; best = g; }
+        }
+      }
+      return best || entryGate();
+    };
 
     // The frontend banks a run's XP/gold/kills whenever it exits a gate having
     // earned anything (see doGateWalk: earnedRewards). So combat XP is banked
@@ -338,35 +377,68 @@ export async function playAgent(page, cfg) {
       || lateralAny[0]
       || entryGate();
 
+    // Reasons to stop fighting and head for a gate right now:
+    //  - hurt (hpRatio at/under the depth-aware retreat line): leave BEFORE we
+    //    can bleed to death (there is no HP regen; a death is costly),
+    //  - no-progress / pinned on an unresolving attack (mustLeave / monStall),
+    //  - done with this run's combat budget.
+    const hurt = hpRatio <= retreatAt;
+    const pinned = mustLeave;
+    const healthy = hpRatio > retreatAt;
+
     let target = null;
-    if (!curConfirmed) {
-      // PROVISIONAL (frontier): risky ground. Do NOT grind here - just survive
-      // to a gate to CONFIRM it (banking whatever this short run earned) and
-      // advance the frontier. Spawning is ON the entry gate and an instant exit
-      // does not count as survived, so take a few steps first; fight only an
-      // adjacent blocker and only while healthy.
-      if (hpRatio > retreatAt && nearestMon && nd <= 1 && huntTurns < 4) {
+    if (hurt || pinned) {
+      // Leave immediately via the nearest reachable gate. When still healthy
+      // (a pin, not low HP) bias outward so the exit also makes progress.
+      const g = gateToward(healthy ? [outwardGate()] : [entryGate()]);
+      target = { x: g.x, y: g.y };
+    } else if (!curConfirmed) {
+      // PROVISIONAL (frontier): risky ground. Do NOT grind - just survive to a
+      // gate to CONFIRM it (banking whatever this short run earned) and advance
+      // the frontier. We spawn ON the entry gate and an instant exit does not
+      // count as survived, so head to a gate (a few steps); fight only an
+      // adjacent blocker briefly.
+      if (nearestMon && nd <= 1 && huntTurns < 3) {
         target = { x: nearestMon.x, y: nearestMon.y }; huntTurns++;
       } else {
         const g = entryGate();
         target = { x: g.x, y: g.y };
       }
-    } else if (hpRatio > retreatAt && nearestMon && nd <= 8 && huntTurns < HUNT_BUDGET) {
-      // CONFIRMED + healthy: GRIND. Hunt the nearest monster to bank XP (this is
-      // the safe, level-appropriate depth we already cleared). Levelling raises
-      // constitution/max_hp and defense, and raises allowedDepth so the frontier
-      // can push further next time.
+    } else if (healthy && canDiscover && frontierOut.length) {
+      // PRIMARY GOAL = push the frontier. If we are healthy in a confirmed
+      // segment that CAN discover a deeper neighbour (cooldown clear, level
+      // allows the depth, world under cap), beeline for that outward frontier
+      // gate. Stepping through it discovers the next ring and, once we survive a
+      // confirm run there, extends the max distance. Fight only an adjacent
+      // blocker on the way (nd<=1) so a monster does not stall the push.
+      if (nearestMon && nd <= 1 && huntTurns < HUNT_BUDGET) {
+        target = { x: nearestMon.x, y: nearestMon.y }; huntTurns++;
+      } else {
+        const g = frontierOut[0];
+        target = { x: g.x, y: g.y };
+      }
+    } else if (nearestMon && nd <= 3 && huntTurns < HUNT_BUDGET) {
+      // CONFIRMED + healthy, no frontier to punch here: fight a CLOSE monster
+      // (opportunistic - one on/near our outward path) to bank XP and level up.
+      // We do not trek across the map to a distant monster; the else branch
+      // heads outward toward a frontier-capable segment. Levelling raises
+      // constitution/max_hp/defense and allowedDepth so the frontier can advance.
+      // Budget counts actual attacks (nd<=1); hurt->leave and the stuck guard
+      // cap the risk (retreat before we can die).
       target = { x: nearestMon.x, y: nearestMon.y };
-      huntTurns++;
+      if (nd <= 1) huntTurns++;
     } else {
-      // CONFIRMED and either done grinding or hurt: leave. Head outward to push
-      // toward/through the frontier when healthy; retreat toward the hub (entry
-      // gate) when hurt so we do not bleed out far from safety.
-      const gate = hpRatio > retreatAt ? outwardGate() : entryGate();
-      target = { x: gate.x, y: gate.y };
+      // Nothing worth fighting nearby (or budget spent): leave via an outward
+      // gate - discover the next ring when cooldown/level allow, else transit
+      // outward toward the frontier.
+      const g = outwardGate();
+      target = { x: g.x, y: g.y };
     }
 
     const step = bfsStep(walls, sess.playerX, sess.playerY, target.x, target.y);
+    if (cfg.debug && name === "bot_0" && tick % 3 === 0) {
+      console.error(`[dbg ${name} t${tick}] seg${p.current_segment} conf=${curConfirmed} hp=${hpRatio.toFixed(2)} hurt=${hurt} pin=${pinned} ht=${huntTurns} nd=${nd} pos=${sess.playerX},${sess.playerY} tgt=${target.x},${target.y} step=${step}`);
+    }
     if (!step || (step[0] === 0 && step[1] === 0)) {
       let moved = false;
       for (const g of sess.gates) {

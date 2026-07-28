@@ -127,8 +127,10 @@ async function runAgent(page, name) {
   while (!stop) {
     cycle++;
     try {
-      const s = await playAgent(page, { name, findings: [], outbound: OUTBOUND, maxTicks: TICKS });
-      console.log(`${ts()} [${name}] cycle ${cycle} done ${JSON.stringify(s)}`);
+      const findings = [];
+      const s = await playAgent(page, { name, findings, outbound: OUTBOUND, maxTicks: TICKS, debug: !!process.env.ROG_DEBUG });
+      const fnote = findings.length ? ` findings=${JSON.stringify(findings.slice(-3))}` : "";
+      console.log(`${ts()} [${name}] cycle ${cycle} done ${JSON.stringify(s)}${fnote}`);
     } catch (e) {
       console.log(`${ts()} [${name}] cycle ${cycle} ERROR ${e.message}`);
       try {
