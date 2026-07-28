@@ -755,8 +755,12 @@ async function doUseItem(itemId: string): Promise<void> {
 
   // Drinking a health potion at full HP would silently waste it, so guard
   // against it here (covers greater_health_potion too via the substring).
+  // Use a visible modal, not just a log line: the inventory modal is usually
+  // open on top of the message log, so a log-only message reads as "the
+  // potion button does nothing / is broken".
   if (itemId.includes("health_potion") && ctx.player.hp >= ctx.player.max_hp) {
-    addOverworldMessage("Already at full HP.", "info");
+    showErrorModal("Already at full HP",
+      "You are at full health, so this potion would be wasted. It is saved for when you are hurt.");
     return;
   }
 
@@ -1413,6 +1417,10 @@ document.addEventListener("click", (e) => {
     case "use-item":
       doUseItem(target.dataset.item!);
       break;
+    case "use-potion-local":
+      // Drink a potion inside a dungeon: local, replayed action (same as P).
+      handleGameInput("use_potion");
+      break;
     case "allocate-stat":
       doAllocateStat(target.dataset.stat!);
       break;
@@ -1569,7 +1577,14 @@ function renderInventoryTabBody(): string {
           canEquip ? `<button class="inv-btn equip" data-action="equip" data-rowid="${it.rowid}" data-slot="${def!.slot}">Equip</button>` : "",
           canUse ? `<button class="inv-btn use" data-action="use-item" data-item="${it.item_id}">Use</button>` : "",
           `<button class="inv-btn discard" data-action="discard" data-rowid="${it.rowid}">Drop</button>`,
-        ].join("") : "";
+        ].join("")
+          // Inside a dungeon, equip/drop are on-chain moves the GSP rejects
+          // mid-run, so they stay read-only. But drinking a potion IS a local,
+          // replayed action (the same one the P key does), so keep the potion
+          // usable from the modal here instead of leaving it dead.
+          : (p.in_channel && canUse
+            ? `<button class="inv-btn use" data-action="use-potion-local">Drink</button>`
+            : "");
         const qty = it.quantity > 1 ? ` x${it.quantity}` : "";
         return `<div class="inv-row">
           <span class="inv-item-icon">${itemIcon(it.item_id)}</span>
@@ -1592,7 +1607,7 @@ function renderInventoryTabBody(): string {
   }
 
   const note = p.in_channel
-    ? '<div class="inv-note">In a dungeon: inventory is locked until you settle.</div>'
+    ? '<div class="inv-note">In a dungeon you can drink potions (here or with P). Equipping gear and managing loot happen back at the hub: loot you pick up settles into your bag when you exit through a gate, then you can equip it.</div>'
     : "";
 
   return `
