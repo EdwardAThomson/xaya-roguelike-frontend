@@ -9,6 +9,7 @@ Browser-based frontend for the [Xaya Roguelike](../xayaroguelike/) blockchain ga
 - **Overworld map**: Segment graph rendered on canvas, click to select, travel between segments
 - **On-chain state**: Player stats, inventory, equipment, combat record from the GSP
 - **Dungeon play**: Full turn-based roguelike (12 monster types, 31 items, fog of war, 8-dir movement)
+- **Multiplayer presence**: Other players shown as tokens on the overworld map and listed (active first) in a Players tab
 - **Channel integration**: Enter dungeons using real on-chain player stats, exit with cryptographic replay proof
 - **Deterministic**: Dungeon generation and RNG verified identical to C++ backend (SHA-256 + MT19937)
 
@@ -28,7 +29,7 @@ python3 -m http.server 8000
 
 ### Standalone mode
 
-Open the page, switch to "Dungeon" mode, press N to start a local dungeon session. No backend needed.
+Open the page, click **Play** on the title screen, then press N to start a local dungeon session. No backend needed.
 
 ### Connected mode (devnet)
 
@@ -43,7 +44,7 @@ cd ~/Projects/xaya-roguelike-frontend
 python3 -m http.server 8000
 ```
 
-1. Open `http://localhost:8000`
+1. Open `http://localhost:8000` and click **Play** on the title screen
 2. Paste the GSP RPC URL from terminal 1 into the GSP field
 3. Enter a player name, click **Connect**
 4. Click **Register Player** if the name is new
@@ -71,6 +72,7 @@ src/
     rng.ts                  MT19937 (matches C++ std::mt19937)
     hash.ts                 SHA-256 (matches C++ HashSeed())
   render/
+    canvas.ts               Canvas setup and main render loop
     tiles.ts                Procedural wall/floor/gate sprites (24px)
     entities.ts             Monster symbols, item icons, player
     camera.ts               Viewport management
@@ -80,11 +82,13 @@ src/
     rpc.ts                  JSON-RPC 2.0 client (typed GSP methods)
     connection.ts           Connection manager with auto-polling
     moves.ts                Move submission client (devnet proxy)
+    walletTransport.ts      Wallet (window.ethereum) move transport, dormant until Phase F4b
     validator.ts            Client-side pre-validation (mirrors moveparser.cpp)
     pending.ts              Post-submit revalidation (detect silently-dropped moves)
   ui/
     modal.ts                Error/confirm dialogs
     overlay.ts              Overlay rendering
+tests/e2e/                  Headless Playwright harness + soak bots (see tests/e2e/README.md)
 dist/                       Compiled JS + source maps
 ```
 

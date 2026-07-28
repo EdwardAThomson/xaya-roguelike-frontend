@@ -18,7 +18,7 @@ called from the browser console.
 To run against a live backend (connected mode), start the devnet from the
 companion repo: `python3 devnet/frontend_devnet.py` in `~/Projects/xayaroguelike`
 (see README.md for the full walkthrough). Standalone dungeon play needs no backend:
-switch to "Dungeon" mode and press N.
+click Play on the title screen and press N.
 
 ## Critical constraint: determinism parity with the C++ backend
 
