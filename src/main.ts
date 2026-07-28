@@ -926,7 +926,20 @@ async function doGateWalk(dir: string): Promise<void> {
   };
   let transit = false;
   if (channelSession && session) {
-    if (curConfirmed) {
+    // A run banks its rewards when it actually did something worth settling:
+    // picked up loot, used a potion, or earned XP/gold/kills from combat.
+    // Leaving a PROVISIONAL segment always settles (that is what confirms
+    // it); a survived run through a CONFIRMED segment that earned anything
+    // must ALSO settle so the GSP banks the replay-derived loot AND xp/gold,
+    // otherwise it is silently wiped on transit (that is how re-run loot and
+    // combat XP were being lost). Only a bare crossing of a confirmed segment
+    // (no loot, no combat) stays a plain, free transit with no proof.
+    const earnedRewards = session.actionLog.some(
+        a => a.type === "pickup" || a.type === "use")
+      || (session.totalXp ?? 0) > 0
+      || (session.totalKills ?? 0) > 0
+      || (session.totalGold ?? 0) > 0;
+    if (curConfirmed && !earnedRewards) {
       transit = true;
     } else {
       const actions: object[] = session.actionLog.map(a =>
