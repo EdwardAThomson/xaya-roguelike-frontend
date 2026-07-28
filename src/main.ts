@@ -120,6 +120,12 @@ const connection = new Connection((state: ConnectionState) => {
 function ensureSessionFromChainState(): void {
   const p = connState?.player;
   if (!p) return;
+  // A channel transition (gate-walk / enter / exit) briefly nulls the local
+  // session before loading the new one. Do not run reconnect reconciliation
+  // in that window, or a state poll sees "in_channel with no session" and
+  // wrongly pops the reconnect modal mid-gate-walk (which then desyncs the
+  // session and gets the next gate-walk rejected by the GSP).
+  if (busy) return;
   if (channelSession || session) return;  // already have something
 
   if (p.in_channel && p.active_visit) {
@@ -547,10 +553,12 @@ function diagnoseRejection(action: string, revalidate: () => ValidationResult): 
   showErrorModal(
     `${action.charAt(0).toUpperCase() + action.slice(1)} move rejected`,
     `The move was submitted but the GSP did not apply it. Likely causes: ` +
-      `you're out of HP (heal before entering a dungeon); the discovery ` +
-      `cooldown hasn't elapsed (it counts blocks, not real time — an idle ` +
-      `devnet doesn't advance it); another player grabbed the coordinate ` +
-      `first; or your local view is stale. Reconnect to refresh, then try again.`,
+      `this is a newly discovered segment you must confirm first (survive a ` +
+      `run to a gate to complete it before you can leave); you're out of HP; ` +
+      `the discovery cooldown hasn't elapsed (it counts blocks, not real ` +
+      `time, so an idle devnet doesn't advance it); another player grabbed ` +
+      `the coordinate first; or your local view is stale. Reconnect to ` +
+      `refresh, then try again.`,
   );
 }
 
@@ -1001,9 +1009,17 @@ async function doGateWalk(dir: string): Promise<void> {
 
     const p = connState.player!;
     if (p.in_channel && p.active_visit) {
-      // Entered a new channel — load that segment's dungeon.
+      // Entered a new channel — load that segment's dungeon.  When we just
+      // DISCOVERED the segment, its details arrive a poll or two after the
+      // player state, so wait briefly for the cache to populate rather than
+      // giving up (which leaves session=null and lets a poll pop the
+      // reconnect modal, desyncing the run and rejecting the next gate-walk).
       const newSegId = p.active_visit.segment_id;
-      const segInfo = connState.segments.get(newSegId);
+      let segInfo = connState.segments.get(newSegId);
+      for (let i = 0; i < 25 && !segInfo; i++) {
+        await new Promise((r) => setTimeout(r, 200));
+        segInfo = connState?.segments.get(newSegId);
+      }
       if (segInfo) {
         // Regenerate the same constrained layout the GSP replay uses, and
         // spawn at the gate the player entered through — both come from
