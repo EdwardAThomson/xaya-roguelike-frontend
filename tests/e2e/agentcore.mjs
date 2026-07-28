@@ -161,6 +161,10 @@ export async function playAgent(page, cfg) {
   // without bound over a long soak; below the cap, bots keep pushing the
   // frontier (cooldown-paced) so the world stays visibly active.
   const WORLD_CAP = Math.max(24, OUTBOUND * 6);
+  // How far from the hub (Manhattan distance) bots will push the frontier.
+  // Higher = bots travel further out; too high risks level-1 bots dying in
+  // deep discovery runs (they still transit confirmed segments safely).
+  const MAX_DEPTH = Number(cfg.maxDepth ?? 6);
 
   let discoveries = 0, lastSig = "", stuck = 0;
   let mapCache = { visitId: null, walls: null };
@@ -205,9 +209,11 @@ export async function playAgent(page, cfg) {
         ? Math.max(0, (pl.last_discover_height + 50) - (s.height ?? 0)) : 0;
 
       const depthProxy = Math.abs(curX) + Math.abs(curY);
+      const distEmpty = (d) => { const [dx, dy] = OFFSET[d]; return Math.abs(curX + dx) + Math.abs(curY + dy); };
+      const emptyOut = [...emptyDirs].sort((a, b) => distEmpty(b) - distEmpty(a));
       let dir = null, discovering = false;
-      if (cd === 0 && emptyDirs.length && depthProxy < 2 && s.segments.length < WORLD_CAP) {
-        dir = emptyDirs[0]; discovering = true;
+      if (cd === 0 && emptyDirs.length && depthProxy < MAX_DEPTH && s.segments.length < WORLD_CAP) {
+        dir = emptyOut[0]; discovering = true;
       } else if (confirmedDirs.length) {
         dir = confirmedDirs[tick % confirmedDirs.length];
       } else if (emptyDirs.length && cd > 0) {
@@ -239,25 +245,35 @@ export async function playAgent(page, cfg) {
 
     const entryDir = p.active_visit?.entry_direction || "";
     if (huntVisit !== vid) { huntVisit = vid; huntTurns = 0; }
-    let target = null;
+    const curSeg = s.segments.find(x => x.id === p.current_segment);
+    const cx0 = curSeg?.world_x ?? 0, cy0 = curSeg?.world_y ?? 0;
+    const depthProxy = Math.abs(cx0) + Math.abs(cy0);
+    const curConfirmed = !curSeg || !!curSeg.confirmed;   // hub (id 0) counts as confirmed
     const combatReady = p.hp > p.max_hp * 0.5;
     let nearestMon = null, nd = Infinity;
     for (const m of sess.monsters) {
       const md = Math.abs(m.x - sess.playerX) + Math.abs(m.y - sess.playerY);
       if (md < nd) { nd = md; nearestMon = m; }
     }
-    const HUNT_BUDGET = cfg.huntBudget ?? 60;
-    if (combatReady && nearestMon && huntTurns < HUNT_BUDGET) {
-      // Engage the nearest monster before leaving. This earns kills/XP and,
-      // crucially, stops the degenerate instant-transit oscillation (free
-      // transit made bots spam gate-walks between confirmed segments,
-      // racing the chain forward without ever playing).
+    const HUNT_BUDGET = cfg.huntBudget ?? 40;
+
+    let target = null;
+    if (combatReady && nearestMon && nd <= 5 && huntTurns < HUNT_BUDGET) {
+      // Fight a NEARBY monster briefly (banks XP toward levelling, and stops
+      // the degenerate instant-transit oscillation). Only nearby and only
+      // while healthy, so we do not chase deep and die.
       target = { x: nearestMon.x, y: nearestMon.y };
       huntTurns++;
+    } else if (!curConfirmed) {
+      // We are in our own freshly discovered PROVISIONAL segment. Confirm it
+      // by surviving to the entry gate (a short, safe retreat) instead of
+      // pushing deeper and dying (which prunes it). This marches the frontier
+      // outward one confirmed step at a time.
+      const gate = sess.gates.find(g => g.direction === entryDir) || sess.gates[0];
+      target = { x: gate.x, y: gate.y };
     } else {
-      // Pick an exit gate.  Which neighbour coords already have a segment?
-      const curSeg = s.segments.find(x => x.id === p.current_segment);
-      const cx0 = curSeg?.world_x ?? 0, cy0 = curSeg?.world_y ?? 0;
+      // Confirmed segment: pick an exit gate, biased OUTWARD so bots travel
+      // far rather than orbit the hub.
       const occupied = new Set();
       for (const [d, [dx, dy]] of Object.entries(OFFSET)) {
         if (s.segments.find(x => x.world_x === cx0 + dx && x.world_y === cy0 + dy)) occupied.add(d);
@@ -265,21 +281,24 @@ export async function playAgent(page, cfg) {
       const cd = p.last_discover_height > 0
         ? Math.max(0, (p.last_discover_height + 50) - (s.height ?? 0)) : 0;
       const frontier = sess.gates.filter(g => !occupied.has(g.direction));
-      // Distance from the hub is a proxy for dungeon depth (the e2e state has
-      // no depth field); deeper segments have tougher monsters that kill a
-      // level-1 bot, so only push the frontier from shallow segments and when
-      // healthy. When hurt, retreat through the entry gate to survive rather
-      // than diving deeper and dying (which just dumps the bot back at the hub).
-      const depthProxy = Math.abs(cx0) + Math.abs(cy0);
+      const distOf = (dir) => { const [dx, dy] = OFFSET[dir]; return Math.abs(cx0 + dx) + Math.abs(cy0 + dy); };
+      const outward = (g) => distOf(g.direction) > depthProxy;
       const healthy = p.hp > p.max_hp * 0.6;
       let gate;
       if (!healthy) {
         gate = sess.gates.find(g => g.direction === entryDir) || sess.gates[0];
-      } else if (cd === 0 && frontier.length && depthProxy < 2 && s.segments.length < WORLD_CAP) {
-        gate = frontier[0];
       } else {
-        // Roam the confirmed graph (spread out) or head home.
-        gate = sess.gates.find(g => g.direction !== entryDir && occupied.has(g.direction))
+        // Prefer: discover an outward frontier, then transit an outward
+        // confirmed neighbour, then any frontier, then any lateral gate;
+        // fall back to the entry gate.
+        const canDiscover = cd === 0 && depthProxy < MAX_DEPTH && s.segments.length < WORLD_CAP;
+        const frontierOut = frontier.filter(outward);
+        const confirmedOut = sess.gates.filter(g => occupied.has(g.direction) && g.direction !== entryDir && outward(g));
+        const lateralAny = sess.gates.filter(g => g.direction !== entryDir && occupied.has(g.direction));
+        gate = (canDiscover && frontierOut[0])
+            || confirmedOut[0]
+            || (canDiscover && frontier[0])
+            || lateralAny[0]
             || sess.gates.find(g => g.direction === entryDir)
             || sess.gates[0];
       }
