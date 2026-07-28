@@ -161,7 +161,7 @@ export function drawOverworld(
       ctx.fillStyle = "#d08040";
       ctx.font = `${11 * zoom}px monospace`;
       ctx.textAlign = "center";
-      ctx.fillText(`Depth ${node.depth} \u2014 prov.`, cx, cy + 10 * zoom);
+      ctx.fillText(`Depth ${node.depth} (prov.)`, cx, cy + 10 * zoom);
     } else {
       ctx.fillStyle = depthColor(node.depth);
       ctx.font = `${11 * zoom}px monospace`;
