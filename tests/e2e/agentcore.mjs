@@ -164,6 +164,11 @@ export async function playAgent(page, cfg) {
 
   let discoveries = 0, lastSig = "", stuck = 0;
   let mapCache = { visitId: null, walls: null };
+  // Per-visit combat budget: on entering a segment a bot hunts monsters for
+  // up to this many action-turns before it is allowed to head for a gate.
+  // Without it, free instant transit makes bots ping-pong between confirmed
+  // segments and never actually play.
+  let huntVisit = null, huntTurns = 0;
 
   for (let tick = 0; tick < MAX_TICKS; tick++) {
     s = await state();
@@ -233,11 +238,23 @@ export async function playAgent(page, cfg) {
     if (!walls) { await sleep(200); continue; }
 
     const entryDir = p.active_visit?.entry_direction || "";
+    if (huntVisit !== vid) { huntVisit = vid; huntTurns = 0; }
     let target = null;
-    const adj = sess.monsters.find(m =>
-      Math.abs(m.x - sess.playerX) <= 1 && Math.abs(m.y - sess.playerY) <= 1);
-    if (adj) target = { x: adj.x, y: adj.y };
-    else {
+    const combatReady = p.hp > p.max_hp * 0.5;
+    let nearestMon = null, nd = Infinity;
+    for (const m of sess.monsters) {
+      const md = Math.abs(m.x - sess.playerX) + Math.abs(m.y - sess.playerY);
+      if (md < nd) { nd = md; nearestMon = m; }
+    }
+    const HUNT_BUDGET = cfg.huntBudget ?? 60;
+    if (combatReady && nearestMon && huntTurns < HUNT_BUDGET) {
+      // Engage the nearest monster before leaving. This earns kills/XP and,
+      // crucially, stops the degenerate instant-transit oscillation (free
+      // transit made bots spam gate-walks between confirmed segments,
+      // racing the chain forward without ever playing).
+      target = { x: nearestMon.x, y: nearestMon.y };
+      huntTurns++;
+    } else {
       // Pick an exit gate.  Which neighbour coords already have a segment?
       const curSeg = s.segments.find(x => x.id === p.current_segment);
       const cx0 = curSeg?.world_x ?? 0, cy0 = curSeg?.world_y ?? 0;
