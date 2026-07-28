@@ -150,7 +150,10 @@ for (let i = 0; i < N; i++) {
   // Fixed names (no run stamp) so restarting the harness REUSES the same
   // on-chain identities instead of minting a fresh set each time and
   // leaving old bots parked at the hub forever, cluttering the world.
-  const name = `bot_${i}`;
+  // ROG_PREFIX overrides the base name to mint a FRESH cohort (new on-chain
+  // players start at full HP with 3 potions), useful for a clean "how far can
+  // a fresh character get" measurement against the already-discovered world.
+  const name = `${process.env.ROG_PREFIX || "bot"}_${i}`;
   await page.goto(URL);
   await page.waitForFunction(() => !!globalThis.__rog, null, { timeout: 20000 });
   agents.push({ page, name });

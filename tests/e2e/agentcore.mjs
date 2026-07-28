@@ -192,6 +192,11 @@ export async function playAgent(page, cfg) {
   // Without it, free instant transit makes bots ping-pong between confirmed
   // segments and never actually play.
   let huntVisit = null, huntTurns = 0;
+  // Last tile we attempted a pickup on, so a full-bag pickup does not loop.
+  let pickTried = "";
+  // Live hp at our last drink attempt; if a drink does not raise hp the session
+  // is out of potions and we must stop retrying (see the potion guard below).
+  let lastDrinkHp = -1;
 
   for (let tick = 0; tick < MAX_TICKS; tick++) {
     s = await state();
@@ -302,10 +307,28 @@ export async function playAgent(page, cfg) {
     // which is banked on a surviving exit, so it both saves the run and heals
     // the character for future runs. Drink a bit before the retreat line so we
     // can keep fighting rather than bail.
-    if (hpRatio < retreatAt + 0.2 && liveHp < liveMax && havePotion) {
+    //
+    // CRITICAL: havePotion checks the on-chain bag, which is NOT decremented
+    // until the run settles, so it stays true even after the SESSION's potions
+    // (session.loot, the only thing use_potion can draw from) are gone. Guard
+    // against the resulting no-op loop: if we already tried to drink at this
+    // exact live-hp and it did not rise, the session is out of potions - stop
+    // trying and play on, instead of freezing here forever (this loop was what
+    // wedged bots in place, killing all combat and exploration).
+    if (hpRatio < retreatAt + 0.2 && liveHp < liveMax && havePotion
+        && liveHp !== lastDrinkHp) {
+      lastDrinkHp = liveHp;
       await call("input", "use_potion"); await sleep(150); continue;
     }
-    if (sess.groundItems.some(g => g.x === sess.playerX && g.y === sess.playerY)) {
+    // Pick up an item we are standing on - but only ATTEMPT each tile once.
+    // If the bag is full the pickup is a no-op (no turn passes); retrying it
+    // every tick would wedge the bot forever on that tile (this is exactly how
+    // bots got stuck deep in a segment doing nothing). Attempt once, then walk
+    // on regardless.
+    const hereKey = `${sess.playerX},${sess.playerY}`;
+    if (sess.groundItems.some(g => g.x === sess.playerX && g.y === sess.playerY)
+        && pickTried !== hereKey) {
+      pickTried = hereKey;
       await call("input", "pickup"); await sleep(150); continue;
     }
 
@@ -380,16 +403,22 @@ export async function playAgent(page, cfg) {
     // Reasons to stop fighting and head for a gate right now:
     //  - hurt (hpRatio at/under the depth-aware retreat line): leave BEFORE we
     //    can bleed to death (there is no HP regen; a death is costly),
-    //  - no-progress / pinned on an unresolving attack (mustLeave / monStall),
-    //  - done with this run's combat budget.
+    //  - no-progress / pinned on an unresolving action (mustLeave).
     const hurt = hpRatio <= retreatAt;
     const pinned = mustLeave;
     const healthy = hpRatio > retreatAt;
+    // A confirmed segment that can punch a deeper frontier: leaving through that
+    // gate is a FREE transit+discover (a confirmed source needs no survival), so
+    // it advances the frontier at ANY hp. We therefore push to it even when
+    // "hurt", down to a low floor (dying mid-crossing only costs a hub respawn -
+    // no prune, since the source is confirmed). This is the primary way max
+    // distance grows.
+    const canPushFrontier = curConfirmed && canDiscover && frontierOut.length
+      && hpRatio > 0.35;
 
     let target = null;
-    if (hurt || pinned) {
-      // Leave immediately via the nearest reachable gate. When still healthy
-      // (a pin, not low HP) bias outward so the exit also makes progress.
+    if (pinned) {
+      // No-progress escape: nearest reachable gate (outward if we still can).
       const g = gateToward(healthy ? [outwardGate()] : [entryGate()]);
       target = { x: g.x, y: g.y };
     } else if (!curConfirmed) {
@@ -404,19 +433,21 @@ export async function playAgent(page, cfg) {
         const g = entryGate();
         target = { x: g.x, y: g.y };
       }
-    } else if (healthy && canDiscover && frontierOut.length) {
-      // PRIMARY GOAL = push the frontier. If we are healthy in a confirmed
-      // segment that CAN discover a deeper neighbour (cooldown clear, level
-      // allows the depth, world under cap), beeline for that outward frontier
-      // gate. Stepping through it discovers the next ring and, once we survive a
-      // confirm run there, extends the max distance. Fight only an adjacent
-      // blocker on the way (nd<=1) so a monster does not stall the push.
+    } else if (canPushFrontier) {
+      // PRIMARY GOAL = push the frontier. Beeline to the outward frontier gate to
+      // discover the next ring. Fight only an adjacent blocker (nd<=1) so a
+      // monster does not stall the push; otherwise walk straight for the gate.
       if (nearestMon && nd <= 1 && huntTurns < HUNT_BUDGET) {
         target = { x: nearestMon.x, y: nearestMon.y }; huntTurns++;
       } else {
         const g = frontierOut[0];
         target = { x: g.x, y: g.y };
       }
+    } else if (hurt) {
+      // Hurt with nothing to discover here: retreat to the nearest gate (biased
+      // back toward the hub / safety) and settle whatever we earned.
+      const g = gateToward([entryGate()]);
+      target = { x: g.x, y: g.y };
     } else if (nearestMon && nd <= 3 && huntTurns < HUNT_BUDGET) {
       // CONFIRMED + healthy, no frontier to punch here: fight a CLOSE monster
       // (opportunistic - one on/near our outward path) to bank XP and level up.
@@ -437,7 +468,7 @@ export async function playAgent(page, cfg) {
 
     const step = bfsStep(walls, sess.playerX, sess.playerY, target.x, target.y);
     if (cfg.debug && name === "bot_0" && tick % 3 === 0) {
-      console.error(`[dbg ${name} t${tick}] seg${p.current_segment} conf=${curConfirmed} hp=${hpRatio.toFixed(2)} hurt=${hurt} pin=${pinned} ht=${huntTurns} nd=${nd} pos=${sess.playerX},${sess.playerY} tgt=${target.x},${target.y} step=${step}`);
+      console.error(`[dbg ${name} t${tick}] seg${p.current_segment} d${depthProxy} conf=${curConfirmed} hp=${hpRatio.toFixed(2)} hurt=${hurt} cd=${cd} canDisc=${canDiscover} frOut=${frontierOut.map(g=>g.direction)} nd=${nd} tgt=${target.x},${target.y}`);
     }
     if (!step || (step[0] === 0 && step[1] === 0)) {
       let moved = false;
