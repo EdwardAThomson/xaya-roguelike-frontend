@@ -54,6 +54,18 @@ export function drawOverworld(
   ctx.fillStyle = "#0a0a0a";
   ctx.fillRect(0, 0, canvasW, canvasH);
 
+  // Inset panel so the map reads as a contained view, not edge-to-edge.
+  const PAD = 14;
+  const pw = Math.max(0, canvasW - PAD * 2);
+  const ph = Math.max(0, canvasH - PAD * 2);
+  ctx.fillStyle = "#0c0c14";
+  roundRect(ctx, PAD, PAD, pw, ph, 10);
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = "#2c2c3c";
+  roundRect(ctx, PAD, PAD, pw, ph, 10);
+  ctx.stroke();
+
   if (nodes.size === 0) {
     ctx.fillStyle = "#666";
     ctx.font = "16px monospace";
@@ -74,6 +86,11 @@ export function drawOverworld(
   const centerNode = nodes.get(currentSegment) ?? nodes.get(0) ?? nodes.values().next().value!;
   const offsetX = canvasW / 2 - centerNode.gridX * cell + panX;
   const offsetY = canvasH / 2 - centerNode.gridY * cell + panY;
+
+  // Clip the map to the panel so nodes never bleed over the frame.
+  ctx.save();
+  roundRect(ctx, PAD, PAD, pw, ph, 10);
+  ctx.clip();
 
   // Draw links first (behind nodes).
   ctx.lineWidth = 2 * zoom;
@@ -228,18 +245,21 @@ export function drawOverworld(
     }
   }
 
-  // Legend.
+  // Done with the clipped map content.
+  ctx.restore();
+
+  // Legend, drawn inside the panel's top-left.
   ctx.textAlign = "left";
   ctx.textBaseline = "top";
   ctx.fillStyle = "#666";
   ctx.font = "11px monospace";
   ctx.fillText(
     "Overworld Map \u00b7 click a segment to select \u00b7 drag to pan, scroll to zoom, Recenter to reset (dashed = provisional)",
-    12, 12,
+    PAD + 8, PAD + 8,
   );
   if (zoom !== DEFAULT_VIEW.zoom || panX !== DEFAULT_VIEW.panX || panY !== DEFAULT_VIEW.panY) {
     ctx.fillStyle = "#888";
-    ctx.fillText(`zoom ${zoom.toFixed(2)}x`, 12, 28);
+    ctx.fillText(`zoom ${zoom.toFixed(2)}x`, PAD + 8, PAD + 24);
   }
 }
 

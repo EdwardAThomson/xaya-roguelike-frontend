@@ -2521,7 +2521,7 @@ function updateOverworldStats(): void {
   const locName = locSeg === 0
     ? "Safe Zone (Hub)"
     : locInfo
-      ? `Segment (${locInfo.world_x}, ${locInfo.world_y}) - Depth ${locInfo.depth}`
+      ? `Segment (${locInfo.world_x}, ${locInfo.world_y}) - Depth ${Math.abs(locInfo.world_x) + Math.abs(locInfo.world_y)}`
       : "Segment (?, ?)";
   const locLabel = `${locName}${p.in_channel ? " · in dungeon" : ""}`;
 

@@ -72,7 +72,10 @@ export function layoutSegments(segments: Map<number, SegmentInfo>): Map<number, 
     }
     nodes.set(seg.id, {
       id: seg.id,
-      depth: seg.depth,
+      // Display depth is the segment's distance from the hub, derived from its
+      // world coordinates (Manhattan |x| + |y|), so the map is always
+      // symmetric regardless of the stored (discovery-time) depth value.
+      depth: Math.abs(seg.world_x) + Math.abs(seg.world_y),
       discoverer: seg.discoverer,
       worldX: seg.world_x,
       worldY: seg.world_y,
