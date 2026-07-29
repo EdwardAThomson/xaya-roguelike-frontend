@@ -322,8 +322,8 @@ function promptReconnectChoice(
   isProvisional: boolean, constraints: Gate[], entryDirection: string,
 ): void {
   const forfeitDetail = isProvisional
-    ? "Respawn at the hub now (25% gold penalty).  The segment is provisional and will be deleted — you'll have to re-discover it."
-    : "Respawn at the hub now (25% gold penalty).  The segment stays available for future visits.";
+    ? "Take the death now (half HP, 25% gold), knocked back one segment (or to the hub if this was your first dive).  This segment is provisional and will be deleted, so you'll have to re-discover it."
+    : "Take the death now (half HP, 25% gold), knocked back one segment (or to the hub if this was your first dive).  The segment stays available for future visits.";
 
   showConfirmModal({
     title: "You were in a dungeon when you disconnected",
@@ -369,14 +369,20 @@ async function doForfeitVisit(visitId: number): Promise<void> {
       { survived: false, xp: 0, gold: 0, kills: 0 },
       [],
     );
-    const resolved = await waitFor(connection, ({ player }) =>
-      !!player && !player.in_channel);
+    const resolved = await waitFor(connection, ({ player }) => {
+      if (!player) return false;
+      if (!player.in_channel) return true;
+      return !!player.active_visit && player.active_visit.visit_id !== visitId;
+    });
     if (resolved) {
+      const knockedBack = resumeAfterSettle();
       addOverworldMessage(
-        "Forfeited dungeon. Respawned at the hub.",
+        knockedBack
+          ? "Forfeited. Knocked back to the segment you came from."
+          : "Forfeited dungeon. Respawned at the hub.",
         "combat",
       );
-      ensureHubSessionIfAtHub();
+      if (!knockedBack && !session) ensureHubSessionIfAtHub();
     } else {
       showErrorModal(
         "Forfeit didn't settle",
@@ -391,6 +397,33 @@ async function doForfeitVisit(visitId: number): Promise<void> {
     updateSidebar();
     render();
   }
+}
+
+/**
+ * After a settle or forfeit resolves, tear down the finished run.  If the GSP
+ * knocked us back into the previous segment (a deep death now lands you one
+ * segment back, not at the hub), start that run; otherwise we are at the hub
+ * (first-dive death or a survived exit) and the hub builder takes over.
+ * Returns true if it started a knock-back run.
+ */
+function resumeAfterSettle(): boolean {
+  channelSession = false;
+  session = null;
+  fov = null;
+  hubBuiltAtSegment = -1;
+  clearPersistedRun();
+  const p = connState?.player;
+  if (p && p.in_channel && p.active_visit) {
+    const segId = p.active_visit.segment_id;
+    const segInfo = connState?.segments.get(segId);
+    if (segInfo) {
+      startChannelDungeon(segInfo.seed, segInfo.depth, segId,
+                          p.active_visit.visit_id, constraintsFor(segInfo),
+                          p.active_visit.entry_direction);
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -917,10 +950,17 @@ async function doExitChannel(): Promise<void> {
       return a;
     });
 
+    const beforeVisit = channelVisitId;
     await moves.exitChannel(connState.playerName, channelVisitId, results, actions);
 
-    const resolved = await waitFor(connection, ({ player }) =>
-      !!player && !player.in_channel);
+    // Success looks like: no longer in a channel (hub respawn / survived exit),
+    // OR knocked back into a NEW run on the previous segment (a deep death now
+    // lands you one segment back instead of teleporting to the hub).
+    const resolved = await waitFor(connection, ({ player }) => {
+      if (!player) return false;
+      if (!player.in_channel) return true;
+      return !!player.active_visit && player.active_visit.visit_id !== beforeVisit;
+    });
 
     if (!resolved) {
       showErrorModal(
@@ -932,40 +972,39 @@ async function doExitChannel(): Promise<void> {
       return;
     }
 
+    // Tear down the finished run; start the knock-back run if we were pushed
+    // back into the previous segment, else fall through to the hub.
+    const knockedBack = resumeAfterSettle();
+
     if (survived) {
       addOverworldMessage(
         `Dungeon complete! +${earnedXp} XP, +${earnedGold} gold`,
         "pickup",
       );
     } else {
-      // Death penalty: respawn at hub, lose 25% of carried gold
-      // (computed against gold AFTER crediting anything earned).
+      // Death penalty: half HP, lose 25% of carried gold (computed against
+      // gold AFTER crediting anything earned).
       const totalGold = goldBefore + earnedGold;
       const goldLost = totalGold - Math.floor(totalGold * 75 / 100);
       addOverworldMessage("You died in the dungeon...", "combat");
       showModal({
         title: "You died",
-        message:
-          `You respawned at the hub (segment 0) and lost ${goldLost} gold ` +
-          `(25% of your carried gold). XP and equipment are preserved.`,
+        message: knockedBack
+          ? `You were knocked back to the segment you came from, at half HP, ` +
+            `and lost ${goldLost} gold (25% of carried gold). XP and equipment ` +
+            `are preserved.`
+          : `You respawned at the hub at half HP and lost ${goldLost} gold ` +
+            `(25% of carried gold). XP and equipment are preserved.`,
         variant: "error",
       });
     }
 
-    // Exit complete.  Clear channel-session state; the connection
-    // callback will rebuild the hub session if we're back at segment 0
-    // (which is the case for both death-respawn and Pass A's gate flow).
-    // Pass B will replace this with an automatic transition into the
-    // neighbour's session via the gw move.
-    channelSession = false;
-    session = null;
-    fov = null;
-    hubBuiltAtSegment = -1;
-    ensureHubSessionIfAtHub();
-    if (!session) {
-      // Not at hub and no real session — fall back to the map view so
-      // the player can navigate.  Pass B removes this case.
-      setMode("overworld");
+    if (!knockedBack && !session) {
+      ensureHubSessionIfAtHub();
+      if (!session) {
+        // Not at hub and no real session — fall back to the map view.
+        setMode("overworld");
+      }
     }
   } catch (e) {
     showErrorModal("Exit channel failed", e instanceof Error ? e.message : String(e));
