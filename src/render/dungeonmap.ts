@@ -34,6 +34,26 @@ export function drawDungeonMap(
   ctx.fillStyle = "#0a0a0a";
   ctx.fillRect(0, 0, canvasW, canvasH);
 
+  // Inset panel frame (matching the world map) so this reads as a contained
+  // MAP, not the live playable dungeon view.
+  const FRAME = 16;
+  const fw = Math.max(0, canvasW - FRAME * 2);
+  const fh = Math.max(0, canvasH - FRAME * 2);
+  ctx.fillStyle = "#0c0c14";
+  roundRect(ctx, FRAME, FRAME, fw, fh, 10);
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = "#2c2c3c";
+  roundRect(ctx, FRAME, FRAME, fw, fh, 10);
+  ctx.stroke();
+
+  // Title, so it is unmistakably the MAP and not the dungeon you play in.
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#8ec";
+  ctx.font = "bold 13px monospace";
+  ctx.fillText("DUNGEON MAP", FRAME + 10, FRAME + 8);
+
   if (!session || !fov) {
     ctx.fillStyle = "#666";
     ctx.font = "16px monospace";
@@ -138,13 +158,30 @@ export function drawDungeonMap(
     ctx.fillText("@", px, py + 1);
   }
 
-  // Legend.
+  // Legend (bottom, clear of the title and the tab bar over the top-centre).
   ctx.textAlign = "left";
   ctx.textBaseline = "top";
   ctx.fillStyle = "#666";
   ctx.font = "11px monospace";
   ctx.fillText(
-    `Dungeon layout · depth ${session.depth} · @ you · gold = gates · dim = explored, bright = in view`,
-    12, 12,
+    "@ you · gold = gates · dim = explored, bright = in view",
+    FRAME + 10, canvasH - FRAME - 20,
   );
+}
+
+function roundRect(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, w: number, h: number, r: number,
+): void {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h);
+  ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
 }

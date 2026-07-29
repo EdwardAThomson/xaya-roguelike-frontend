@@ -55,7 +55,7 @@ export function drawOverworld(
   ctx.fillRect(0, 0, canvasW, canvasH);
 
   // Inset panel so the map reads as a contained view, not edge-to-edge.
-  const PAD = 14;
+  const PAD = 28;
   const pw = Math.max(0, canvasW - PAD * 2);
   const ph = Math.max(0, canvasH - PAD * 2);
   ctx.fillStyle = "#0c0c14";
@@ -248,18 +248,23 @@ export function drawOverworld(
   // Done with the clipped map content.
   ctx.restore();
 
-  // Legend, drawn inside the panel's top-left.
+  // Title (top-left inside the panel) and legend (bottom, clear of the tab
+  // bar that floats over the panel's top-centre).
   ctx.textAlign = "left";
   ctx.textBaseline = "top";
+  ctx.fillStyle = "#8ec";
+  ctx.font = "bold 13px monospace";
+  ctx.fillText("WORLD MAP", PAD + 10, PAD + 8);
+
   ctx.fillStyle = "#666";
   ctx.font = "11px monospace";
   ctx.fillText(
-    "Overworld Map \u00b7 click a segment to select \u00b7 drag to pan, scroll to zoom, Recenter to reset (dashed = provisional)",
-    PAD + 8, PAD + 8,
+    "Click a segment to select \u00b7 drag to pan, scroll to zoom, Recenter to reset (dashed = provisional)",
+    PAD + 10, canvasH - PAD - 20,
   );
   if (zoom !== DEFAULT_VIEW.zoom || panX !== DEFAULT_VIEW.panX || panY !== DEFAULT_VIEW.panY) {
     ctx.fillStyle = "#888";
-    ctx.fillText(`zoom ${zoom.toFixed(2)}x`, PAD + 8, PAD + 24);
+    ctx.fillText(`zoom ${zoom.toFixed(2)}x`, PAD + 10, canvasH - PAD - 36);
   }
 }
 
