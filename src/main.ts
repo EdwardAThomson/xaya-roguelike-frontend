@@ -2644,40 +2644,33 @@ function updateOverworldInventory(): void {
   const p = connState?.player;
   const canMutate = !!moves && !p?.in_channel;
 
-  if (!p || p.inventory.length === 0) {
+  if (!p) {
     el.innerHTML = '<div style="color:#666">Empty</div>';
     return;
   }
 
-  el.innerHTML = p.inventory.map(item => {
-    const slotClass = item.slot === "bag" ? "slot-bag" : "slot-equipped";
-    const slotLabel = item.slot === "bag" ? "" : `[${item.slot}]`;
-    const def = lookupItem(item.item_id);
-    const isEquipable = def && def.slot !== "" && def.type !== "potion"
-        && def.type !== "misc";
-    const isPotion = def && def.type === "potion";
+  // Sidebar shows equipped gear only; the (potentially long) bag is managed in
+  // the Inventory modal (I).  A compact hint points there.
+  const equipped = p.inventory.filter(i => i.slot !== "bag");
+  const bagCount = p.inventory.filter(i => i.slot === "bag").length;
 
-    let btn = "";
-    if (canMutate && item.slot === "bag" && isEquipable) {
-      btn = `<button data-action="equip" data-rowid="${item.rowid}"
-        data-slot="${def!.slot}" class="inv-btn"
-        ${busy ? "disabled" : ""}>Equip</button>`;
-    } else if (canMutate && item.slot === "bag" && isPotion) {
-      btn = `<button data-action="use-item" data-item="${item.item_id}"
-        class="inv-btn"
-        ${busy ? "disabled" : ""}>Drink</button>`;
-    } else if (canMutate && item.slot !== "bag") {
-      btn = `<button data-action="unequip" data-rowid="${item.rowid}"
-        class="inv-btn"
-        ${busy ? "disabled" : ""}>Unequip</button>`;
+  const lines: string[] = [];
+  if (equipped.length === 0) {
+    lines.push('<div style="color:#666">Nothing equipped</div>');
+  } else {
+    for (const item of equipped) {
+      const btn = canMutate
+        ? `<button data-action="unequip" data-rowid="${item.rowid}" class="inv-btn" ${busy ? "disabled" : ""}>Unequip</button>`
+        : "";
+      lines.push(`<div class="inventory-item">
+        <span>${itemIcon(item.item_id)} ${itemName(item.item_id)}</span>
+        <span class="slot-equipped">[${item.slot}]</span>
+        ${btn}
+      </div>`);
     }
-
-    return `<div class="inventory-item">
-      <span>${item.item_id} x${item.quantity}</span>
-      <span class="${slotClass}">${slotLabel}</span>
-      ${btn}
-    </div>`;
-  }).join("");
+  }
+  lines.push(`<div style="margin-top:6px;color:#888;font-size:11px">Bag: ${bagCount} / ${MAX_INVENTORY} (press I to manage)</div>`);
+  el.innerHTML = lines.join("");
 }
 
 function updateOverworldMessages(): void {
@@ -2798,28 +2791,21 @@ function updateDungeonInventory(): void {
   // Potions drunk this run are consumed from the live session immediately,
   // but the on-chain stack does not shrink until settlement; reflect that in
   // the shown count so the drink visibly registers.
-  const usedThisRun = new Map<string, number>();
-  if (session) {
-    for (const a of session.actionLog)
-      if (a.type === "use" && a.itemId)
-        usedThisRun.set(a.itemId, (usedThisRun.get(a.itemId) ?? 0) + 1);
-  }
-
+  // Sidebar shows equipped gear only; the settled bag is managed in the
+  // Inventory modal (I).  Items found THIS run are still listed below as
+  // pending, since that is the useful in-run feedback.
   const lines: string[] = [];
-  if (p && p.inventory.length > 0) {
-    for (const it of p.inventory) {
-      const slot = it.slot === "bag" ? "" : ` [${it.slot}]`;
-      const used = usedThisRun.get(it.item_id) ?? 0;
-      const remaining = Math.max(0, it.quantity - used);
-      const qty = remaining !== 1 ? ` x${remaining}` : "";
-      const usedTag = used > 0
-        ? `<span class="slot-equipped" style="color:#c9b24a">${used} used</span>`
-        : `<span class="slot-equipped">${slot}</span>`;
-      lines.push(`<div class="inventory-item"><span>${itemIcon(it.item_id)} ${itemName(it.item_id)}${qty}</span>${usedTag}</div>`);
-    }
+  const equipped = p ? p.inventory.filter(i => i.slot !== "bag") : [];
+  const bagCount = p ? p.inventory.filter(i => i.slot === "bag").length : 0;
+
+  if (equipped.length === 0) {
+    lines.push('<div style="color:#666">Nothing equipped</div>');
   } else {
-    lines.push('<div style="color:#666">Empty</div>');
+    for (const it of equipped) {
+      lines.push(`<div class="inventory-item"><span>${itemIcon(it.item_id)} ${itemName(it.item_id)}</span><span class="slot-equipped">[${it.slot}]</span></div>`);
+    }
   }
+  lines.push(`<div style="margin-top:6px;color:#888;font-size:11px">Bag: ${bagCount} / ${MAX_INVENTORY} (press I to manage)</div>`);
 
   const pending = session ? session.collected.filter(l => l.quantity > 0) : [];
   if (pending.length > 0) {
