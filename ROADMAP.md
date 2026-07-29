@@ -1,6 +1,6 @@
 # Roadmap — Xaya Roguelike Frontend
 
-_Status: active · updated 2026-05-30_
+_Status: active · updated 2026-07-29_
 
 Zero-dependency TypeScript + Canvas browser client for the Xaya Roguelike
 blockchain game. Renders the on-chain overworld, runs dungeon sessions locally
@@ -16,7 +16,7 @@ with deterministic RNG, and submits action-replay proofs on-chain. Pairs with th
 - [x] Action-log recording for replay verification
 - [x] JSON-RPC client (typed methods, 2s auto-polling)
 - [x] On-chain player stats display (level, HP, XP, equipment)
-- [x] Overworld segment-graph rendering (BFS layout, provisional-segment markers)
+- [x] Overworld segment-graph rendering (BFS layout, provisional-segment markers, drag-pan / wheel-zoom / recenter)
 - [x] Channel play (enter with on-chain stats, submit results on-chain)
 - [x] Move submission via devnet proxy (register, discover, travel, equip, use, allocate)
 - [x] Client-side pre-validation mirroring backend rules + post-submit revalidation
