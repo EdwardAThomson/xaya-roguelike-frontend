@@ -240,50 +240,14 @@ test("T4a", "discover a frontier segment; cooldown blocks a too-soon retry", asy
     statsText.replace(/\s+/g, " ").slice(0, 160));
 });
 
-// ---- T3 + T5: in-dungeon modal (read-only equip, drink), loot pickup+persist ----
-test("T3", "in-dungeon: modal equip is read-only, drink from modal raises HP", async (t) => {
-  const { c, page, check, world } = t;
-  const dir = world.discoverDir || "north";
-  await enterNeighbour(c, dir);
-  const entered = await c.state();
-  check("entered a dungeon channel", entered.player?.in_channel === true, JSON.stringify(summary(entered)));
-
-  // Modal is read-only in a dungeon: no equip buttons, but a Drink button for
-  // potions (use-potion-local) is present.
-  await openModalViaKey(c);
-  await clickTab(c, "inventory");
-  const equipBtns = await page.$$('#game-modal .inv-btn.equip');
-  check("equip is read-only in a dungeon (no Equip buttons)", equipBtns.length === 0);
-  await closeModal(c);
-
-  // Take some damage, then drink from the modal and assert live HP rose.
-  const hurt = await takeDamage(c, 0.8, 80);
-  const liveBefore = hurt.session?.hp ?? hurt.player?.hp;
-  const maxHp = hurt.session?.maxHp ?? hurt.player?.max_hp;
-  const hasPotion = hurt.player?.inventory?.some(
-    (i) => i.slot === "bag" && i.item_id === "health_potion");
-  if (!hurt.player?.in_channel) { t.skip("left channel before we could get hurt"); }
-  if (liveBefore >= maxHp || !hasPotion) {
-    t.skip(`could not set up hurt+potion state (hp ${liveBefore}/${maxHp}, potion=${hasPotion})`);
-  }
-  await openModalViaKey(c);
-  await clickTab(c, "inventory");
-  const drink = await page.$('#game-modal .inv-btn.use[data-action="use-potion-local"]');
-  check("a Drink button is available in the dungeon modal", !!drink);
-  if (drink) {
-    await drink.click();
-    await sleep(500);
-    const liveAfter = (await c.state()).session?.hp ?? 0;
-    check("drinking in-dungeon raised live HP", liveAfter > liveBefore, `${liveBefore} -> ${liveAfter}`);
-  }
-  await closeModal(c);
-});
-
+// ---- T5: loot pickup + persist (also BANKS the settled bag gear that the
+// mid-run-equip test, T3, later acts on). This is the first test to enter the
+// provisional frontier discovered in T4a, so it enters the channel itself. ----
 test("T5", "loot: pick up an item in a run and it persists into the bag on exit", async (t) => {
   const { c, check, world } = t;
   let s = await c.state();
   if (!s.player?.in_channel) {
-    // Re-enter to run the loot flow if T3 left the channel.
+    // Enter the provisional frontier discovered in T4a to run the loot flow.
     await enterNeighbour(c, world.discoverDir || "north").catch(() => {});
     s = await c.state();
   }
@@ -360,6 +324,109 @@ test("T2b", "hub inventory: equip a bag item to its slot, then unequip", async (
       back.player.inventory.find((i) => i.rowid === rowid)?.slot === "bag");
   }
   await closeModal(c);
+});
+
+// ---- T3: in-dungeon mid-run equip of banked bag gear + drink from modal ----
+// Mid-run equip is now a SHIPPED feature: a player can equip already-banked bag
+// gear during a run. It calls the live session locally (no on-chain move), takes
+// effect immediately in the session, and only lands on-chain when the run
+// settles on exit. This runs AFTER T5 (which banks the gear into the bag) and
+// AFTER T2b (hub equip/unequip of that same bag gear), so settling this run with
+// the item equipped does not starve T2b of a bag item to act on.
+test("T3", "in-dungeon: mid-run equip of banked bag gear is local + immediate; drink raises HP", async (t) => {
+  const { c, page, check, world } = t;
+  const dir = world.discoverDir || "north";
+
+  // Enter a FRESH run in the (now confirmed) neighbour. Its bag carries the gear
+  // T5 banked, which mid-run equip can act on (this-run pickups never can).
+  await c.waitState((s) => s.player && !s.player.in_channel, "at hub before entering", 20000);
+  await enterNeighbour(c, dir);
+  const entered = await c.state();
+  check("entered a dungeon channel", entered.player?.in_channel === true, JSON.stringify(summary(entered)));
+
+  // A banked BAG equippable item renders an [equip-local] button (distinct from
+  // the hub's [equip]). If nothing banked is available, skip honestly rather
+  // than assert the OLD read-only invariant, which is no longer true.
+  await openModalViaKey(c);
+  await clickTab(c, "inventory");
+  const equipBtn = await page.$('#game-modal [data-action="equip-local"]');
+  if (!equipBtn) {
+    await closeModal(c);
+    await returnToHub(c);
+    t.skip("no banked equippable bag gear available to equip mid-run");
+  }
+  const rowid = Number(await equipBtn.evaluate((e) => e.dataset.rowid));
+  const slot = await equipBtn.evaluate((e) => e.dataset.slot);
+  const slotBefore = entered.player.inventory.find((i) => i.rowid === rowid)?.slot;
+  check("the banked item starts in the bag (on-chain)", slotBefore === "bag", `slot=${slotBefore}`);
+
+  // Clicking [equip-local] calls the session locally: NO on-chain move, so the
+  // player stays in the channel and the on-chain inventory slot is unchanged.
+  // The effect is immediate in the live session, which the re-rendered modal
+  // reflects: the item moves into its equipped slot, surfacing [unequip-local].
+  await equipBtn.click();
+  await sleep(400);
+  const afterEquip = await c.state();
+  check("mid-run equip did NOT leave the channel (local, no settle)",
+    afterEquip.player?.in_channel === true, JSON.stringify(summary(afterEquip)));
+  check("mid-run equip did NOT change on-chain inventory (still bagged until settle)",
+    afterEquip.player.inventory.find((i) => i.rowid === rowid)?.slot === "bag");
+  const unequipLocal = await page.$(
+    `#game-modal .inv-btn.unequip[data-action="unequip-local"][data-rowid="${rowid}"]`);
+  check("the item took effect immediately in the live session (an [unequip-local] button appeared)",
+    !!unequipLocal, `rowid=${rowid} slot=${slot}`);
+  const stillEquipLocal = await page.$(
+    `#game-modal [data-action="equip-local"][data-rowid="${rowid}"]`);
+  check("the equipped item no longer offers [equip-local] in the bag", !stillEquipLocal);
+  await closeModal(c);
+
+  // Drink from the modal raises live HP (unchanged behaviour). Take a little
+  // damage first; if we cannot reach a hurt+potion state, skip only the drink
+  // sub-check (the equip assertions above already stand) rather than the test.
+  const hurt = await takeDamage(c, 0.8, 80);
+  const liveBefore = hurt.session?.hp ?? hurt.player?.hp;
+  const maxHp = hurt.session?.maxHp ?? hurt.player?.max_hp;
+  const hasPotion = hurt.player?.inventory?.some(
+    (i) => i.slot === "bag" && i.item_id === "health_potion");
+  if (hurt.player?.in_channel && liveBefore < maxHp && hasPotion) {
+    await openModalViaKey(c);
+    await clickTab(c, "inventory");
+    const drink = await page.$('#game-modal .inv-btn.use[data-action="use-potion-local"]');
+    check("a Drink button is available in the dungeon modal", !!drink);
+    if (drink) {
+      await drink.click();
+      await sleep(500);
+      const liveAfter = (await c.state()).session?.hp ?? 0;
+      check("drinking in-dungeon raised live HP", liveAfter > liveBefore, `${liveBefore} -> ${liveAfter}`);
+    }
+    await closeModal(c);
+  } else {
+    console.log(`   note: drink sub-check not set up (hp ${liveBefore}/${maxHp}, potion=${hasPotion}, inChannel=${hurt.player?.in_channel})`);
+  }
+
+  // Settle the run by walking out through a gate. The equip action rides the
+  // exit proof (the GSP replays it), so the loadout must PERSIST on-chain: the
+  // item's slot flips from "bag" to its equipment slot once the run settles.
+  // Only assert this when we settle via a survived gate exit (a death mid-setup
+  // takes a different xc path and is not what this test covers).
+  if (hurt.player?.in_channel) {
+    const out = await runOutViaGate(c);
+    check("run settled and returned to the overworld", out.player?.in_channel === false,
+      JSON.stringify(summary(out)));
+    const persisted = await c.waitState(
+      (s) => s.player && !s.player.in_channel
+        && s.player.inventory.find((i) => i.rowid === rowid)?.slot === slot,
+      "equipped loadout persisted on-chain", 20000).catch(() => null);
+    check("the mid-run equip persisted on-chain after settling (item now in its slot)",
+      !!persisted, persisted ? "" : `slot did not become ${slot} within timeout`);
+  }
+
+  // Hand off cleanly to the next hub-based test: the exit gate-walk is only
+  // fully done (the frontend's busy flag cleared) once it finishes tearing the
+  // run down, and a gate-walk issued while busy is silently a no-op.
+  await c.waitState((s) => s.player && !s.player.in_channel
+    && s.player.current_segment === 0 && !s.busy,
+    "settled idle at the hub", 20000).catch(() => {});
 });
 
 // ---- T4b: free transit between confirmed segments; land on the other side ----
@@ -559,8 +626,9 @@ async function main() {
       }
       // Cascade guard: never let a FAILED/SKIPPED test leave the player stuck
       // in a channel, which would fail every following hub-based test. A test
-      // that PASSED may deliberately leave the player in a channel for the next
-      // test to continue the same run (T3 -> T5), so we do not disturb it.
+      // that PASSED is trusted to have returned itself to a sane state (the
+      // in-dungeon tests each walk out through a gate before finishing), so we
+      // do not disturb a passing test's end state.
       if (rec.status !== "pass") {
         try {
           await resetOverlays(c);
