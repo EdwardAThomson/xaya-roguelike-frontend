@@ -2184,8 +2184,15 @@ function renderGameModal(): void {
   // The ~1s state poll re-renders the whole modal; without this, scrolling
   // the inventory (or any tab) snaps back to the top every poll.  Capture
   // scrollTop before wiping the old instance and restore it after mount.
-  const prevBody = document.querySelector<HTMLElement>("#game-modal .modal-tab-body");
-  const prevScrollTop = prevBody ? prevBody.scrollTop : 0;
+  // The active scroll container may be NESTED (e.g. the inventory tab scrolls
+  // .inv-body, not .modal-tab-body), so capture scrollTop of every scrollable
+  // element in document order and restore onto the identically-rebuilt DOM.
+  const prevModal = document.getElementById("game-modal");
+  const prevScroll = prevModal
+    ? Array.from(prevModal.querySelectorAll<HTMLElement>("*"))
+        .filter(el => el.scrollHeight > el.clientHeight)
+        .map(el => el.scrollTop)
+    : [];
 
   document.getElementById("game-modal")?.remove();
   if (!activeModalTab) return;
@@ -2239,9 +2246,13 @@ function renderGameModal(): void {
   });
   document.body.appendChild(root);
 
-  // Restore the scroll position captured before the rebuild.
-  const newBody = root.querySelector<HTMLElement>(".modal-tab-body");
-  if (newBody && prevScrollTop > 0) newBody.scrollTop = prevScrollTop;
+  // Restore scroll onto the matching scrollable elements (same document order
+  // as capture, since the tab rebuilds to an identical structure).
+  if (prevScroll.length) {
+    const scrollers = Array.from(root.querySelectorAll<HTMLElement>("*"))
+      .filter(el => el.scrollHeight > el.clientHeight);
+    scrollers.forEach((el, i) => { if (prevScroll[i] > 0) el.scrollTop = prevScroll[i]; });
+  }
 }
 
 /**
