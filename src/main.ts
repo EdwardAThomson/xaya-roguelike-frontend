@@ -269,6 +269,26 @@ function ensureSessionFromChainState(): void {
   // wrongly pops the reconnect modal mid-gate-walk (which then desyncs the
   // session and gets the next gate-walk rejected by the GSP).
   if (busy) return;
+
+  // A live run can end server-side without the client acting: the 200-block
+  // visit timeout force-settles it (a death), or a death/force-settle is
+  // applied off-client.  Detect that our in-progress run is no longer the
+  // one the chain shows (not in a channel, or a different visit) and re-sync
+  // instead of leaving a stale dungeon on screen.  (busy is already excluded
+  // above, so this never fires mid gate-walk / settle that we drive ourselves.)
+  if (channelSession && session
+      && (!p.in_channel || !p.active_visit
+          || p.active_visit.visit_id !== channelVisitId)) {
+    const knockedBack = resumeAfterSettle();
+    if (!knockedBack) ensureHubSessionIfAtHub();
+    addOverworldMessage(
+      "Your previous run ended (timeout or death); synced to your current location.",
+      "combat",
+    );
+    render();
+    return;
+  }
+
   if (channelSession || session) return;  // already have something
 
   if (p.in_channel && p.active_visit) {
