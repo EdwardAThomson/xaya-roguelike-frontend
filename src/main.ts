@@ -22,6 +22,7 @@ import { Gate } from "./game/dungeon.js";
 import { MoveClient, createMoveClient } from "./net/moves.js";
 import { layoutSegments, SegmentNode, hitTestSegment, areLinked } from "./game/overworld.js";
 import { drawOverworld, NODE_SIZE, CELL, PlayerMarker, OverworldView } from "./render/overworld.js";
+import { drawDungeonMap } from "./render/dungeonmap.js";
 import { DEFAULT_GSP_URL, DEFAULT_PROXY_URL } from "./config.js";
 import {
   ValidatorContext, ValidationResult,
@@ -71,6 +72,29 @@ recenterBtn.title = "Recenter the map on your segment and reset zoom (press C)";
 recenterBtn.style.display = "none";
 document.getElementById("topbar")?.appendChild(recenterBtn);
 
+// Map-view tab switcher (World / Dungeon).  The Map view is a single canvas
+// with two sub-views: the overworld segment graph ("World", with pan/zoom)
+// and a fit-to-frame minimap of the current dungeon session ("Dungeon").
+// Injected into the game area (index.html isn't edited); shown only while the
+// Map view is active, via setMode()/setMapTab().
+const mapTabBar = document.createElement("div");
+mapTabBar.id = "map-tab-bar";
+mapTabBar.style.cssText =
+  "position:absolute; top:8px; left:50%; transform:translateX(-50%); "
+  + "display:none; gap:6px; z-index:5;";
+const mapTabWorldBtn = document.createElement("button");
+mapTabWorldBtn.className = "mode-btn active";
+mapTabWorldBtn.textContent = "World";
+mapTabWorldBtn.dataset.action = "map-tab-world";
+mapTabWorldBtn.title = "Show the overworld segment map";
+const mapTabDungeonBtn = document.createElement("button");
+mapTabDungeonBtn.className = "mode-btn";
+mapTabDungeonBtn.textContent = "Dungeon";
+mapTabDungeonBtn.dataset.action = "map-tab-dungeon";
+mapTabDungeonBtn.title = "Show the current dungeon's layout";
+mapTabBar.append(mapTabWorldBtn, mapTabDungeonBtn);
+document.getElementById("game-area")?.appendChild(mapTabBar);
+
 // --- State ---
 
 type AppMode = "overworld" | "dungeon";
@@ -97,6 +121,10 @@ let hubBuiltAtSegment = -1;
 let reconnectPromptShown = false;
 
 // Overworld mode state.
+/** Which sub-view of the Map is showing: the World graph or the Dungeon
+ *  minimap.  Only meaningful while `mode === "overworld"`. */
+type MapTab = "world" | "dungeon";
+let mapTab: MapTab = "world";
 let overworldNodes: Map<number, SegmentNode> = new Map();
 let connState: ConnectionState | null = null;
 let selectedSegment: number | null = null;
@@ -426,14 +454,32 @@ function setMode(m: AppMode): void {
   modeDungeonBtn.classList.toggle("active", m === "dungeon");
   modeOverworldBtn.disabled = m === "overworld";
   modeDungeonBtn.disabled = m === "dungeon";
-  recenterBtn.style.display = m === "overworld" ? "" : "none";
-  canvas.style.cursor = m === "overworld" ? "grab" : "";
+  mapTabBar.style.display = m === "overworld" ? "flex" : "none";
+  applyMapTabControls();
   render();
   updateSidebar();
 }
 
+/** Pan/zoom controls (grab cursor, Recenter button) apply only to the World
+ *  tab; the Dungeon minimap is a static view, so hide them there. */
+function applyMapTabControls(): void {
+  const worldActive = mode === "overworld" && mapTab === "world";
+  recenterBtn.style.display = worldActive ? "" : "none";
+  canvas.style.cursor = worldActive ? "grab" : "";
+}
+
+function setMapTab(tab: MapTab): void {
+  mapTab = tab;
+  mapTabWorldBtn.classList.toggle("active", tab === "world");
+  mapTabDungeonBtn.classList.toggle("active", tab === "dungeon");
+  applyMapTabControls();
+  render();
+}
+
 modeOverworldBtn.addEventListener("click", () => setMode("overworld"));
 modeDungeonBtn.addEventListener("click", () => setMode("dungeon"));
+mapTabWorldBtn.addEventListener("click", () => setMapTab("world"));
+mapTabDungeonBtn.addEventListener("click", () => setMapTab("dungeon"));
 
 // --- Overworld ---
 
@@ -449,7 +495,7 @@ function rebuildOverworld(): void {
 // Canvas click handler for overworld segment selection.  The click event
 // fires after mouseup, so a drag-pan sets `panMoved` and we skip selection.
 canvas.addEventListener("click", (e) => {
-  if (mode !== "overworld" || overworldNodes.size === 0) return;
+  if (mode !== "overworld" || mapTab !== "world" || overworldNodes.size === 0) return;
   if (panMoved) { panMoved = false; return; }  // this was a drag, not a click
 
   const rect = canvas.getBoundingClientRect();
@@ -470,7 +516,7 @@ canvas.addEventListener("click", (e) => {
 // commits it (turning off follow mode), and the pan follows the pointer.  The
 // move/up listeners live on window so a drag keeps working outside the canvas.
 canvas.addEventListener("mousedown", (e) => {
-  if (mode !== "overworld" || e.button !== 0) return;
+  if (mode !== "overworld" || mapTab !== "world" || e.button !== 0) return;
   isPanning = true;
   panMoved = false;
   panDownX = e.clientX;
@@ -500,14 +546,14 @@ window.addEventListener("mousemove", (e) => {
 window.addEventListener("mouseup", () => {
   if (!isPanning) return;
   isPanning = false;
-  if (mode === "overworld") canvas.style.cursor = "grab";
+  if (mode === "overworld" && mapTab === "world") canvas.style.cursor = "grab";
   // `panMoved` is left set for the click handler (which fires next) to inspect.
 });
 
 // Wheel to zoom, centered on the cursor.  Adjusts the pan so the world point
 // under the pointer stays fixed while zooming.
 canvas.addEventListener("wheel", (e) => {
-  if (mode !== "overworld" || overworldNodes.size === 0) return;
+  if (mode !== "overworld" || mapTab !== "world" || overworldNodes.size === 0) return;
   e.preventDefault();
 
   const rect = canvas.getBoundingClientRect();
@@ -1290,7 +1336,14 @@ resize();
 
 function render(): void {
   if (mode === "overworld") {
-    renderOverworld();
+    if (mapTab === "dungeon") {
+      // The Dungeon tab reflects a real dungeon run only; the hub and the
+      // no-session state fall through to the renderer's placeholder.
+      drawDungeonMap(ctx, channelSession ? session : null,
+        channelSession ? fov : null, canvas.width, canvas.height);
+    } else {
+      renderOverworld();
+    }
   } else {
     renderDungeon();
   }
@@ -1557,7 +1610,7 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   // "C" recenters the overworld map (reset pan/zoom, re-enable follow).
-  if (mode === "overworld" && e.key.toLowerCase() === "c") {
+  if (mode === "overworld" && mapTab === "world" && e.key.toLowerCase() === "c") {
     recenterMap();
     return;
   }
@@ -1665,7 +1718,7 @@ const EQUIP_SLOTS: Array<{ slot: string; label: string; icon: string }> = [
 // means closed; otherwise the value is the active tab.  A topbar button
 // (or key) opens it on a specific tab; the tab bar switches between them
 // without closing.
-type ModalTab = "inventory" | "players" | "help";
+type ModalTab = "inventory" | "character" | "players" | "help";
 let activeModalTab: ModalTab | null = null;
 // The in-game modal carries a Help tab (alongside Inventory / Players).
 // Separately, the title screen has its OWN standalone help overlay
