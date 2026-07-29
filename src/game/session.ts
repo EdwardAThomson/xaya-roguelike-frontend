@@ -22,14 +22,46 @@ export interface CollectedItem {
   quantity: number;
 }
 
-export type ActionType = "move" | "pickup" | "use" | "gate" | "wait";
+/**
+ * An already-settled inventory item known at run start (bag + equipped),
+ * mirroring the on-chain `inventory` rows.  Only these items can be
+ * equipped/unequipped mid-run; this-run pickups (`loot`/`collected`) cannot.
+ */
+export interface EntryInvItem {
+  rowid: number;
+  itemId: string;
+  slot: string;
+}
+
+/** A gear item currently occupying an equipment slot. */
+export interface EquippedItem {
+  rowid: number;
+  itemId: string;
+}
+
+/** A settled item sitting in the bag, available to equip mid-run. */
+export interface BagItem {
+  rowid: number;
+  itemId: string;
+}
+
+export type ActionType =
+  "move" | "pickup" | "use" | "gate" | "wait" | "equip" | "unequip";
 
 export interface GameAction {
   type: ActionType;
   dx?: number;
   dy?: number;
   itemId?: string;
+  /** Inventory rowid for equip/unequip. */
+  rowid?: number;
+  /** Target equipment slot for equip. */
+  slot?: string;
 }
+
+/** maxHp = BASE_HP + effectiveConstitution*HP_PER_CON (must match items.cpp). */
+const BASE_HP = 50;
+const HP_PER_CON = 5;
 
 export interface GameMessage {
   text: string;
@@ -49,6 +81,16 @@ export class DungeonSession {
   monsters: Monster[] = [];
   groundItems: GroundItem[] = [];
   loot: CollectedItem[] = [];
+
+  /**
+   * Settled loadout, seeded from the on-chain inventory at run start.
+   * `equipped` maps slot -> {rowid,itemId}; `bag` holds settled items not
+   * currently worn.  Mid-run equip/unequip mutates these plus the effective
+   * `stats` by deltas — this is the anti-cheat-verified, replayed loadout,
+   * kept SEPARATE from this-run `loot`/`collected` (which is not equippable).
+   */
+  equipped: Map<string, EquippedItem> = new Map();
+  bag: BagItem[] = [];
 
   /**
    * Items picked up during this run, tracked separately from `loot` (which
@@ -75,11 +117,20 @@ export class DungeonSession {
 
   constructor(seed: string, depth: number, stats: PlayerStats,
               hp: number, maxHp: number, startingPotions: CollectedItem[] = [],
-              constraints: Gate[] = [], entryDirection: string = "") {
+              constraints: Gate[] = [], entryDirection: string = "",
+              entryInventory: EntryInvItem[] = []) {
     this.depth = depth;
     this.stats = stats;
     this.playerHp = hp;
     this.playerMaxHp = maxHp;
+
+    // Seed the settled loadout from the on-chain inventory (ORDER BY rowid
+    // asc on the caller side).  `stats` arrives ALREADY effective (base +
+    // entry-equipped); equip/unequip mutate it by deltas, never re-derived.
+    for (const e of entryInventory) {
+      if (e.slot === "bag") this.bag.push({ rowid: e.rowid, itemId: e.itemId });
+      else this.equipped.set(e.slot, { rowid: e.rowid, itemId: e.itemId });
+    }
 
     // Seed the RNG — must match C++ dungeongame.cpp.
     this.rng = new MT19937(hashSeedSync(seed + ":game:" + depth));
@@ -177,6 +228,8 @@ export class DungeonSession {
     s.monsters = [];
     s.groundItems = [];
     s.loot = [];
+    s.equipped = new Map();
+    s.bag = [];
     s.collected = [];
     s.turnCount = 0;
     s.totalXp = 0;
@@ -335,6 +388,52 @@ export class DungeonSession {
         break;
       }
 
+      case "equip": {
+        const rowid = action.rowid ?? -1;
+        const slot = action.slot ?? "";
+        // 1. Must be a settled bag item (this-run pickups live in `loot`, not
+        //    `bag`, so equipping them is auto-rejected).
+        const idx = this.bag.findIndex(b => b.rowid === rowid);
+        if (idx < 0) return false;
+        const bagItem = this.bag[idx];
+        // 2. Item def must exist and its slot must match the requested slot.
+        const def = lookupItem(bagItem.itemId);
+        if (!def || def.slot === "" || def.slot !== slot) return false;
+        // 3. Displace whatever occupies the slot: subtract its bonuses, bag it.
+        const old = this.equipped.get(slot);
+        if (old) {
+          this.applyItemStats(old.itemId, -1);
+          this.bag.push({ rowid: old.rowid, itemId: old.itemId });
+        }
+        // 4. Remove the new item from the bag; add its bonuses; equip it.
+        this.bag.splice(idx, 1);
+        this.applyItemStats(bagItem.itemId, +1);
+        this.equipped.set(slot, { rowid: bagItem.rowid, itemId: bagItem.itemId });
+        // 5. Recompute maxHp cap (raise = no heal; lower = clamp current hp).
+        this.recomputeMaxHp();
+        this.addMessage(`Equipped ${def.name}.`, "info");
+        valid = true;
+        break;
+      }
+
+      case "unequip": {
+        const rowid = action.rowid ?? -1;
+        let foundSlot: string | null = null;
+        for (const [s, it] of this.equipped) {
+          if (it.rowid === rowid) { foundSlot = s; break; }
+        }
+        if (foundSlot === null) return false;
+        const it = this.equipped.get(foundSlot)!;
+        this.applyItemStats(it.itemId, -1);
+        this.bag.push({ rowid: it.rowid, itemId: it.itemId });
+        this.equipped.delete(foundSlot);
+        this.recomputeMaxHp();
+        const def = lookupItem(it.itemId);
+        this.addMessage(`Unequipped ${def?.name ?? it.itemId}.`, "info");
+        valid = true;
+        break;
+      }
+
       case "wait":
         valid = true;
         break;
@@ -351,6 +450,42 @@ export class DungeonSession {
     }
 
     return true;
+  }
+
+  /**
+   * Equip a settled bag item into a slot mid-run.  Immediate effect (this
+   * run), recorded as a replayed action.  Costs a turn (monsters act), just
+   * like drinking a potion.  Returns false (and does nothing) if invalid.
+   */
+  equip(rowid: number, slot: string): boolean {
+    return this.processAction({ type: "equip", rowid, slot });
+  }
+
+  /** Unequip a worn item back to the bag mid-run.  Costs a turn. */
+  unequip(rowid: number): boolean {
+    return this.processAction({ type: "unequip", rowid });
+  }
+
+  /**
+   * Adds (sign=+1) or subtracts (sign=-1) an item's six effective-stat
+   * bonuses.  maxHealth is intentionally NOT applied here — maxHp derives
+   * only from constitution (matches items.cpp ComputeEffectiveStats).
+   */
+  private applyItemStats(itemId: string, sign: number): void {
+    const d = lookupItem(itemId);
+    if (!d) return;
+    this.stats.equipAttack += sign * d.attackPower;
+    this.stats.equipDefense += sign * d.defense;
+    this.stats.strength += sign * d.strength;
+    this.stats.dexterity += sign * d.dexterity;
+    this.stats.constitution += sign * d.constitution;
+    this.stats.intelligence += sign * d.intelligence;
+  }
+
+  /** Recompute maxHp from constitution and clamp current hp down if needed. */
+  private recomputeMaxHp(): void {
+    this.playerMaxHp = BASE_HP + this.stats.constitution * HP_PER_CON;
+    if (this.playerMaxHp < this.playerHp) this.playerHp = this.playerMaxHp;
   }
 
   private processMonsterTurns(): void {

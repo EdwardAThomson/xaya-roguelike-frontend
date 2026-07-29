@@ -597,9 +597,16 @@ function startChannelDungeon(
     }
   }
 
+  // Settled inventory (bag + equipped) that mid-run equip/unequip can act on.
+  // ORDER BY rowid asc, matching the GSP's ApplySettlementBody SELECT so the
+  // replayed loadout is byte-identical.
+  const entryInventory = p.inventory
+    .map(item => ({ rowid: item.rowid, itemId: item.item_id, slot: item.slot }))
+    .sort((a, b) => a.rowid - b.rowid);
+
   session = new DungeonSession(
     segmentSeed, depth, stats, p.hp, p.max_hp, potions,
-    constraints, entryDirection);
+    constraints, entryDirection, entryInventory);
   fov = new FovMap();
   fov.explored = persistentExplored("seg:" + segmentSeed);
   fov.update(session.playerX, session.playerY, session.dungeon);
@@ -781,9 +788,12 @@ async function doExitChannel(): Promise<void> {
       kills: session.totalKills,
     };
 
-    // Convert TS actionLog to C++ format: "itemId" -> "item"
+    // Convert TS actionLog to C++ format: "itemId" -> "item"; equip/unequip
+    // pass through carrying their rowid/slot (same shape the GSP replays).
     const actions = session.actionLog.map(a => {
       if (a.type === "use") return { type: "use", item: a.itemId };
+      if (a.type === "equip") return { type: "equip", rowid: a.rowid, slot: a.slot };
+      if (a.type === "unequip") return { type: "unequip", rowid: a.rowid };
       return a;
     });
 
@@ -994,6 +1004,34 @@ async function doUnequip(rowid: number): Promise<void> {
   updateSidebar();
 }
 
+/**
+ * Mid-run equip: NOT an on-chain move.  It mutates the live session's settled
+ * loadout locally (immediate stat effect), records an equip action in the
+ * replay log, and costs a turn (monsters act).  It settles with the exit
+ * proof, where the GSP replays the same action and verifies the outcome.
+ */
+function equipLocal(rowid: number, slot: string): void {
+  if (busy || !session || session.gameOver) return;
+  if (!session.equip(rowid, slot)) return;
+  afterLocalLoadoutChange();
+}
+
+/** Mid-run unequip: local, replayed, costs a turn (see equipLocal). */
+function unequipLocal(rowid: number): void {
+  if (busy || !session || session.gameOver) return;
+  if (!session.unequip(rowid)) return;
+  afterLocalLoadoutChange();
+}
+
+/** Refresh views after a local equip/unequip (the monster turn it ran may
+ *  have moved monsters or changed the player's HP). */
+function afterLocalLoadoutChange(): void {
+  if (session && fov) fov.update(session.playerX, session.playerY, session.dungeon);
+  render();
+  updateSidebar();
+  if (activeModalTab) renderGameModal();
+}
+
 function doDiscard(rowid: number): void {
   if (busy || !moves || !connState?.playerName) return;
   const ctx = validatorContext();
@@ -1066,15 +1104,20 @@ async function doGateWalk(dir: string): Promise<void> {
     // combat XP were being lost). Only a bare crossing of a confirmed segment
     // (no loot, no combat) stays a plain, free transit with no proof.
     const earnedRewards = session.actionLog.some(
-        a => a.type === "pickup" || a.type === "use")
+        a => a.type === "pickup" || a.type === "use"
+          || a.type === "equip" || a.type === "unequip")
       || (session.totalXp ?? 0) > 0
       || (session.totalKills ?? 0) > 0
       || (session.totalGold ?? 0) > 0;
     if (curConfirmed && !earnedRewards) {
       transit = true;
     } else {
-      const actions: object[] = session.actionLog.map(a =>
-        a.type === "use" ? { type: "use", item: a.itemId } : a);
+      const actions: object[] = session.actionLog.map(a => {
+        if (a.type === "use") return { type: "use", item: a.itemId };
+        if (a.type === "equip") return { type: "equip", rowid: a.rowid, slot: a.slot };
+        if (a.type === "unequip") return { type: "unequip", rowid: a.rowid };
+        return a;
+      });
       actions.push({ type: "gate" });
       settlement = {
         results: {
@@ -1570,6 +1613,12 @@ document.addEventListener("click", (e) => {
     case "unequip":
       doUnequip(Number(target.dataset.rowid));
       break;
+    case "equip-local":
+      equipLocal(Number(target.dataset.rowid), target.dataset.slot!);
+      break;
+    case "unequip-local":
+      unequipLocal(Number(target.dataset.rowid));
+      break;
     case "discard":
       doDiscard(Number(target.dataset.rowid));
       break;
@@ -1681,13 +1730,31 @@ function renderInventoryTabBody(): string {
     return `<div class="inv-body"><div class="inv-empty">Connect and register to see your inventory.</div></div>`;
   }
 
-  // On-chain inventory is the truth everywhere.  Equip/use/discard are
-  // chain moves the GSP rejects mid-channel, so they're only active in
-  // the hub; inside a dungeon the modal is read-only + pending finds.
+  // On-chain inventory is the truth at the hub.  Equip/use/discard there are
+  // chain moves the GSP rejects mid-channel.  Inside a dungeon the settled
+  // loadout is instead mutated LOCALLY (session.equipped/bag) as a replayed
+  // action, so the bag/equipped view is driven by the live session and the
+  // buttons fire local equip/unequip (not on-chain moves).
   const interactive = !!moves && !p.in_channel && !busy;
-  const equipped = new Map<string, typeof p.inventory[number]>();
-  for (const it of p.inventory) if (it.slot !== "bag") equipped.set(it.slot, it);
-  const bag = p.inventory.filter(it => it.slot === "bag");
+  const inRun = !!(channelSession && session && p.in_channel);
+
+  const chainQty = new Map<number, number>();
+  for (const it of p.inventory) chainQty.set(it.rowid, it.quantity);
+
+  interface InvRow { rowid: number; itemId: string; quantity: number; }
+  const equipped = new Map<string, InvRow>();
+  const bag: InvRow[] = [];
+  if (inRun && session) {
+    for (const [slot, e] of session.equipped)
+      equipped.set(slot, { rowid: e.rowid, itemId: e.itemId, quantity: 1 });
+    for (const b of session.bag)
+      bag.push({ rowid: b.rowid, itemId: b.itemId, quantity: chainQty.get(b.rowid) ?? 1 });
+  } else {
+    for (const it of p.inventory)
+      if (it.slot !== "bag") equipped.set(it.slot, { rowid: it.rowid, itemId: it.item_id, quantity: it.quantity });
+    for (const it of p.inventory)
+      if (it.slot === "bag") bag.push({ rowid: it.rowid, itemId: it.item_id, quantity: it.quantity });
+  }
 
   const equipHtml = EQUIP_SLOTS.map(s => {
     const it = equipped.get(s.slot);
@@ -1697,14 +1764,17 @@ function renderInventoryTabBody(): string {
         <span class="inv-slot-label">${s.label}</span>
         <span class="inv-empty">empty</span></div>`;
     }
-    const stat = itemStatLine(it.item_id);
+    const stat = itemStatLine(it.itemId);
+    // Hub: on-chain unequip.  Mid-run: local, replayed unequip (costs a turn).
     const unequipBtn = interactive
       ? `<button class="inv-btn unequip" data-action="unequip" data-rowid="${it.rowid}">Unequip</button>`
-      : "";
+      : inRun
+        ? `<button class="inv-btn unequip" data-action="unequip-local" data-rowid="${it.rowid}">Unequip</button>`
+        : "";
     return `<div class="inv-slot">
-      <span class="inv-slot-icon">${itemIcon(it.item_id)}</span>
+      <span class="inv-slot-icon">${itemIcon(it.itemId)}</span>
       <span class="inv-slot-label">${s.label}</span>
-      <span class="inv-item-name" style="color:${itemColor(it.item_id)}">${itemName(it.item_id)}</span>
+      <span class="inv-item-name" style="color:${itemColor(it.itemId)}">${itemName(it.itemId)}</span>
       ${stat ? `<span class="inv-stat">${stat}</span>` : ""}
       ${unequipBtn}</div>`;
   }).join("");
@@ -1712,26 +1782,35 @@ function renderInventoryTabBody(): string {
   const bagHtml = bag.length === 0
     ? '<div class="inv-empty">Bag is empty</div>'
     : bag.map(it => {
-        const def = lookupItem(it.item_id);
+        const def = lookupItem(it.itemId);
         const canEquip = def && def.slot !== "" && def.type !== "potion" && def.type !== "misc";
         const canUse = def && def.type === "potion";
-        const stat = itemStatLine(it.item_id);
-        const btns = interactive ? [
-          canEquip ? `<button class="inv-btn equip" data-action="equip" data-rowid="${it.rowid}" data-slot="${def!.slot}">Equip</button>` : "",
-          canUse ? `<button class="inv-btn use" data-action="use-item" data-item="${it.item_id}">Use</button>` : "",
-          `<button class="inv-btn discard" data-action="discard" data-rowid="${it.rowid}">Drop</button>`,
-        ].join("")
-          // Inside a dungeon, equip/drop are on-chain moves the GSP rejects
-          // mid-run, so they stay read-only. But drinking a potion IS a local,
-          // replayed action (the same one the P key does), so keep the potion
-          // usable from the modal here instead of leaving it dead.
-          : (p.in_channel && canUse
+        const stat = itemStatLine(it.itemId);
+        let btns: string;
+        if (interactive) {
+          btns = [
+            canEquip ? `<button class="inv-btn equip" data-action="equip" data-rowid="${it.rowid}" data-slot="${def!.slot}">Equip</button>` : "",
+            canUse ? `<button class="inv-btn use" data-action="use-item" data-item="${it.itemId}">Use</button>` : "",
+            `<button class="inv-btn discard" data-action="discard" data-rowid="${it.rowid}">Drop</button>`,
+          ].join("");
+        } else if (inRun) {
+          // Mid-run: equipping SETTLED bag gear is a local, replayed action
+          // (immediate this run, settles with the exit proof); drinking a
+          // potion is the same local action the P key does.  Dropping stays
+          // hub-only.  This-run finds (the pending list below) are NOT here.
+          btns = [
+            canEquip ? `<button class="inv-btn equip" data-action="equip-local" data-rowid="${it.rowid}" data-slot="${def!.slot}">Equip</button>` : "",
+            canUse ? `<button class="inv-btn use" data-action="use-potion-local">Drink</button>` : "",
+          ].join("");
+        } else {
+          btns = p.in_channel && canUse
             ? `<button class="inv-btn use" data-action="use-potion-local">Drink</button>`
-            : "");
+            : "";
+        }
         const qty = it.quantity > 1 ? ` x${it.quantity}` : "";
         return `<div class="inv-row">
-          <span class="inv-item-icon">${itemIcon(it.item_id)}</span>
-          <span class="inv-item-name" style="color:${itemColor(it.item_id)}">${itemName(it.item_id)}${qty}</span>
+          <span class="inv-item-icon">${itemIcon(it.itemId)}</span>
+          <span class="inv-item-name" style="color:${itemColor(it.itemId)}">${itemName(it.itemId)}${qty}</span>
           ${stat ? `<span class="inv-stat">${stat}</span>` : ""}
           <span class="inv-row-actions">${btns}</span></div>`;
       }).join("");
@@ -1750,7 +1829,7 @@ function renderInventoryTabBody(): string {
   }
 
   const note = p.in_channel
-    ? '<div class="inv-note">In a dungeon you can drink potions (here or with P). Equipping gear and managing loot happen back at the hub: loot you pick up settles into your bag when you exit through a gate, then you can equip it.</div>'
+    ? '<div class="inv-note">Mid-run you can equip settled gear from your bag and drink potions; both take effect immediately (each costs a turn) and settle when you exit through a gate. Items collected this run cannot be equipped until they settle back at the hub.</div>'
     : "";
 
   return `

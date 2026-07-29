@@ -12,6 +12,8 @@
  */
 import { hashSeedSync } from "./hash.js";
 import { Dungeon, Gate, WIDTH, HEIGHT } from "./dungeon.js";
+import { DungeonSession, GameAction, EntryInvItem } from "./session.js";
+import { PlayerStats } from "./combat.js";
 
 /**
  * Canonical signature: depth, entry-gate spawn, gates (sorted by direction),
@@ -69,4 +71,65 @@ export function runParityTest(): boolean {
   return ok;
 }
 
+/**
+ * Mid-run equip parity vector (see equip_spec.md "Parity test vector").
+ * Constructs a run with a known settled inventory, replays a fixed action
+ * sequence that equips/unequips gear mid-run, and prints the final outcome.
+ * The C++ side (DungeonGame) replays the IDENTICAL vector; the two printed
+ * lines must match byte-for-byte, or equip determinism has drifted.
+ *
+ * Fixed action sequence (pinned, both sides identical):
+ *   equip rowid10 slot "weapon"; equip rowid11 slot "body";
+ *   40x move (dx=0,dy=1); unequip rowid11; gate.
+ */
+export function runEquipParityVector(): void {
+  const stats: PlayerStats = {
+    level: 3,
+    strength: 12,
+    dexterity: 11,
+    constitution: 10,
+    intelligence: 10,
+    equipAttack: 0,
+    equipDefense: 0,
+  };
+  const entryInventory: EntryInvItem[] = [
+    { rowid: 10, itemId: "short_sword",   slot: "bag" },
+    { rowid: 11, itemId: "scale_mail",    slot: "bag" },
+    { rowid: 12, itemId: "leather_armor", slot: "body" },
+  ];
+
+  const s = new DungeonSession(
+    "parity-equip", 3, stats, /*hp=*/80, /*maxHp=*/100,
+    /*startingPotions=*/[], /*constraints=*/[], /*entryDir=*/"south",
+    entryInventory);
+
+  // PINNED all-valid corridor walk (matches the C++ GSP ParityEquipVector).
+  // Every move is a valid step in this layout, so no blocked-move stop occurs.
+  const actions: GameAction[] = [
+    { type: "equip", rowid: 10, slot: "weapon" },   // short_sword
+    { type: "equip", rowid: 11, slot: "body" },     // scale_mail (+1 con), displaces rowid12
+    { type: "move", dx: -1, dy: 0 },                // west out of the south-gate mouth
+  ];
+  for (let i = 0; i < 10; i++) actions.push({ type: "move", dx: 0, dy: -1 }); // north
+  actions.push({ type: "unequip", rowid: 11 });     // scale_mail back to bag
+  for (let i = 0; i < 10; i++) actions.push({ type: "move", dx: 0, dy: 1 });  // back south
+  actions.push({ type: "move", dx: 1, dy: 0 });     // east to the mouth
+  actions.push({ type: "move", dx: 0, dy: 1 });     // onto the south gate tile
+  actions.push({ type: "gate" });
+
+  // The GSP replay STOPS on the first false action (blocked move / invalid).
+  // Mirror that here so the harness matches consensus, not a no-op-and-continue.
+  for (const a of actions) if (!s.processAction(a)) break;
+
+  console.log(
+    `[equip-parity] survived=${s.survived ? 1 : 0}` +
+    `,totalXp=${s.totalXp}` +
+    `,totalGold=${s.totalGold}` +
+    `,totalKills=${s.totalKills}` +
+    `,playerHp=${s.playerHp}` +
+    `,playerMaxHp=${s.playerMaxHp}` +
+    `,exitGate=${s.exitGate}`);
+}
+
 runParityTest();
+runEquipParityVector();
