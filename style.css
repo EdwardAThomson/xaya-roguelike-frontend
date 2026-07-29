@@ -593,10 +593,11 @@ body {
   background: #15151c;
   border: 1px solid #444;
   border-radius: 8px;
-  width: min(900px, 96vw);
-  /* Fixed height (not just max-height) so switching tabs does not resize the
-     panel; the active tab body scrolls inside it instead. */
-  height: min(760px, 90vh);
+  /* Fixed OUTER dimensions (not max-*) so every tab renders at exactly the
+     same size and switching tabs never resizes or jitters the panel; the
+     active tab body scrolls inside it instead. */
+  width: min(980px, 96vw);
+  height: min(820px, 92vh);
   display: flex;
   flex-direction: column;
   color: #ddd;
@@ -698,3 +699,62 @@ body {
   color: #bcc; font-size: 12px; flex: 0 0 auto;
   min-width: 72px; text-align: right;
 }
+
+/* --- Gold / pending / bag-capacity labels --- */
+
+.inv-gold-pending { color: #c9b24a; font-weight: normal; font-size: 12px; }
+.inv-pending-badge {
+  color: #c9b24a; font-size: 10px; margin-left: 6px;
+  border: 1px dashed #5a5a3a; border-radius: 4px; padding: 0 5px;
+  background: rgba(90, 80, 30, 0.12); white-space: nowrap;
+}
+.inv-cap { color: #9aa; }
+.inv-cap-full { color: #e08a3a; font-weight: bold; }
+.inv-warning {
+  margin: 10px 16px 0; padding: 8px 12px;
+  background: rgba(200, 80, 20, 0.12); color: #e79a5a;
+  border: 1px solid #8a4a2a; border-radius: 5px;
+  font-size: 12px; line-height: 1.4;
+}
+
+/* --- Character tab --- */
+
+.char-wrap {
+  padding: 18px 20px; display: flex; flex-direction: column; gap: 14px;
+}
+.char-header {
+  display: flex; align-items: baseline; gap: 12px;
+  border-bottom: 1px solid #333; padding-bottom: 10px;
+}
+.char-name { font-size: 20px; font-weight: bold; color: #cde; }
+.char-level { font-size: 14px; color: #8ec; margin-left: auto; }
+.char-xp { display: flex; flex-direction: column; gap: 4px; }
+.char-xp-bar {
+  position: relative; height: 20px; background: #1a1a24;
+  border: 1px solid #333; border-radius: 4px; overflow: hidden;
+}
+.char-xp-fill {
+  position: absolute; inset: 0 auto 0 0; height: 100%;
+  background: linear-gradient(90deg, #2b5a8a, #3a7ac0);
+}
+.char-xp-text {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; font-size: 11px; color: #dde; text-shadow: 0 1px 2px #000;
+}
+.char-xp-note { font-size: 11px; color: #888; }
+.char-section-title {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: #8ec; border-bottom: 1px solid #2f4a44;
+  padding-bottom: 5px; margin-top: 4px;
+}
+.char-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 16px;
+}
+.char-stat {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 8px; background: rgba(40, 40, 48, 0.5);
+  border: 1px solid #3a3a44; border-radius: 5px; padding: 6px 10px;
+}
+.char-stat-label { font-size: 12px; color: #99a; }
+.char-stat-value { font-weight: 600; color: #cde; text-align: right; }
+.char-pending { color: #c9b24a; font-weight: normal; font-size: 11px; }

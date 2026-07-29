@@ -1703,6 +1703,13 @@ document.addEventListener("click", (e) => {
 
 // --- Inventory & equipment modal ---
 
+// Maximum number of BAG-slot rows a player can hold.  Must match the GSP's
+// MAX_INVENTORY (items.cpp / moveprocessor.cpp): equipped/worn gear does NOT
+// count against it, and it counts rows (distinct stacks), not quantities.
+// Loot beyond this cap is silently left behind at settlement, so the UI warns
+// before that happens.
+const MAX_INVENTORY = 50;
+
 /** Equipment slots in display order, matching the GSP's slot names. */
 const EQUIP_SLOTS: Array<{ slot: string; label: string; icon: string }> = [
   { slot: "weapon",  label: "Weapon",   icon: "⚔️" },
@@ -1794,6 +1801,17 @@ function renderInventoryTabBody(): string {
   const chainQty = new Map<number, number>();
   for (const it of p.inventory) chainQty.set(it.rowid, it.quantity);
 
+  // Potions drunk during this run are consumed from the live session
+  // immediately, but the on-chain stack does not shrink until settlement.
+  // Count uses per item id (from the replayed action log) so the bag row can
+  // show the pending drop instead of a stale count.
+  const usedThisRun = new Map<string, number>();
+  if (inRun && session) {
+    for (const a of session.actionLog)
+      if (a.type === "use" && a.itemId)
+        usedThisRun.set(a.itemId, (usedThisRun.get(a.itemId) ?? 0) + 1);
+  }
+
   interface InvRow { rowid: number; itemId: string; quantity: number; }
   const equipped = new Map<string, InvRow>();
   const bag: InvRow[] = [];
@@ -1860,11 +1878,20 @@ function renderInventoryTabBody(): string {
             ? `<button class="inv-btn use" data-action="use-potion-local">Drink</button>`
             : "";
         }
-        const qty = it.quantity > 1 ? ` x${it.quantity}` : "";
+        // Reflect this-run potion consumption: the drink is already applied
+        // in the live session but the on-chain stack does not shrink until
+        // settlement, so show the remaining count plus a pending badge.
+        const used = usedThisRun.get(it.itemId) ?? 0;
+        const remaining = Math.max(0, it.quantity - used);
+        const qty = remaining !== 1 ? ` x${remaining}` : "";
+        const usedBadge = used > 0
+          ? `<span class="inv-pending-badge">${used} used this run, settles on exit</span>`
+          : "";
         return `<div class="inv-row">
           <span class="inv-item-icon">${itemIcon(it.itemId)}</span>
           <span class="inv-item-name" style="color:${itemColor(it.itemId)}">${itemName(it.itemId)}${qty}</span>
           ${stat ? `<span class="inv-stat">${stat}</span>` : ""}
+          ${usedBadge}
           <span class="inv-row-actions">${btns}</span></div>`;
       }).join("");
 
@@ -1885,11 +1912,33 @@ function renderInventoryTabBody(): string {
     ? '<div class="inv-note">Mid-run you can equip settled gear from your bag and drink potions; both take effect immediately (each costs a turn) and settle when you exit through a gate. Items collected this run cannot be equipped until they settle back at the hub.</div>'
     : "";
 
+  // Bag capacity: count settled BAG-slot rows only (equipped gear is exempt,
+  // matching the GSP).  Project how many NEW rows this-run pickups would need
+  // at settlement (a pickup that stacks onto an existing bag row needs none),
+  // so we can warn before loot is silently left behind at the cap.
+  const bagRows = p.inventory.filter(i => i.slot === "bag");
+  const bagCount = bagRows.length;
+  let projectedNewRows = 0;
+  if (inRun && session) {
+    const seen = new Set(bagRows.map(i => i.item_id));
+    for (const c of session.collected) {
+      if (c.quantity <= 0) continue;
+      if (!seen.has(c.itemId)) { projectedNewRows++; seen.add(c.itemId); }
+    }
+  }
+  const bagFull = bagCount >= MAX_INVENTORY;
+  const willOverflow = bagCount + projectedNewRows > MAX_INVENTORY;
+  const capClass = bagFull || willOverflow ? " inv-cap-full" : "";
+  const capWarning = (bagFull || (inRun && willOverflow))
+    ? `<div class="inv-warning">Bag full: extra loot will be left behind when you settle. Drop or equip items (manage your bag at the hub).</div>`
+    : "";
+
   return `
       ${note}
+      ${capWarning}
       <div class="inv-body">
         <div class="inv-bag">
-          <div class="inv-col-title">Bag (${bag.length})</div>
+          <div class="inv-col-title">Bag: <span class="inv-cap${capClass}">${bagCount} / ${MAX_INVENTORY}</span></div>
           ${bagHtml}
           ${pendingHtml}
         </div>
@@ -1957,6 +2006,101 @@ function renderPlayersTabBody(): string {
     <div class="players-subtitle">Active = currently in a dungeon or out on a segment (presence is not tracked on-chain).</div>
     ${body}
   </div>`;
+}
+
+// --- Character tab ---
+
+/**
+ * Cumulative XP threshold to reach `level`, mirroring the backend
+ * XpForLevel(L) = floor(60 * L^1.35) in moveprocessor.cpp.  Display-only:
+ * the on-chain `xp` field is the residual progress toward the NEXT level
+ * (the GSP subtracts each threshold on level-up), so XP-to-next is
+ * XpForLevel(level + 1) - xp.
+ */
+function xpForLevel(level: number): number {
+  return Math.floor(60 * Math.pow(level, 1.35));
+}
+
+/**
+ * Builds the Character tab body: name, level, XP progress toward the next
+ * level, base and effective stats, HP, and gold (banked + this-run pending,
+ * per the settled-vs-pending labelling).  Read-only.
+ */
+function renderCharacterTabBody(): string {
+  const p = connState?.player;
+  if (!p) {
+    return `<div class="char-wrap"><div class="inv-empty">Connect and register to see your character.</div></div>`;
+  }
+
+  const nextThreshold = xpForLevel(p.level + 1);
+  const xpToNext = Math.max(0, nextThreshold - p.xp);
+  const xpPct = nextThreshold > 0
+    ? Math.max(0, Math.min(100, p.xp / nextThreshold * 100)) : 0;
+
+  const hpPct = Math.max(0, p.hp / p.max_hp * 100);
+  const hpColor = hpPct > 60 ? "#4a4" : hpPct > 30 ? "#aa4" : "#c44";
+
+  const inRun = !!(channelSession && session && p.in_channel);
+  const pendingGold = inRun && session ? session.totalGold : 0;
+  const goldLine = pendingGold > 0
+    ? `${p.gold} banked <span class="char-pending">(+${pendingGold} this run, settles on exit)</span>`
+    : `${p.gold} banked`;
+
+  const es = p.effective_stats;
+  const statRow = (label: string, value: string) =>
+    `<div class="char-stat"><span class="char-stat-label">${label}</span><span class="char-stat-value">${value}</span></div>`;
+
+  // Bag capacity: settled BAG-slot rows only (equipped gear is exempt).
+  const bagCount = p.inventory.filter(i => i.slot === "bag").length;
+  const bagValue = bagCount >= MAX_INVENTORY
+    ? `<span class="inv-cap inv-cap-full">${bagCount} / ${MAX_INVENTORY} (full)</span>`
+    : `${bagCount} / ${MAX_INVENTORY}`;
+
+  return `
+    <div class="char-wrap">
+      <div class="char-header">
+        <span class="char-name">${p.name}</span>
+        <span class="char-level">Level ${p.level}</span>
+      </div>
+
+      <div class="char-xp">
+        <div class="char-xp-bar">
+          <div class="char-xp-fill" style="width:${xpPct}%"></div>
+          <div class="char-xp-text">XP ${p.xp} / ${nextThreshold}</div>
+        </div>
+        <div class="char-xp-note">${xpToNext} XP to level ${p.level + 1}</div>
+      </div>
+
+      <div class="char-hp">
+        <div class="hp-bar">
+          <div class="hp-bar-fill" style="width:${hpPct}%; background:${hpColor}"></div>
+          <div class="hp-bar-text">HP ${p.hp} / ${p.max_hp}</div>
+        </div>
+      </div>
+
+      <div class="char-section-title">Attributes</div>
+      <div class="char-grid">
+        ${statRow("Strength", String(p.stats.strength))}
+        ${statRow("Dexterity", String(p.stats.dexterity))}
+        ${statRow("Constitution", String(p.stats.constitution))}
+        ${statRow("Intelligence", String(p.stats.intelligence))}
+      </div>
+
+      <div class="char-section-title">Combat</div>
+      <div class="char-grid">
+        ${statRow("Attack", String(es.attack_power))}
+        ${statRow("Defense", String(es.defense))}
+      </div>
+
+      <div class="char-section-title">Record</div>
+      <div class="char-grid">
+        ${statRow("Gold", goldLine)}
+        ${statRow("Bag", bagValue)}
+        ${statRow("Kills", String(p.combat_record.kills))}
+        ${statRow("Deaths", String(p.combat_record.deaths))}
+        ${statRow("Runs completed", String(p.combat_record.visits_completed))}
+      </div>
+    </div>`;
 }
 
 // --- Help tab ---
@@ -2036,11 +2180,19 @@ function renderHelpOverlay(): void {
  * on a backdrop click.  Tab buttons switch the active body without closing.
  */
 function renderGameModal(): void {
+  // Preserve the scroll position of the active tab body across re-renders.
+  // The ~1s state poll re-renders the whole modal; without this, scrolling
+  // the inventory (or any tab) snaps back to the top every poll.  Capture
+  // scrollTop before wiping the old instance and restore it after mount.
+  const prevBody = document.querySelector<HTMLElement>("#game-modal .modal-tab-body");
+  const prevScrollTop = prevBody ? prevBody.scrollTop : 0;
+
   document.getElementById("game-modal")?.remove();
   if (!activeModalTab) return;
 
   const tabs: Array<{ id: ModalTab; label: string }> = [
     { id: "inventory", label: "Inventory" },
+    { id: "character", label: "Character" },
     { id: "players",   label: "Players" },
     { id: "help",      label: "Help" },
   ];
@@ -2053,9 +2205,12 @@ function renderGameModal(): void {
   let body = "";
   if (activeModalTab === "inventory") {
     title = "Inventory &amp; Equipment";
-    const p = connState?.player;
-    if (p) headerExtra = `<span class="inv-gold">🪙 ${p.gold}</span>`;
+    headerExtra = goldHeaderHtml();
     body = renderInventoryTabBody();
+  } else if (activeModalTab === "character") {
+    title = "Character";
+    headerExtra = goldHeaderHtml();
+    body = renderCharacterTabBody();
   } else if (activeModalTab === "players") {
     title = "Players";
     body = renderPlayersTabBody();
@@ -2083,6 +2238,26 @@ function renderGameModal(): void {
     if (e.target === root) setModalTab(null);
   });
   document.body.appendChild(root);
+
+  // Restore the scroll position captured before the rebuild.
+  const newBody = root.querySelector<HTMLElement>(".modal-tab-body");
+  if (newBody && prevScrollTop > 0) newBody.scrollTop = prevScrollTop;
+}
+
+/**
+ * Gold readout for the modal header: banked (on-chain) gold, plus this-run
+ * unsettled gold when a channel session is live.  Settled vs pending is
+ * spelled out in words so the two numbers are never confused.
+ */
+function goldHeaderHtml(): string {
+  const p = connState?.player;
+  if (!p) return "";
+  const inRun = !!(channelSession && session && p.in_channel);
+  const pending = inRun && session ? session.totalGold : 0;
+  const pendingHtml = pending > 0
+    ? ` <span class="inv-gold-pending">(+${pending} this run)</span>`
+    : "";
+  return `<span class="inv-gold">🪙 ${p.gold} banked${pendingHtml}</span>`;
 }
 
 // --- Sidebar updates ---
@@ -2135,9 +2310,14 @@ function updateOverworldStats(): void {
   // sidebar agrees with the map and tile view.
   const locSeg = playerLocationSegment(p);
   const locInfo = connState?.segments.get(locSeg);
-  const locCoord = locSeg === 0 ? "(0, 0)"
-    : locInfo ? `(${locInfo.world_x}, ${locInfo.world_y})` : "(?, ?)";
-  const locLabel = `${locCoord}${p.in_channel ? " · in dungeon" : ""}`;
+  // Unambiguous location label: the hub is a named safe zone; every other
+  // segment shows its world coordinates and depth.
+  const locName = locSeg === 0
+    ? "Safe Zone (Hub)"
+    : locInfo
+      ? `Segment (${locInfo.world_x}, ${locInfo.world_y}) - Depth ${locInfo.depth}`
+      : "Segment (?, ?)";
+  const locLabel = `${locName}${p.in_channel ? " · in dungeon" : ""}`;
 
   let selectedInfo = "";
   if (selectedSegment !== null) {
@@ -2233,7 +2413,7 @@ function updateOverworldStats(): void {
       <div class="hp-bar-text">HP ${p.hp} / ${p.max_hp}</div>
     </div>
     <div class="stat-row"><span class="stat-label">XP</span><span class="stat-value">${p.xp}</span></div>
-    <div class="stat-row"><span class="stat-label">Gold</span><span class="stat-value">${p.gold}</span></div>
+    <div class="stat-row"><span class="stat-label">Gold</span><span class="stat-value">${p.gold} (banked)${channelSession && session && p.in_channel && session.totalGold > 0 ? ` (+${session.totalGold} this run)` : ""}</span></div>
     <div class="stat-row"><span class="stat-label">Location</span><span class="stat-value">${locLabel}</span></div>
     <div style="margin-top:6px;color:#888;font-size:11px">
       STR ${p.stats.strength} DEX ${p.stats.dexterity}
@@ -2341,10 +2521,21 @@ function updateDungeonStats(): void {
   let channelLabel = "";
   if (channelSession) {
     const segInfo = connState?.segments.get(channelSegmentId);
-    const coord = channelSegmentId === 0 ? "(0, 0)"
-      : segInfo ? `(${segInfo.world_x}, ${segInfo.world_y})` : "(?, ?)";
-    channelLabel = `<div style="color:#aaf;font-size:11px">${coord}</div>`;
+    const locName = channelSegmentId === 0
+      ? "Safe Zone (Hub)"
+      : segInfo
+        ? `Segment (${segInfo.world_x}, ${segInfo.world_y}) - Depth ${segInfo.depth}`
+        : `Segment (?, ?) - Depth ${session.depth}`;
+    channelLabel = `<div style="color:#aaf;font-size:11px">Location: ${locName}</div>`;
   }
+
+  // Gold readout: in a channel run the on-chain banked gold and this-run
+  // unsettled gold are labelled separately (they settle together on exit);
+  // in a standalone dungeon there is no banked total, so show the run score.
+  const bankedGold = connState?.player?.gold ?? 0;
+  const goldLine = channelSession
+    ? `Gold: ${bankedGold} banked (+${session.totalGold} this run, settles on exit)`
+    : `Gold: ${session.totalGold} (this run)`;
 
   let endButtons = "";
   if (session.gameOver) {
@@ -2373,7 +2564,8 @@ function updateDungeonStats(): void {
       <div class="hp-bar-fill" style="width:${hpPct}%; background:${hpColor}"></div>
       <div class="hp-bar-text">HP ${session.playerHp} / ${session.playerMaxHp}</div>
     </div>
-    <div>XP: ${session.totalXp} &nbsp; Gold: ${session.totalGold}</div>
+    <div>XP: ${session.totalXp}</div>
+    <div>${goldLine}</div>
     <div>Kills: ${session.totalKills} &nbsp; Depth: ${session.depth}</div>
     ${session.gameOver
       ? `<div style="margin-top:8px;color:${session.survived ? '#4a4' : '#c44'};font-weight:bold">
@@ -2397,12 +2589,27 @@ function updateDungeonInventory(): void {
   // consistent with the hub.  Items found this run are listed separately
   // as pending (they settle only on a winning exit).  Full management is
   // in the modal (I), which is read-only while in a dungeon.
+  // Potions drunk this run are consumed from the live session immediately,
+  // but the on-chain stack does not shrink until settlement; reflect that in
+  // the shown count so the drink visibly registers.
+  const usedThisRun = new Map<string, number>();
+  if (session) {
+    for (const a of session.actionLog)
+      if (a.type === "use" && a.itemId)
+        usedThisRun.set(a.itemId, (usedThisRun.get(a.itemId) ?? 0) + 1);
+  }
+
   const lines: string[] = [];
   if (p && p.inventory.length > 0) {
     for (const it of p.inventory) {
       const slot = it.slot === "bag" ? "" : ` [${it.slot}]`;
-      const qty = it.quantity > 1 ? ` x${it.quantity}` : "";
-      lines.push(`<div class="inventory-item"><span>${itemIcon(it.item_id)} ${itemName(it.item_id)}${qty}</span><span class="slot-equipped">${slot}</span></div>`);
+      const used = usedThisRun.get(it.item_id) ?? 0;
+      const remaining = Math.max(0, it.quantity - used);
+      const qty = remaining !== 1 ? ` x${remaining}` : "";
+      const usedTag = used > 0
+        ? `<span class="slot-equipped" style="color:#c9b24a">${used} used</span>`
+        : `<span class="slot-equipped">${slot}</span>`;
+      lines.push(`<div class="inventory-item"><span>${itemIcon(it.item_id)} ${itemName(it.item_id)}${qty}</span>${usedTag}</div>`);
     }
   } else {
     lines.push('<div style="color:#666">Empty</div>');
