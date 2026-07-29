@@ -758,3 +758,12 @@ body {
 .char-stat-label { font-size: 12px; color: #99a; }
 .char-stat-value { font-weight: 600; color: #cde; text-align: right; }
 .char-pending { color: #c9b24a; font-weight: normal; font-size: 11px; }
+.char-stat-wide { grid-column: 1 / -1; flex-wrap: wrap; }
+.char-stat-note {
+  flex-basis: 100%; font-size: 11px; color: #7a7a88;
+  font-weight: normal; text-align: left;
+}
+.char-hint {
+  font-size: 10px; color: #c9b24a; text-transform: none;
+  letter-spacing: normal; margin-left: 6px;
+}

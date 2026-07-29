@@ -2082,6 +2082,37 @@ function renderCharacterTabBody(): string {
   const es = p.effective_stats;
   const statRow = (label: string, value: string) =>
     `<div class="char-stat"><span class="char-stat-label">${label}</span><span class="char-stat-value">${value}</span></div>`;
+  // Full-width row that also shows where the number comes from.
+  const statRowB = (label: string, value: string, note: string) =>
+    `<div class="char-stat char-stat-wide"><span class="char-stat-label">${label}</span>` +
+    `<span class="char-stat-value">${value}</span>` +
+    `<span class="char-stat-note">${note}</span></div>`;
+
+  // Effective loadout: the live session during a run (mid-run equips change
+  // combat immediately and on-chain stats are stale until settlement), else
+  // the on-chain effective stats.  Base attributes are the allocated values;
+  // the gap between effective and base is the equipment contribution.
+  const eff = (channelSession && session)
+    ? { str: session.stats.strength, dex: session.stats.dexterity,
+        con: session.stats.constitution, intl: session.stats.intelligence,
+        equipAtk: session.stats.equipAttack, equipDef: session.stats.equipDefense,
+        level: session.stats.level }
+    : { str: es.strength, dex: es.dexterity, con: es.constitution,
+        intl: es.intelligence, equipAtk: es.equip_attack, equipDef: es.equip_defense,
+        level: p.level };
+  const base = p.stats;
+  const gearNote = (effVal: number, baseVal: number, effect: string) => {
+    const g = effVal - baseVal;
+    const src = g === 0 ? `${baseVal} base` : `${baseVal} base ${g > 0 ? "+" : ""}${g} gear`;
+    return `${src}, ${effect}`;
+  };
+  const atk = eff.str + Math.floor(eff.level / 2) + eff.equipAtk;
+  const def = Math.floor(eff.con / 2) + Math.floor(eff.level / 3) + eff.equipDef;
+  const crit = 5 + Math.floor(eff.dex / 5);
+  const dodge = Math.min(50, 5 + Math.floor(eff.dex * 0.5));
+  const ptsHint = p.stat_points > 0
+    ? `<span class="char-hint">${p.stat_points} unspent point${p.stat_points > 1 ? "s" : ""}: allocate at the hub</span>`
+    : "";
 
   // Bag capacity: settled BAG-slot rows only (equipped gear is exempt).
   const bagCount = p.inventory.filter(i => i.slot === "bag").length;
@@ -2111,18 +2142,21 @@ function renderCharacterTabBody(): string {
         </div>
       </div>
 
-      <div class="char-section-title">Attributes</div>
+      <div class="char-section-title">Attributes ${ptsHint}</div>
       <div class="char-grid">
-        ${statRow("Strength", String(p.stats.strength))}
-        ${statRow("Dexterity", String(p.stats.dexterity))}
-        ${statRow("Constitution", String(p.stats.constitution))}
-        ${statRow("Intelligence", String(p.stats.intelligence))}
+        ${statRowB("Strength", String(eff.str), gearNote(eff.str, base.strength, "+1 Attack each"))}
+        ${statRowB("Dexterity", String(eff.dex), gearNote(eff.dex, base.dexterity, "raises crit and dodge"))}
+        ${statRowB("Constitution", String(eff.con), gearNote(eff.con, base.constitution, "raises Defense and Max HP"))}
+        ${statRowB("Intelligence", String(eff.intl), gearNote(eff.intl, base.intelligence, "no combat effect yet"))}
       </div>
 
-      <div class="char-section-title">Combat</div>
+      <div class="char-section-title">Combat (derived)</div>
       <div class="char-grid">
-        ${statRow("Attack", String(es.attack_power))}
-        ${statRow("Defense", String(es.defense))}
+        ${statRowB("Attack Power", String(atk), `${eff.str} Strength + ${Math.floor(eff.level / 2)} Level + ${eff.equipAtk} Weapon`)}
+        ${statRowB("Defense", String(def), `${Math.floor(eff.con / 2)} from Constitution + ${Math.floor(eff.level / 3)} Level + ${eff.equipDef} Armor`)}
+        ${statRowB("Max HP", String(curMax), `50 base + ${eff.con * 5} from Constitution`)}
+        ${statRowB("Crit chance", `${crit}%`, "from Dexterity")}
+        ${statRowB("Dodge chance", `${dodge}%`, "from Dexterity")}
       </div>
 
       <div class="char-section-title">Record</div>
