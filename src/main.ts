@@ -930,10 +930,42 @@ async function doDiscover(dir: string): Promise<void> {
   updateSidebar();
 }
 
+/**
+ * Current HP the player actually has right now.  During a live dungeon run the
+ * on-chain player.hp is stale (it only updates at settlement), so the live
+ * session HP is the truth; in the hub there is no session and on-chain wins.
+ */
+function effectiveHp(): { hp: number; max: number } {
+  if (channelSession && session) {
+    return { hp: session.playerHp, max: session.playerMaxHp };
+  }
+  const p = connState?.player;
+  return { hp: p?.hp ?? 0, max: p?.max_hp ?? 0 };
+}
+
 async function doUseItem(itemId: string): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
   const ctx = validatorContext();
   if (!ctx) return;
+
+  // Inside a live run a health potion is a LOCAL replayed action that heals the
+  // live session HP, not an on-chain move.  Route by the live session (not
+  // p.in_channel, which can lag a poll behind), so a mid-run drink is never
+  // blocked by the stale on-chain "full HP" and never submits a bad on-chain use.
+  if (itemId.includes("health_potion") && channelSession && session) {
+    if (session.playerHp >= session.playerMaxHp) {
+      showErrorModal("Already at full HP",
+        "You are at full health, so this potion would be wasted. It is saved for when you are hurt.");
+      return;
+    }
+    session.processAction({ type: "use", itemId });
+    if (fov) fov.update(session.playerX, session.playerY, session.dungeon);
+    render();
+    updateSidebar();
+    if (activeModalTab) renderGameModal();
+    return;
+  }
+
   if (!handleValidation(validateUseItem(ctx, itemId))) return;
 
   // Drinking a health potion at full HP would silently waste it, so guard
@@ -2037,7 +2069,8 @@ function renderCharacterTabBody(): string {
   const xpPct = nextThreshold > 0
     ? Math.max(0, Math.min(100, p.xp / nextThreshold * 100)) : 0;
 
-  const hpPct = Math.max(0, p.hp / p.max_hp * 100);
+  const { hp: curHp, max: curMax } = effectiveHp();
+  const hpPct = Math.max(0, curHp / curMax * 100);
   const hpColor = hpPct > 60 ? "#4a4" : hpPct > 30 ? "#aa4" : "#c44";
 
   const inRun = !!(channelSession && session && p.in_channel);
@@ -2074,7 +2107,7 @@ function renderCharacterTabBody(): string {
       <div class="char-hp">
         <div class="hp-bar">
           <div class="hp-bar-fill" style="width:${hpPct}%; background:${hpColor}"></div>
-          <div class="hp-bar-text">HP ${p.hp} / ${p.max_hp}</div>
+          <div class="hp-bar-text">HP ${curHp} / ${curMax}</div>
         </div>
       </div>
 
