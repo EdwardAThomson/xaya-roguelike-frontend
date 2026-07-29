@@ -188,6 +188,64 @@ const connection = new Connection((state: ConnectionState) => {
   updateSidebar();
 });
 
+// --- In-progress run persistence -------------------------------------------
+// A dungeon run's state (position, HP, loot, kills) lives only in the client
+// until it settles at a gate.  Persist the action log so a page reload restores
+// the EXACT run by deterministic replay (the same thing the GSP does to verify
+// it), instead of forcing a replay-from-scratch or a forfeit (which reads to
+// the player as a death).  One active run at a time, keyed by player name.
+function runStorageKey(): string | null {
+  const name = connState?.playerName;
+  return name ? `rog_run:${name}` : null;
+}
+function persistRun(): void {
+  const key = runStorageKey();
+  if (!key || !channelSession || !session) return;
+  try {
+    localStorage.setItem(key, JSON.stringify({
+      visitId: channelVisitId,
+      segmentId: channelSegmentId,
+      actions: session.actionLog,
+    }));
+  } catch { /* storage disabled/full: reconnect prompt is the fallback */ }
+}
+function clearPersistedRun(): void {
+  const key = runStorageKey();
+  if (!key) return;
+  try { localStorage.removeItem(key); } catch { /* ignore */ }
+}
+function loadPersistedRun(visitId: number): GameAction[] | null {
+  const key = runStorageKey();
+  if (!key) return null;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (data && data.visitId === visitId && Array.isArray(data.actions)) {
+      return data.actions as GameAction[];
+    }
+  } catch { /* corrupt entry: ignore */ }
+  return null;
+}
+// Rebuild the run from on-chain entry state, then deterministically replay the
+// saved action log to reproduce the exact pre-reload state.  In its own
+// function so `session` is not stale-narrowed by the caller's earlier guards.
+function restoreRunFromLog(
+  seed: string, depth: number, segmentId: number, visitId: number,
+  constraints: Gate[], entryDirection: string, savedActions: GameAction[],
+): void {
+  startChannelDungeon(seed, depth, segmentId, visitId, constraints, entryDirection);
+  if (session && fov) {
+    for (const a of savedActions) session.processAction(a);
+    fov.update(session.playerX, session.playerY, session.dungeon);
+    camera.centerOn(session.playerX, session.playerY);
+    render();
+    updateSidebar();
+    persistRun();
+  }
+  addOverworldMessage("Resumed your dungeon run where you left off.", "info");
+}
+
 /**
  * Rebuilds the local session to match what the chain says about the
  * player.  Three cases:
@@ -221,6 +279,19 @@ function ensureSessionFromChainState(): void {
       // Segment cache not populated yet; the next poll will retry.
       return;
     }
+
+    // Restore the exact in-progress run from local storage if we saved it: a
+    // reload otherwise loses all client-side progress.  Rebuild from the same
+    // on-chain entry state and deterministically replay the saved action log,
+    // reproducing position / HP / loot / kills.  No modal, no death.
+    const savedActions = loadPersistedRun(visitId);
+    if (savedActions) {
+      restoreRunFromLog(segInfo.seed, segInfo.depth, segId, visitId,
+                        constraintsFor(segInfo),
+                        p.active_visit.entry_direction, savedActions);
+      return;
+    }
+
     if (reconnectPromptShown) return;  // modal is already up
     reconnectPromptShown = true;
     promptReconnectChoice(segInfo.seed, segInfo.depth, segId, visitId,
@@ -355,6 +426,9 @@ function ensureHubSessionIfAtHub(entryDirection: string = ""): void {
   if (p.current_segment !== 0) return;
 
   if (hubBuiltAtSegment === 0 && session !== null) return;  // already built
+
+  // Reached the hub: any in-progress run is over, so drop its saved state.
+  clearPersistedRun();
 
   // Use EFFECTIVE stats (base + equipment bonuses) to match the GSP's
   // ComputePlayerStats, which is what the settlement replay runs with.
@@ -962,6 +1036,7 @@ async function doUseItem(itemId: string): Promise<void> {
     if (fov) fov.update(session.playerX, session.playerY, session.dungeon);
     render();
     updateSidebar();
+    persistRun();
     if (activeModalTab) renderGameModal();
     return;
   }
@@ -1107,6 +1182,7 @@ function afterLocalLoadoutChange(): void {
   if (session && fov) fov.update(session.playerX, session.playerY, session.dungeon);
   render();
   updateSidebar();
+  persistRun();
   if (activeModalTab) renderGameModal();
 }
 
@@ -1528,6 +1604,7 @@ function handleGameInput(action: string, dir?: Direction): void {
     camera.centerOn(session.playerX, session.playerY);
     render();
     updateSidebar();
+    persistRun();
 
     // If a "move" landed us on a gate (hub OR real dungeon), ask for
     // confirmation before settling/transiting.  Easy to step on a gate
