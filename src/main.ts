@@ -282,8 +282,8 @@ function ensureSessionFromChainState(): void {
     const knockedBack = resumeAfterSettle();
     if (!knockedBack) ensureHubSessionIfAtHub();
     addOverworldMessage(
-      "Your previous run ended (timeout or death); synced to your current location.",
-      "combat",
+      "Your previous run ended; synced to your current location.",
+      "info",
     );
     render();
     return;
