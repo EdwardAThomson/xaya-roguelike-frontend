@@ -1023,13 +1023,25 @@ async function doDiscover(dir: string): Promise<void> {
   if (!handleValidation(validateDiscover(ctx, dir))) return;
 
   const currentSeg = ctx.player.current_segment;
-  const currentDepth = overworldNodes.get(currentSeg)?.depth ?? 0;
   const beforeLastDiscover = ctx.player.last_discover_height;
+
+  // Depth is the new segment's distance from the hub (Manhattan of its world
+  // coords), matching the GSP which computes it authoritatively.  Sending the
+  // discovery-path length here would disagree and could trip the [1,20] range
+  // check on a long winding path even when the segment is near the hub.
+  const cur = overworldNodes.get(currentSeg);
+  let nx = cur?.worldX ?? 0;
+  let ny = cur?.worldY ?? 0;
+  if (dir === "north") ny += 1;
+  else if (dir === "south") ny -= 1;
+  else if (dir === "east") nx += 1;
+  else if (dir === "west") nx -= 1;
+  const newDepth = Math.abs(nx) + Math.abs(ny);
 
   busy = true;
   updateSidebar();
   try {
-    await moves.discover(connState.playerName, currentDepth + 1, dir);
+    await moves.discover(connState.playerName, newDepth, dir);
     addOverworldMessage(`Discovering ${dir}...`, "info");
 
     const resolved = await waitFor(connection, ({ player }) =>
