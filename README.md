@@ -4,6 +4,10 @@ Browser-based frontend for the [Xaya Roguelike](https://github.com/EdwardAThomso
 
 > **This repo** is the TypeScript browser client. The C++ backend (on-chain Game State Processor) lives in the companion repo: **[xaya-roguelike](https://github.com/EdwardAThomson/xaya-roguelike)**. The two must stay in lockstep on the deterministic dungeon/combat code (byte-for-byte parity).
 
+![In-dungeon screenshot: the player (@) exploring a procedural dungeon, flanked by a giant spider (s) and giant rat (r) with loot nearby, live combat log and on-chain stats in the sidebar](assets/screenshot-dungeon.png)
+
+*Delving a Depth-1 dungeon: fog-of-war exploration, monsters, ground loot, and a live combat log, with on-chain player stats settling on exit.*
+
 **Zero runtime dependencies** -- pure TypeScript compiled with `tsc`, no npm packages in production. All rendering is Canvas 2D with procedural sprites.
 
 ## Features
