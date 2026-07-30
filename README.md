@@ -8,7 +8,7 @@ Browser-based frontend for the [Xaya Roguelike](https://github.com/EdwardAThomso
 
 ## Features
 
-- **Overworld map**: Segment graph rendered on canvas, click to select, travel between segments
+- **Overworld map**: Segment graph rendered on canvas, click to select, travel between segments; drag to pan, scroll to zoom, Recenter (C) to snap back to your segment
 - **On-chain state**: Player stats, inventory, equipment, combat record from the GSP
 - **Dungeon play**: Full turn-based roguelike (12 monster types, 31 items, fog of war, 8-dir movement)
 - **In-dungeon map**: Fog-of-war-aware minimap of the current dungeon (the Map view's "Dungeon" tab, alongside the "World" segment graph)
