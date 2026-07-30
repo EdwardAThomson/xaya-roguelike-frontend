@@ -20,7 +20,7 @@ import { Connection, ConnectionState } from "./net/connection.js";
 import { PlayerInfo, SegmentInfo } from "./net/rpc.js";
 import { Gate } from "./game/dungeon.js";
 import { MoveClient, createMoveClient } from "./net/moves.js";
-import { layoutSegments, SegmentNode, hitTestSegment, areLinked } from "./game/overworld.js";
+import { layoutSegments, SegmentNode, hitTestSegment } from "./game/overworld.js";
 import { drawOverworld, NODE_SIZE, CELL, PlayerMarker, OverworldView } from "./render/overworld.js";
 import { drawDungeonMap } from "./render/dungeonmap.js";
 import { DEFAULT_GSP_URL, DEFAULT_PROXY_URL } from "./config.js";
@@ -2548,7 +2548,6 @@ function updateOverworldStats(): void {
   let selectedInfo = "";
   if (selectedSegment !== null) {
     const selNode = overworldNodes.get(selectedSegment);
-    const isAdjacentDir = areLinked(overworldNodes, p.current_segment, selectedSegment);
     const isCurrent = selectedSegment === p.current_segment;
 
     const selCoord = selectedSegment === 0 ? "(0, 0)"
@@ -2568,10 +2567,11 @@ function updateOverworldStats(): void {
         class="action-btn action-enter" ${busy ? "disabled" : ""}>Enter Dungeon</button>`;
     }
 
-    if (isAdjacentDir && !isCurrent && !p.in_channel) {
-      selectedInfo += `<button data-action="travel" data-dir="${isAdjacentDir}"
-        class="action-btn action-travel" ${busy ? "disabled" : ""}>Travel ${isAdjacentDir}</button>`;
-    }
+    // No "Travel" button here: the map is a meta-view, not a place you move
+    // on.  You travel by walking to a gate and stepping through it inside a
+    // dungeon/hub session.  The old overworld `t` travel moved you to a
+    // segment out-of-channel (a limbo with no session), which desynced the
+    // view from the chain, so it is gone.
 
     selectedInfo += `</div>`;
   }
@@ -2632,6 +2632,17 @@ function updateOverworldStats(): void {
     }
   }
 
+  // Recovery: if we are out-of-channel on a real (non-hub) segment, offer a
+  // one-click way into that segment's dungeon.  Normal play never lands here
+  // (gate-walk always enters a channel; the hub is the only out-of-channel
+  // spot), so this only appears after an odd state and lets the player get
+  // moving again (walk to a gate and step through to travel onward).
+  let enterHereBtn = "";
+  if (!p.in_channel && p.current_segment !== 0 && hasProxy) {
+    enterHereBtn = `<button data-action="enter-channel" data-segment="${p.current_segment}"
+      class="action-btn action-enter" ${busy ? "disabled" : ""}>Enter Dungeon Here</button>`;
+  }
+
   el.innerHTML = `
     <div><strong>${p.name}</strong> \u2014 Level ${p.level}</div>
     <div class="hp-bar">
@@ -2651,6 +2662,7 @@ function updateOverworldStats(): void {
     <div style="color:#888;font-size:11px">
       K:${p.combat_record.kills} D:${p.combat_record.deaths} V:${p.combat_record.visits_completed}
     </div>
+    ${enterHereBtn}
     ${statBtns}
     ${potionBtn}
     ${discoverBtns}
