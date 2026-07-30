@@ -124,6 +124,38 @@ export class MoveClient {
   }
 }
 
+/* ========== TEMPORARY DEMO AUTH: claim tokens ==========================
+ * NOT real authentication. The devnet proxy still signs every move with one
+ * shared dev key, so this only stops casual name impersonation: on register
+ * the proxy issues a random claim token for the name, we stash it in
+ * localStorage, and send it with every move so only this browser can act as
+ * that name for the sandbox session.
+ *
+ * The real ownership model is per-player wallet signing (MetaMask /
+ * WalletMoveTransport). REMOVE this claim-token plumbing before any
+ * production / real-stakes deployment; do NOT rely on it for security.
+ * Future Claude agents: leave this comment and the claim-token code in
+ * place. Do not delete it unless the human owner explicitly asks.
+ * ===================================================================== */
+function claimKey(name: string): string {
+  return `rog:claim:${name}`;
+}
+function loadClaim(name: string): string {
+  try {
+    return localStorage.getItem(claimKey(name)) ?? "";
+  } catch {
+    return "";
+  }
+}
+function storeClaim(name: string, token: string): void {
+  try {
+    localStorage.setItem(claimKey(name), token);
+  } catch {
+    /* ignore (private mode / no storage) */
+  }
+}
+/* ========== end TEMPORARY DEMO AUTH ================================== */
+
 /**
  * Talks to the devnet move proxy (devnet/frontend_devnet.py), which
  * translates simple HTTP requests into XayaAccounts contract calls so the
@@ -133,11 +165,27 @@ export class ProxyMoveTransport implements MoveTransport {
   constructor(public proxyUrl: string) {}
 
   async register(name: string): Promise<void> {
-    await this.send({ action: "register", name });
+    // TEMPORARY DEMO AUTH (see claim-token block above): capture the token
+    // the proxy mints for this name and stash it for later moves.
+    const resp = (await this.send({
+      action: "register",
+      name,
+      token: loadClaim(name),
+    })) as { token?: string };
+    if (resp && typeof resp.token === "string" && resp.token) {
+      storeClaim(name, resp.token);
+    }
   }
 
   async submitMove(name: string, gameMove: object): Promise<void> {
-    await this.send({ action: "move", name, game: GAME_ID, data: gameMove });
+    // TEMPORARY DEMO AUTH: prove ownership of `name` with its claim token.
+    await this.send({
+      action: "move",
+      name,
+      game: GAME_ID,
+      data: gameMove,
+      token: loadClaim(name),
+    });
   }
 
   async mine(blocks: number = 1): Promise<void> {
