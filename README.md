@@ -11,6 +11,9 @@ Browser-based frontend for the [Xaya Roguelike](https://github.com/EdwardAThomso
 - **Overworld map**: Segment graph rendered on canvas, click to select, travel between segments
 - **On-chain state**: Player stats, inventory, equipment, combat record from the GSP
 - **Dungeon play**: Full turn-based roguelike (12 monster types, 31 items, fog of war, 8-dir movement)
+- **In-dungeon map**: Fog-of-war-aware minimap of the current dungeon (the Map view's "Dungeon" tab, alongside the "World" segment graph)
+- **Character sheet**: Tabbed in-game panel (Character, Inventory, Players, Help) with base and effective stats, XP progress, and mid-run equip of banked gear
+- **Crash-safe runs**: In-progress dungeon runs persist locally and deterministically resume on reload; server-side timeouts and death knock-backs auto-recover
 - **Multiplayer presence**: Other players shown as tokens on the overworld map and listed (active first) in a Players tab
 - **Channel integration**: Enter dungeons using real on-chain player stats, exit with cryptographic replay proof
 - **Deterministic**: Dungeon generation and RNG verified identical to C++ backend (SHA-256 + MT19937)
@@ -80,6 +83,7 @@ src/
     camera.ts               Viewport management
     fov.ts                  Fog of war (8-tile radius LOS)
     overworld.ts            Segment map canvas renderer
+    dungeonmap.ts           Dungeon-layout minimap (Map view "Dungeon" tab)
   net/
     rpc.ts                  JSON-RPC 2.0 client (typed GSP methods)
     connection.ts           Connection manager with auto-polling
