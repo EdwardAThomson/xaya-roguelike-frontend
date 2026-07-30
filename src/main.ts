@@ -457,13 +457,36 @@ function resumeAfterSettle(): boolean {
  */
 const exploredByKey = new Map<string, Set<number>>();
 
+// Fog is also written through to localStorage (keyed by segment seed) so the
+// map you have uncovered survives a page reload, not just the current tab.
+let currentFogKey: string | null = null;
+
+function fogStorageKey(key: string): string { return `rog_fog:${key}`; }
+
 function persistentExplored(key: string): Set<number> {
   let s = exploredByKey.get(key);
   if (!s) {
     s = new Set<number>();
+    try {
+      const raw = localStorage.getItem(fogStorageKey(key));
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) for (const n of arr) s.add(n);
+      }
+    } catch { /* corrupt / disabled: start with an empty map */ }
     exploredByKey.set(key, s);
   }
   return s;
+}
+
+/** Persist the currently-shown segment's explored tiles to localStorage. */
+function saveCurrentFog(): void {
+  if (!currentFogKey) return;
+  const s = exploredByKey.get(currentFogKey);
+  if (!s) return;
+  try {
+    localStorage.setItem(fogStorageKey(currentFogKey), JSON.stringify([...s]));
+  } catch { /* storage full/disabled: fog just will not persist */ }
 }
 
 /**
@@ -499,6 +522,7 @@ function ensureHubSessionIfAtHub(entryDirection: string = ""): void {
   };
   session = DungeonSession.createHub(stats, p.hp, p.max_hp, entryDirection);
   fov = new FovMap();
+  currentFogKey = "hub";
   fov.explored = persistentExplored("hub");
   fov.update(session.playerX, session.playerY, session.dungeon);
   camera.centerOn(session.playerX, session.playerY);
@@ -781,6 +805,7 @@ function startChannelDungeon(
     segmentSeed, depth, stats, p.hp, p.max_hp, potions,
     constraints, entryDirection, entryInventory);
   fov = new FovMap();
+  currentFogKey = "seg:" + segmentSeed;
   fov.explored = persistentExplored("seg:" + segmentSeed);
   fov.update(session.playerX, session.playerY, session.dungeon);
   camera.centerOn(session.playerX, session.playerY);
@@ -1676,6 +1701,7 @@ function handleGameInput(action: string, dir?: Direction): void {
     render();
     updateSidebar();
     persistRun();
+    saveCurrentFog();
 
     // If a "move" landed us on a gate (hub OR real dungeon), ask for
     // confirmation before settling/transiting.  Easy to step on a gate
