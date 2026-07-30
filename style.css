@@ -29,6 +29,20 @@ body {
   display: none;
 }
 
+/* GSP box wrapper: inline-flex so the label + input keep the topbar's 6px
+   gap and centring (the topbar gap only applies to its direct children). */
+.topbar-gsp {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Hidden on hosted builds: the GSP endpoint is fixed and same-origin, so the
+   manual GSP box is redundant (see isHostedOrigin in config.ts / main.ts). */
+#gsp-connection.hidden {
+  display: none;
+}
+
 .landing-inner {
   width: 100%;
   max-width: 560px;

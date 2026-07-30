@@ -23,7 +23,7 @@ import { MoveClient, createMoveClient } from "./net/moves.js";
 import { layoutSegments, SegmentNode, hitTestSegment } from "./game/overworld.js";
 import { drawOverworld, NODE_SIZE, CELL, PlayerMarker, OverworldView } from "./render/overworld.js";
 import { drawDungeonMap } from "./render/dungeonmap.js";
-import { DEFAULT_GSP_URL, DEFAULT_PROXY_URL } from "./config.js";
+import { DEFAULT_GSP_URL, DEFAULT_PROXY_URL, isHostedOrigin } from "./config.js";
 import {
   ValidatorContext, ValidationResult,
   validateDiscover, validateTravel, validateEnterChannel,
@@ -530,6 +530,16 @@ function ensureHubSessionIfAtHub(entryDirection: string = ""): void {
 }
 
 gspUrlInput.value = DEFAULT_GSP_URL;
+
+// On a hosted deploy the GSP endpoint is fixed and same-origin (config.ts
+// resolves it), so the manual GSP box is redundant and a footgun (a player
+// could point it at a dead localhost). Hide it there; the input keeps its
+// resolved value so the connect flow still reads a valid URL. Local dev
+// keeps the box visible for pointing at an arbitrary devnet. The ?gsp=
+// override still works either way (it flows through DEFAULT_GSP_URL).
+if (isHostedOrigin()) {
+  document.getElementById("gsp-connection")?.classList.add("hidden");
+}
 
 // --- Landing / title screen ---
 

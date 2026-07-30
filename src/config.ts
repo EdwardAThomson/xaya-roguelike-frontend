@@ -31,22 +31,30 @@ function endpointOverrides(): { gsp?: string; proxy?: string } {
   return out;
 }
 
-function defaultEndpoints(): { gsp: string; proxy: string } {
-  // Node / non-browser contexts (tests): fall back to the devnet ports.
-  if (typeof location === "undefined") {
-    return { gsp: "http://localhost:18332", proxy: "http://localhost:18380" };
-  }
+/**
+ * True when served from a real domain (a hosted deploy), false for
+ * localhost / 127.0.0.1 / file:// and non-browser contexts (tests). Used to
+ * decide endpoint defaults and to hide the manual GSP box on hosted builds,
+ * where the endpoint is fixed and same-origin.
+ */
+export function isHostedOrigin(): boolean {
+  if (typeof location === "undefined") return false;
   const host = location.hostname;
   const isLocal =
     host === "localhost" ||
     host === "127.0.0.1" ||
     host === "" ||
     location.protocol === "file:";
-  if (isLocal) {
-    return { gsp: "http://localhost:18332", proxy: "http://localhost:18380" };
-  }
+  return !isLocal;
+}
+
+function defaultEndpoints(): { gsp: string; proxy: string } {
   // Hosted: same-origin paths handled by the reverse proxy.
-  return { gsp: `${location.origin}/gsp`, proxy: `${location.origin}/proxy` };
+  if (isHostedOrigin()) {
+    return { gsp: `${location.origin}/gsp`, proxy: `${location.origin}/proxy` };
+  }
+  // Local dev / tests: the fixed devnet ports.
+  return { gsp: "http://localhost:18332", proxy: "http://localhost:18380" };
 }
 
 const overrides = endpointOverrides();
