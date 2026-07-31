@@ -12,12 +12,12 @@ Browser-based frontend for the [Xaya Roguelike](https://github.com/EdwardAThomso
 
 ## Features
 
-- **Overworld map**: Segment graph rendered on canvas, click to select, travel between segments; drag to pan, scroll to zoom, Recenter (C) to snap back to your segment
+- **Overworld map**: Segment graph rendered on canvas, click to select; drag to pan, scroll to zoom, Recenter (C) to snap back to your segment
 - **On-chain state**: Player stats, inventory, equipment, combat record from the GSP
 - **Dungeon play**: Full turn-based roguelike (12 monster types, 31 items, fog of war, 8-dir movement)
 - **In-dungeon map**: Fog-of-war-aware minimap of the current dungeon (the Map view's "Dungeon" tab, alongside the "World" segment graph)
 - **Character sheet**: Tabbed in-game panel (Character, Inventory, Players, Help) with base and effective stats, XP progress, and mid-run equip of banked gear
-- **Crash-safe runs**: In-progress dungeon runs persist locally and deterministically resume on reload; server-side timeouts and death knock-backs auto-recover
+- **Crash-safe runs**: In-progress dungeon runs persist locally and deterministically resume on reload, and explored maps (fog of war) survive reloads too; server-side timeouts and death knock-backs auto-recover
 - **Multiplayer presence**: Other players shown as tokens on the overworld map and listed (active first) in a Players tab
 - **Channel integration**: Enter dungeons using real on-chain player stats, exit with cryptographic replay proof
 - **Deterministic**: Dungeon generation and RNG verified identical to C++ backend (SHA-256 + MT19937)
@@ -58,7 +58,7 @@ python3 -m http.server 8000
 3. Enter a player name, click **Connect**
 4. Click **Register Player** if the name is new
 5. Click a direction button to **Discover** new segments
-6. Click a segment, then **Travel** or **Enter Dungeon**
+6. Click a segment, then **Enter Dungeon** (to travel between segments, walk to a gate inside a dungeon and step through)
 7. Play the dungeon, then click **Submit Results On-Chain**
 
 ## Project structure
@@ -117,7 +117,7 @@ Browser
     XayaAccounts contract on Anvil (local EVM)
 ```
 
-**Overworld mode**: Fetches player info, segments, and visits from the GSP. Renders the segment graph centered on the player's current position. Sidebar shows stats, inventory, and action buttons (travel, discover, enter dungeon).
+**Overworld mode**: Fetches player info, segments, and visits from the GSP. Renders the segment graph centered on the player's current position. Sidebar shows stats, inventory, and action buttons (discover, enter dungeon).
 
 **Dungeon mode**: Runs a `DungeonSession` locally. In channel mode, uses the real segment seed and player stats from the GSP. On exit, submits the action replay proof on-chain for verification.
 
