@@ -3,7 +3,8 @@
  * and polls for changes via waitforchange.
  */
 
-import { RpcClient, PlayerInfo, SegmentInfo, FullState } from "./rpc.js";
+import { RpcClient, PlayerInfo, SegmentInfo, SegmentRef, FullState, segKey }
+  from "./rpc.js";
 import { POLL_INTERVAL_MS } from "../config.js";
 
 export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
@@ -13,7 +14,8 @@ export interface ConnectionState {
   error?: string;
   playerName: string;
   player: PlayerInfo | null;
-  segments: Map<number, SegmentInfo>;
+  /** Known segments, keyed by their coordinate ("x,y" -- see segKey). */
+  segments: Map<string, SegmentInfo>;
   fullState: FullState | null;
   /** Block height that the game state corresponds to (0 until known). */
   currentHeight: number;
@@ -66,7 +68,7 @@ export class Connection {
       }
 
       // Fetch full segment details (with links/gates) for each segment.
-      await this.fetchSegmentDetails(envelope.state.segments.map(s => s.id));
+      await this.fetchSegmentDetails(envelope.state.segments);
 
       this.state.status = "connected";
       this.notify();
@@ -94,12 +96,12 @@ export class Connection {
     this.notify();
   }
 
-  private async fetchSegmentDetails(ids: number[]): Promise<void> {
+  private async fetchSegmentDetails(segs: SegmentRef[]): Promise<void> {
     if (!this.rpc) return;
-    for (const id of ids) {
-      const info = await this.rpc.getsegmentinfo(id);
+    for (const seg of segs) {
+      const info = await this.rpc.getsegmentinfo(seg);
       if (info) {
-        this.state.segments.set(id, info);
+        this.state.segments.set(segKey(seg), info);
       }
     }
   }
@@ -133,8 +135,7 @@ export class Connection {
 
       // Refresh segment details for new AND existing segments — links
       // and `confirmed` can change as other players act.
-      const allIds = envelope.state.segments.map(s => s.id);
-      await this.fetchSegmentDetails(allIds);
+      await this.fetchSegmentDetails(envelope.state.segments);
 
       this.state.status = "connected";
       this.state.error = undefined;

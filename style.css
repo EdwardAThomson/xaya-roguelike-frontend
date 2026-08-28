@@ -436,6 +436,41 @@ body {
   outline: 1px solid #88a;
 }
 
+/* Account picker (Play -> choose or create a character) */
+.account-modal { min-width: 340px; max-width: 440px; }
+.account-list {
+  display: flex; flex-direction: column; gap: 8px;
+  margin: 8px 0 20px; max-height: 260px; overflow-y: auto;
+}
+.account-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px; background: #1c1e26; border: 1px solid #333;
+  border-radius: 8px; color: #e8eae2; font: inherit; font-size: 15px;
+  cursor: pointer; text-align: left;
+  transition: background 0.12s, border-color 0.12s;
+}
+.account-item:hover { background: #232733; border-color: #4a8; }
+.account-name { font-weight: 600; }
+.account-go { color: #4a8; font-size: 18px; line-height: 1; }
+.account-current {
+  color: #8ec; font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+}
+.account-empty { color: #888; font-size: 14px; padding: 6px 2px 10px; }
+.account-new-label {
+  color: #9aa; font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+  margin-bottom: 8px;
+}
+.account-new-row { display: flex; gap: 8px; }
+#account-new-name {
+  flex: 1; min-width: 0; padding: 10px 12px; background: #111;
+  border: 1px solid #333; border-radius: 6px; color: #eee;
+  font: inherit; font-size: 15px;
+}
+#account-new-name:focus { outline: none; border-color: #4a8; }
+#account-create { padding: 10px 16px; white-space: nowrap; }
+.account-hint { color: #666; font-size: 12px; margin-top: 8px; }
+.account-foot { margin-top: 16px; }
+
 /* --- Processing overlay --- */
 
 .processing-overlay {

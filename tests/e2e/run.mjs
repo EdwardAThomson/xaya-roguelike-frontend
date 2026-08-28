@@ -14,6 +14,7 @@
  * Env:  ROG_URL (default http://localhost:8000), ROG_HEADED=1 to watch.
  */
 import { chromium } from "playwright";
+import { isHub, segStr } from "./agentcore.mjs";
 
 const BASE = process.env.ROG_URL || "http://localhost:8000";
 const URL = `${BASE}/?e2e=1`;
@@ -48,7 +49,7 @@ async function clearModal() {
 
 function summary(s) {
   return {
-    seg: s.player?.current_segment,
+    seg: segStr(s.player?.segment),
     inChannel: s.player?.in_channel,
     hp: s.player?.hp,
     mode: s.mode,
@@ -76,18 +77,18 @@ try {
     await call("register");
     s = await waitFor((s) => !!s.player, "registered");
   }
-  check("registered at hub (seg 0)", s.player?.current_segment === 0, s);
+  check("registered at hub (0, 0)", isHub(s.player?.segment), s);
 
   // Go north: gate-walk from the hub into unexplored -> discover + enter (0,1).
   await call("gateWalk", "north");
   await sleep(800);
   await clearModal();
   s = await waitFor(
-    (s) => s.player?.in_channel || s.player?.current_segment !== 0 || s.modal,
+    (s) => s.player?.in_channel || !isHub(s.player?.segment) || s.modal,
     "north transit",
   );
   console.log("after gw north:", JSON.stringify(summary(s)));
-  check("entered a non-hub segment going north", s.player?.current_segment !== 0, s);
+  check("entered a non-hub segment going north", !isHub(s.player?.segment), s);
 
   // Path 1 (what a "go south" UI trigger does): gate-walk south without
   // standing on the gate.  Reproduces the silent failure.
@@ -98,10 +99,10 @@ try {
   await sleep(1500);
   s = await state();
   console.log("after direct gw south:", JSON.stringify(summary(s)));
-  check("[path1] direct gate-walk south retreats to hub", s.player?.current_segment === 0, s);
+  check("[path1] direct gate-walk south retreats to hub", isHub(s.player?.segment), s);
 
   // Path 2 (intended): walk onto the south entry gate, confirm, leave.
-  if (s.player?.current_segment !== 0) {
+  if (!isHub(s.player?.segment)) {
     await page.$eval("#game-canvas", (el) => el.click()); // focus game, not inputs
     await sleep(200);
     await page.keyboard.press("s"); // step south onto the entry gate
@@ -111,12 +112,12 @@ try {
       "tile=", s.session?.tileAtPlayer);
     await clearModal(); // confirm the gate-walk modal
     s = await waitFor(
-      (s) => s.player?.current_segment === 0
+      (s) => isHub(s.player?.segment)
         || /reject|fail|mismatch/i.test(s.modal || ""),
       "retreat result", 25000,
     );
     console.log("after walk-onto-gate retreat:", JSON.stringify(summary(s)));
-    check("[path2] walk-onto-gate retreats to hub", s.player?.current_segment === 0, s);
+    check("[path2] walk-onto-gate retreats to hub", isHub(s.player?.segment), s);
   }
 } catch (e) {
   console.log("ERROR:", e.message);

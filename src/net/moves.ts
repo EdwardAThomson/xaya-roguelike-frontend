@@ -15,6 +15,8 @@
  * `createMoveClient` selects the transport from MOVE_TRANSPORT in config.
  */
 
+import { SegmentRef } from "./rpc.js";
+
 import { GAME_ID, MOVE_TRANSPORT } from "../config.js";
 import { WalletMoveTransport } from "./walletTransport.js";
 
@@ -56,8 +58,8 @@ export class MoveClient {
     await this.transport.mine();
   }
 
-  async enterChannel(name: string, segmentId: number): Promise<void> {
-    await this.transport.submitMove(name, { ec: { id: segmentId } });
+  async enterChannel(name: string, seg: SegmentRef): Promise<void> {
+    await this.transport.submitMove(name, { ec: { x: seg.x, y: seg.y } });
     await this.transport.mine();
   }
 

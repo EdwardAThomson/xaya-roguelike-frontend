@@ -20,6 +20,7 @@ import {
   openModalViaKey, openModalViaButton, closeModal, modalOpen,
   clickTab, activeTab, runOutViaGate, dieInChannel, neighbourInDir, resetOverlays,
   handleStrayModal, discoverFreshFrontier, returnToHub, waitDiscoverReady,
+  HUB, isHub, sameSeg, segStr,
 } from "./helpers.mjs";
 import { bfsStep } from "./agentcore.mjs";
 
@@ -106,7 +107,7 @@ test("T1", "register a fresh player, then re-register the same name (no 500)", a
   const { c, page, check } = t;
   const s = await domConnectAndRegister(c, NAME);
   check("player exists after register", !!s.player);
-  check("registered at the hub (segment 0)", s.player?.current_segment === 0);
+  check("registered at the hub (0, 0)", isHub(s.player?.segment), segStr(s.player?.segment));
   check("full HP on a fresh character", s.player?.hp === s.player?.max_hp);
 
   // Re-register the SAME name. The proxy `register` re-mints; the shipped fix
@@ -227,11 +228,13 @@ test("T4a", "discover a frontier segment; cooldown blocks a too-soon retry", asy
 
   const after = await c.waitState((s) => s.segments.length > segCountBefore,
     "a new provisional segment appears", 30000);
-  const newSeg = after.segments.find((x) => !before.segments.some((b) => b.id === x.id));
+  // Segments are identified by coordinate, so "new" = a coord that was not in
+  // the previous snapshot.
+  const newSeg = after.segments.find((x) => !before.segments.some((b) => sameSeg(b, x)));
   check("discover created a new segment", !!newSeg, JSON.stringify(newSeg));
   check("the new segment is provisional (unconfirmed)", newSeg && newSeg.confirmed === false);
   world.discoverDir = dir;
-  world.provisionalSeg = newSeg?.id;
+  world.provisionalSeg = newSeg ? { x: newSeg.x, y: newSeg.y } : null;
 
   // A second discovery now is too-soon: the sidebar must show the cooldown.
   await sleep(500);
@@ -272,12 +275,13 @@ test("T5", "loot: pick up an item in a run and it persists into the bag on exit"
   // segment. The confirmed flag propagates a poll after the player state, so
   // wait for it rather than reading a possibly-stale snapshot.
   const confd = await c.waitState((s) => {
-    const nb = neighbourInDir(s, 0, dir);
+    const nb = neighbourInDir(s, HUB, dir);
     return nb && nb.confirmed === true;
   }, "frontier segment confirmed", 20000).catch(() => null);
   check("the survived run confirmed the frontier segment (banked its results)",
     !!confd, confd ? "" : "segment did not confirm within timeout");
-  world.confirmedSeg = neighbourInDir(out, 0, dir)?.id;
+  const confSeg = neighbourInDir(out, HUB, dir);
+  world.confirmedSeg = confSeg ? { x: confSeg.x, y: confSeg.y } : null;
 
   const nonPotionAfter = out.player.inventory.filter(
     (i) => i.slot === "bag" && i.item_id !== "health_potion");
@@ -425,7 +429,7 @@ test("T3", "in-dungeon: mid-run equip of banked bag gear is local + immediate; d
   // fully done (the frontend's busy flag cleared) once it finishes tearing the
   // run down, and a gate-walk issued while busy is silently a no-op.
   await c.waitState((s) => s.player && !s.player.in_channel
-    && s.player.current_segment === 0 && !s.busy,
+    && isHub(s.player.segment) && !s.busy,
     "settled idle at the hub", 20000).catch(() => {});
 });
 
@@ -434,16 +438,17 @@ test("T4b", "transit hub <-> confirmed segment is free and lands on the other si
   const { c, check, world } = t;
   const dir = world.discoverDir || "north";
   const s0 = await c.waitState((x) => x.player && !x.player.in_channel, "at hub", 20000);
-  const target = neighbourInDir(s0, 0, dir);
+  const target = neighbourInDir(s0, HUB, dir);
   if (!target || !target.confirmed) t.skip("no confirmed neighbour to transit into");
 
   // Free transit from the hub into the confirmed segment: lands us ON the other
   // side (inside that segment's channel), no survive-requirement, no penalty.
   await c.call("gateWalk", dir);
   const inSeg = await c.waitState((x) => x.player?.in_channel
-    && x.player.active_visit?.segment_id === target.id, "transited into confirmed seg", 40000);
+    && sameSeg(x.player.active_visit?.segment, target),
+    `transited into confirmed seg ${segStr(target)}`, 40000);
   check("free transit landed us inside the confirmed segment",
-    inSeg.player.active_visit?.segment_id === target.id);
+    sameSeg(inSeg.player.active_visit?.segment, target), segStr(target));
   check("we entered via the matching (opposite) gate",
     !!inSeg.player.active_visit?.entry_direction, JSON.stringify(inSeg.player.active_visit));
 
@@ -451,8 +456,9 @@ test("T4b", "transit hub <-> confirmed segment is free and lands on the other si
   const opposite = { north: "south", south: "north", east: "west", west: "east" }[dir];
   await c.call("gateWalk", opposite);
   const back = await c.waitState((x) => x.player && !x.player.in_channel
-    && x.player.current_segment === 0, "returned to hub", 40000);
-  check("transit back returned us to the hub (segment 0)", back.player.current_segment === 0);
+    && isHub(x.player.segment), "returned to hub", 40000);
+  check("transit back returned us to the hub (0, 0)", isHub(back.player.segment),
+    segStr(back.player.segment));
 });
 
 // ---- T7: death and respawn at the hub with reduced HP ----
@@ -480,7 +486,7 @@ test("T7", "death in a dungeon respawns the player at the hub with reduced HP", 
   }
   check("player is back out of the channel after dying", dead.player?.in_channel === false,
     JSON.stringify(summary(dead)));
-  check("respawned at the hub (segment 0)", dead.player?.current_segment === 0);
+  check("respawned at the hub (0, 0)", isHub(dead.player?.segment), segStr(dead.player?.segment));
   check("respawn HP is reduced (< max) but alive (> 0)",
     dead.player?.hp > 0 && dead.player?.hp < maxHp, `hp ${dead.player?.hp}/${maxHp}`);
   world.hurtAtHub = dead.player?.hp < maxHp;

@@ -11,6 +11,25 @@
 export const OFFSET = { north: [0, 1], south: [0, -1], east: [1, 0], west: [-1, 0] };
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// --- Segment identity ---
+// A segment IS its world coordinate {x, y}; there is no id. The hub is (0, 0)
+// and, like any other cell, is named purely by its coordinate. Sets/maps that
+// used to be keyed by an integer id are keyed by segKey() instead.
+
+export const HUB = { x: 0, y: 0 };
+/** Canonical map/set key for a coordinate. */
+export const segKey = (s) => (s ? `${s.x},${s.y}` : "none");
+/** True when two coordinates name the same segment. */
+export const sameSeg = (a, b) => !!a && !!b && a.x === b.x && a.y === b.y;
+export const isHub = (s) => !!s && s.x === 0 && s.y === 0;
+/** Human-readable coordinate for log lines. */
+export const segStr = (s) => (s ? `(${s.x}, ${s.y})` : "none");
+/** The cell reached by walking `dir` out of `seg` (a gate always leads next door). */
+export const stepCoord = (seg, dir) => {
+  const [dx, dy] = OFFSET[dir];
+  return { x: seg.x + dx, y: seg.y + dy };
+};
+
 /** BFS first step from (fx,fy) toward (tx,ty) over non-wall tiles. */
 export function bfsStep(walls, fx, fy, tx, ty) {
   const H = walls.length, W = walls[0].length;
@@ -41,32 +60,24 @@ export function bfsStep(walls, fx, fy, tx, ty) {
 
 const OPPOSITE = { north: "south", south: "north", east: "west", west: "east" };
 
-/** Coordinate of a segment id (hub id 0 is the origin). */
-function segCoord(segs, id) {
-  if (id === 0) return [0, 0];
-  const z = segs.find((s) => s.id === id);
-  return z ? [z.world_x, z.world_y] : [0, 0];
-}
 /** Gate directions a segment exposes (the hub has all four). */
-function gateDirsOf(segs, id) {
-  if (id === 0) return ["north", "south", "east", "west"];
-  const z = segs.find((s) => s.id === id);
+function gateDirsOf(segs, seg) {
+  if (isHub(seg)) return ["north", "south", "east", "west"];
+  const z = segByCoord(segs, seg.x, seg.y);
   return z && z.gates ? Object.keys(z.gates) : [];
 }
 function segByCoord(segs, x, y) {
-  return segs.find((s) => s.world_x === x && s.world_y === y);
+  return segs.find((s) => s.x === x && s.y === y);
 }
 /**
- * Directions from segment `id` whose gate opens onto an UNEXPLORED coord
+ * Directions from segment `seg` whose gate opens onto an UNEXPLORED coord
  * within the depth budget: the real discovery opportunities from here.
  */
-export function frontierDirsOf(segs, id, maxD) {
-  const [x, y] = segCoord(segs, id);
+export function frontierDirsOf(segs, seg, maxD) {
   const out = [];
-  for (const d of gateDirsOf(segs, id)) {
-    const [dx, dy] = OFFSET[d];
-    const nx = x + dx, ny = y + dy;
-    // (0,0) is the hub - it always exists (id 0, not in the segment list), so a
+  for (const d of gateDirsOf(segs, seg)) {
+    const { x: nx, y: ny } = stepCoord(seg, d);
+    // (0,0) is the hub - it always exists (it is not in the segment list), so a
     // gate pointing at it is a plain transit home, NOT a discovery. Treating it
     // as unexplored made a hub-adjacent segment look "frontier-capable" and
     // bounced bots hub<->that-segment forever. Exclude it.
@@ -76,20 +87,19 @@ export function frontierDirsOf(segs, id, maxD) {
   return out;
 }
 /** Deepest coord this segment can discover into (-1 if not frontier-capable). */
-export function frontierBestDepth(segs, id, maxD) {
-  const [x, y] = segCoord(segs, id);
+export function frontierBestDepth(segs, seg, maxD) {
   let best = -1;
-  for (const d of frontierDirsOf(segs, id, maxD)) {
-    const [dx, dy] = OFFSET[d];
-    best = Math.max(best, Math.abs(x + dx) + Math.abs(y + dy));
+  for (const d of frontierDirsOf(segs, seg, maxD)) {
+    const { x: nx, y: ny } = stepCoord(seg, d);
+    best = Math.max(best, Math.abs(nx) + Math.abs(ny));
   }
   return best;
 }
 /**
  * BFS over the graph of CONFIRMED segments (an edge is a real gate onto a
  * coord-adjacent confirmed neighbour, and the hub (0,0) is a traversable node
- * that links every quadrant) from `fromId`. Among every reachable
- * frontier-capable segment (including `fromId`), pick the one that can discover
+ * that links every quadrant) from `from` (a coordinate). Among every reachable
+ * frontier-capable segment (including `from`), pick the one that can discover
  * the DEEPEST coord, tie-broken by nearest, and return the first transit step
  * toward it - or { atGoal: true } when standing on it already.
  *
@@ -100,49 +110,48 @@ export function frontierBestDepth(segs, id, maxD) {
  * toward a single chosen target, so it does not oscillate; the hub node lets a
  * bot in one arm reach a deeper frontier in another arm.
  */
-export function planToFrontier(segs, fromId, maxD) {
-  const q = [fromId];
-  const seen = new Set([fromId]);
-  const firstDir = new Map([[fromId, null]]);
-  const dist = new Map([[fromId, 0]]);
-  let bestId = -1, bestDepth = -1, bestDist = Infinity;
-  const consider = (id) => {
-    const fd = frontierBestDepth(segs, id, maxD);
+export function planToFrontier(segs, from, maxD) {
+  const fromK = segKey(from);
+  const q = [from];
+  const seen = new Set([fromK]);
+  const firstDir = new Map([[fromK, null]]);
+  const dist = new Map([[fromK, 0]]);
+  let best = null, bestDepth = -1, bestDist = Infinity;
+  const consider = (seg) => {
+    const fd = frontierBestDepth(segs, seg, maxD);
     if (fd < 0) return;
-    const dd = dist.get(id) ?? Infinity;
+    const dd = dist.get(segKey(seg)) ?? Infinity;
     if (fd > bestDepth || (fd === bestDepth && dd < bestDist)) {
-      bestDepth = fd; bestDist = dd; bestId = id;
+      bestDepth = fd; bestDist = dd; best = seg;
     }
   };
-  consider(fromId);
+  consider(from);
   while (q.length) {
     const cur = q.shift();
-    const [x, y] = segCoord(segs, cur);
+    const curK = segKey(cur);
     for (const d of gateDirsOf(segs, cur)) {
-      const [dx, dy] = OFFSET[d];
-      const nx = x + dx, ny = y + dy;
+      const nb = stepCoord(cur, d);
+      const nbK = segKey(nb);
       // The hub (0,0) is real and traversable even though it is not in the
       // segment list; without it BFS cannot cross from one arm of the map to a
       // deeper frontier in another arm.
-      let nbId, nbConfirmed = true;
-      if (nx === 0 && ny === 0) {
-        nbId = 0;
-      } else {
-        const nb = segByCoord(segs, nx, ny);
-        if (!nb) continue;
-        nbId = nb.id; nbConfirmed = !!nb.confirmed;
+      let nbConfirmed = true;
+      if (!isHub(nb)) {
+        const z = segByCoord(segs, nb.x, nb.y);
+        if (!z) continue;
+        nbConfirmed = !!z.confirmed;
       }
-      if (!nbConfirmed || seen.has(nbId)) continue;
-      seen.add(nbId);
-      firstDir.set(nbId, cur === fromId ? d : firstDir.get(cur));
-      dist.set(nbId, (dist.get(cur) ?? 0) + 1);
-      consider(nbId);
-      q.push(nbId);
+      if (!nbConfirmed || seen.has(nbK)) continue;
+      seen.add(nbK);
+      firstDir.set(nbK, curK === fromK ? d : firstDir.get(curK));
+      dist.set(nbK, (dist.get(curK) ?? 0) + 1);
+      consider(nb);
+      q.push(nb);
     }
   }
-  if (bestId < 0) return { atGoal: false, stepDir: null };
-  if (bestId === fromId) return { atGoal: true, stepDir: null };
-  return { atGoal: false, stepDir: firstDir.get(bestId) };
+  if (!best) return { atGoal: false, stepDir: null };
+  if (sameSeg(best, from)) return { atGoal: true, stepDir: null };
+  return { atGoal: false, stepDir: firstDir.get(segKey(best)) };
 }
 
 /**
@@ -299,12 +308,14 @@ export async function playAgent(page, cfg) {
   const allowedDepth = (lvl) => Math.min(DEPTH_CEIL, Math.max(5, (lvl ?? 1) + 4));
 
   let discoveries = 0, lastSig = "", stuck = 0;
-  // Anti-backtrack bookkeeping: the segment we were in before the current one.
-  // Used so a wedge-escape never turns a bot straight back the way it came.
+  // Anti-backtrack bookkeeping: the COORD of the segment we were in before the
+  // current one. Used so a wedge-escape never turns a bot straight back the way
+  // it came.
   let cameFrom = null, lastSeg = null;
-  // Recent segment-entry history (ids), for a branch-agnostic two-segment
-  // oscillation detector: if the last four entries alternate between just two
-  // segments, the bot is ping-ponging and must stop transiting (grind or park).
+  // Recent segment-entry history (as "x,y" keys), for a branch-agnostic
+  // two-segment oscillation detector: if the last four entries alternate
+  // between just two segments, the bot is ping-ponging and must stop transiting
+  // (grind or park).
   let segHist = [];
   let mapCache = { visitId: null, walls: null };
   // Per-visit combat budget: on entering a segment a bot hunts monsters for
@@ -321,12 +332,13 @@ export async function playAgent(page, cfg) {
   for (let tick = 0; tick < MAX_TICKS; tick++) {
     s = await state();
 
-    // Track the segment we just came from (updated whenever current_segment
-    // changes) so the navigation can refuse to immediately transit back to it.
-    if (s.player && s.player.current_segment !== lastSeg) {
+    // Track the segment we just came from (updated whenever the player's
+    // coordinate changes) so the navigation can refuse to immediately transit
+    // back to it.
+    if (s.player && !sameSeg(s.player.segment, lastSeg)) {
       if (lastSeg !== null) cameFrom = lastSeg;
-      lastSeg = s.player.current_segment;
-      segHist.push(s.player.current_segment);
+      lastSeg = s.player.segment;
+      segHist.push(segKey(s.player.segment));
       if (segHist.length > 4) segHist.shift();
     }
     // Two-segment ping-pong: the last four DISTINCT-pairwise entries are A,B,A,B.
@@ -349,7 +361,7 @@ export async function playAgent(page, cfg) {
     // a genuinely wedged action (an unreachable/unresolving target) leaves all
     // of position, player hp, monster count AND monster hp unchanged.
     const totalMonHp = (s.session?.monsters ?? []).reduce((a, m) => a + m.hp, 0);
-    const sig = `${s.player?.current_segment}:${s.session?.playerX}:${s.session?.playerY}:${s.session?.hp}:${aliveMons}:${totalMonHp}`;
+    const sig = `${segKey(s.player?.segment)}:${s.session?.playerX}:${s.session?.playerY}:${s.session?.hp}:${aliveMons}:${totalMonHp}`;
     if (s.player?.in_channel && sig === lastSig && !s.modal && !s.busy) {
       stuck++;
       if (stuck > 250) { fail(`stuck ${stuck} ticks in dungeon at ${sig}`); break; }
@@ -371,24 +383,21 @@ export async function playAgent(page, cfg) {
       const maxD = allowedDepth(pl.level);
       const cd = pl.last_discover_height > 0
         ? Math.max(0, (pl.last_discover_height + 50) - (s.height ?? 0)) : 0;
-      const [curX, curY] = segCoord(segs, pl.current_segment);
-      const distFromHub = (d) => { const [dx, dy] = OFFSET[d]; return Math.abs(curX + dx) + Math.abs(curY + dy); };
+      const cur = pl.segment;
+      const distFromHub = (d) => {
+        const n = stepCoord(cur, d); return Math.abs(n.x) + Math.abs(n.y);
+      };
       // Real gates from HERE that open onto unexplored ground (deepest first),
       // and the BFS route to the nearest segment that CAN push the frontier.
-      const frontierHere = frontierDirsOf(segs, pl.current_segment, maxD)
+      const frontierHere = frontierDirsOf(segs, cur, maxD)
         .sort((a, b) => distFromHub(b) - distFromHub(a));
-      const plan = planToFrontier(segs, pl.current_segment, maxD);
+      const plan = planToFrontier(segs, cur, maxD);
       const owHealthy = pl.max_hp > 0 ? pl.hp >= pl.max_hp * 0.5 : true;
-      // Direction back to the segment we just came from (anti-backtrack).
-      const owBackDir = (() => {
-        if (cameFrom == null) return null;
-        for (const d of Object.keys(OFFSET)) {
-          const [dx, dy] = OFFSET[d];
-          if (cameFrom === 0) { if (curX + dx === 0 && curY + dy === 0) return d; }
-          else { const nb = segByCoord(segs, curX + dx, curY + dy); if (nb && nb.id === cameFrom) return d; }
-        }
-        return null;
-      })();
+      // Direction back to the segment we just came from (anti-backtrack). A
+      // gate always leads to the neighbouring cell, so this is a plain
+      // coordinate comparison.
+      const owBackDir = cameFrom == null ? null
+        : Object.keys(OFFSET).find((d) => sameSeg(stepCoord(cur, d), cameFrom)) || null;
 
       let dir = null, discovering = false;
       if (cd === 0 && segs.length < WORLD_CAP && frontierHere.length && plan.atGoal && owHealthy) {
@@ -410,7 +419,7 @@ export async function playAgent(page, cfg) {
       }
 
       if (cfg.debug && name === "bot_0")
-        console.error(`[ow bot_0 t${tick}] seg${pl.current_segment} dir=${dir} disc=${discovering} cd=${cd} frontierHere=${frontierHere} step=${plan.stepDir}`);
+        console.error(`[ow bot_0 t${tick}] seg${segStr(cur)} dir=${dir} disc=${discovering} cd=${cd} frontierHere=${frontierHere} step=${plan.stepDir}`);
       await call("gateWalk", dir);
       const after = await waitIdle(15000);
       if (after.player?.in_channel && discovering) discoveries++;
@@ -421,7 +430,7 @@ export async function playAgent(page, cfg) {
     if (!sess) { await sleep(200); continue; }
     if (sess.gameOver) { await call("exitChannel"); await waitIdle(15000); continue; }
     if (cfg.debug && name === "bot_0" && tick % 10 === 0)
-      console.error(`[dz bot_0 t${tick}] seg${p.current_segment} mons=${sess.monsters.length} pos=${sess.playerX},${sess.playerY} hp=${sess.hp}/${sess.maxHp}`);
+      console.error(`[dz bot_0 t${tick}] seg${segStr(p.segment)} mons=${sess.monsters.length} pos=${sess.playerX},${sess.playerY} hp=${sess.hp}/${sess.maxHp}`);
 
     // LIVE combat HP comes from the running session (sess.hp/maxHp), NOT the
     // on-chain player.hp, which is frozen until the run settles. Every in-run
@@ -439,10 +448,7 @@ export async function playAgent(page, cfg) {
     // monsters, so a timid bot at half HP would deadlock (never fight, never
     // heal, never level). retreatAt rises from ~0.35 near the hub toward ~0.6
     // deep, where a level-appropriate character has far more max HP to spend.
-    const depthProxyEarly = (() => {
-      const seg = s.segments.find(x => x.id === p.current_segment);
-      return seg ? Math.abs(seg.world_x) + Math.abs(seg.world_y) : 0;
-    })();
+    const depthProxyEarly = Math.abs(p.segment?.x ?? 0) + Math.abs(p.segment?.y ?? 0);
     const retreatAt = Math.min(0.6, 0.32 + 0.045 * depthProxyEarly);
 
     // Drink when hurt (and not already topped up). Drinking raises live hp,
@@ -481,10 +487,11 @@ export async function playAgent(page, cfg) {
 
     const entryDir = p.active_visit?.entry_direction || "";
     if (huntVisit !== vid) { huntVisit = vid; huntTurns = 0; }
-    const curSeg = s.segments.find(x => x.id === p.current_segment);
-    const cx0 = curSeg?.world_x ?? 0, cy0 = curSeg?.world_y ?? 0;
+    const here = p.segment;
+    const curSeg = s.segments.find(x => x.x === here.x && x.y === here.y);
+    const cx0 = here.x, cy0 = here.y;
     const depthProxy = Math.abs(cx0) + Math.abs(cy0);
-    const curConfirmed = !curSeg || !!curSeg.confirmed;   // hub (id 0) counts as confirmed
+    const curConfirmed = !curSeg || !!curSeg.confirmed;   // the hub (0,0) counts as confirmed
     const maxD = allowedDepth(p.level);
 
     let nearestMon = null, nd = Infinity;
@@ -501,14 +508,16 @@ export async function playAgent(page, cfg) {
     // --- Frontier-directed navigation (anti-oscillation core) ---
     const cd = p.last_discover_height > 0
       ? Math.max(0, (p.last_discover_height + 50) - (s.height ?? 0)) : 0;
-    const distOf = (dir) => { const [dx, dy] = OFFSET[dir]; return Math.abs(cx0 + dx) + Math.abs(cy0 + dy); };
+    const distOf = (dir) => {
+      const n = stepCoord(here, dir); return Math.abs(n.x) + Math.abs(n.y);
+    };
     const segs = s.segments;
     // Real gates from HERE onto unexplored ground (deepest first), and the BFS
     // route toward the nearest segment that CAN push the frontier. planToFrontier
     // is a shortest path over confirmed segments, so following it never orbits.
-    const frontierHere = frontierDirsOf(segs, p.current_segment, maxD)
+    const frontierHere = frontierDirsOf(segs, here, maxD)
       .sort((a, b) => distOf(b) - distOf(a));
-    const plan = planToFrontier(segs, p.current_segment, maxD);
+    const plan = planToFrontier(segs, here, maxD);
     // Discover from HERE only when this is the DEEPEST reachable frontier
     // (plan.atGoal), off cooldown and under the world cap. If a deeper frontier
     // is reachable, plan.stepDir (below) routes toward it instead of filling a
@@ -543,15 +552,8 @@ export async function playAgent(page, cfg) {
     // came from. Anti-backtrack keys off this, NOT entryDir: entryDir is the
     // gate side we arrived on, which does not match the travel direction of the
     // return hop, so using it let a two-segment bounce slip through.
-    const backSegDir = (() => {
-      if (cameFrom == null) return null;
-      for (const d of allDirs) {
-        const [dx, dy] = OFFSET[d];
-        if (cameFrom === 0) { if (cx0 + dx === 0 && cy0 + dy === 0) return d; }
-        else { const nb = segByCoord(segs, cx0 + dx, cy0 + dy); if (nb && nb.id === cameFrom) return d; }
-      }
-      return null;
-    })();
+    const backSegDir = cameFrom == null ? null
+      : allDirs.find((d) => sameSeg(stepCoord(here, d), cameFrom)) || null;
     const hurt = hpRatio <= retreatAt;
     const pinned = mustLeave;
 
@@ -645,7 +647,7 @@ export async function playAgent(page, cfg) {
 
     const step = bfsStep(walls, sess.playerX, sess.playerY, target.x, target.y);
     if (cfg.debug && name === "bot_0" && tick % 3 === 0) {
-      console.error(`[dbg ${name} t${tick}] seg${p.current_segment} d${depthProxy} conf=${curConfirmed} hp=${hpRatio.toFixed(2)} ${decision} cd=${cd} discHere=${canDiscoverHere} frontierHere=${frontierHere} step=${plan.stepDir} nd=${nd} tgt=${target.x},${target.y}`);
+      console.error(`[dbg ${name} t${tick}] seg${segStr(here)} d${depthProxy} conf=${curConfirmed} hp=${hpRatio.toFixed(2)} ${decision} cd=${cd} discHere=${canDiscoverHere} frontierHere=${frontierHere} step=${plan.stepDir} nd=${nd} tgt=${target.x},${target.y}`);
     }
     if (!step || (step[0] === 0 && step[1] === 0)) {
       let moved = false;
@@ -663,7 +665,7 @@ export async function playAgent(page, cfg) {
   const fin = await state().catch(() => ({}));
   return {
     name,
-    seg: fin.player?.current_segment,
+    seg: segStr(fin.player?.segment),
     level: fin.player?.level,
     deaths: fin.player?.combat_record?.deaths,
     discoveries,
