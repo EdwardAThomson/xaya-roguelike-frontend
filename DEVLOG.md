@@ -1,5 +1,11 @@
 # Development Log
 
+## 2026-08-27
+
+Presentation work for the hosted build: shared links to the deployed game were rendering as bare URLs with no preview. Added a 1200x630 (at 2x) Open Graph card under `assets/og-image.png`, composed from the existing in-dungeon screenshot with the title, tagline, and site URL burned in, and wired up the matching `og:*` and `twitter:*` meta tags in `index.html` along with a page description. The card copy pitches the three things that actually distinguish the game: an on-chain overworld, procedural dungeons, and runs settled on-chain with replay proofs.
+
+**Decisions & notes:** The image is served at 2x, so the `og:image:width`/`height` tags declare the real pixel dimensions (2400x1260) rather than the nominal 1200x630 layout size. Static markup and one asset only; no engine or parity-critical code touched.
+
 ## 2026-07-30
 
 The headline fix was auto-recovering runs that ended server-side without the client noticing. If a dungeon run was force-settled on-chain (the 200-block visit timeout, or a death applied off-client), the state poll used to skip reconciliation whenever it already held a `channelSession`, so the client kept rendering the old dungeon while the map already showed the player back at the hub. The poll now detects that the live run no longer matches the visit the chain reports (not in a channel, or a different visit id) and re-syncs: it starts the knock-back run if the player was pushed back a segment, otherwise it drops to the hub. The reconciliation is guarded by the `busy` flag so it never fires during a gate-walk or settle the client is driving itself. A quick follow-up made the recovery message neutral, since a timeout-driven settle is not a death. The rest of the day was Map-view polish: the world map got a larger inset so it no longer fills the game area, with a "WORLD MAP" title and the legend moved to the bottom to clear the tab bar; the dungeon minimap was wrapped in the same framed panel and titled "DUNGEON MAP" so it is not mistaken for the live playable dungeon; and the World/Dungeon tab switcher got bigger, more visible buttons.
