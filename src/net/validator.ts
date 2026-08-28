@@ -12,13 +12,16 @@
  * heading, and a `message` for the modal body.
  */
 
-import { PlayerInfo, SegmentInfo } from "./rpc.js";
+import { PlayerInfo, SegmentInfo, SegmentRef, segKey, sameSeg, isHub }
+  from "./rpc.js";
 
 export type ValidationResult =
   | { ok: true }
   | { ok: false; code: ValidationErrorCode; title: string; message: string };
 
 export type ValidationErrorCode =
+  | "no_settlement"
+  | "provisional_transit"
   | "in_channel"
   | "in_visit"
   | "cooldown"
@@ -42,7 +45,8 @@ export type ValidationErrorCode =
 
 export interface ValidatorContext {
   player: PlayerInfo;
-  segments: Map<number, SegmentInfo>;
+  /** Known segments, keyed by coordinate (see segKey). */
+  segments: Map<string, SegmentInfo>;
   currentHeight: number;
 }
 
@@ -54,6 +58,33 @@ const OPPOSITE: Record<string, string> = {
 const DIR_DX: Record<string, number> = { east: 1, west: -1, north: 0, south: 0 };
 const DIR_DY: Record<string, number> = { north: 1, south: -1, east: 0, west: 0 };
 const VALID_DIRS = new Set(["north", "south", "east", "west"]);
+
+/** The cell one step from `from` in `dir` (mirrors segmentkey.hpp). */
+export function neighbour(from: SegmentRef, dir: string): SegmentRef {
+  return { x: from.x + (DIR_DX[dir] ?? 0), y: from.y + (DIR_DY[dir] ?? 0) };
+}
+
+/** Human-readable coordinate, e.g. "(1, -2)". */
+export function segName(seg: SegmentRef): string {
+  return `(${seg.x}, ${seg.y})`;
+}
+
+/**
+ * Whether a gate link is recorded out of `from` in `dir`.  The hub keeps no
+ * segment record of its own, so its links are read off the neighbour's link
+ * back to (0, 0).
+ */
+function linkedThrough(
+  ctx: ValidatorContext, from: SegmentRef, dir: string,
+): boolean {
+  const info = ctx.segments.get(segKey(from));
+  if (info) return !!info.links[dir];
+
+  const target = neighbour(from, dir);
+  const back = ctx.segments.get(segKey(target));
+  const lnk = back?.links[OPPOSITE[dir]];
+  return !!lnk && sameSeg(lnk.to, from);
+}
 
 function err(
   code: ValidationErrorCode, title: string, message: string,
@@ -103,45 +134,24 @@ export function validateDiscover(
       `You discovered a segment recently. Wait ${remaining} more block${remaining === 1 ? "" : "s"} before discovering again.`);
   }
 
-  // Direction already linked from the current segment?  For the hub
-  // (segment 0) we infer this from other segments that link back to 0.
-  const curSeg = p.current_segment;
-  if (curSeg === 0) {
-    const opp = OPPOSITE[dir];
-    for (const seg of ctx.segments.values()) {
-      for (const [d, lnk] of Object.entries(seg.links)) {
-        if (lnk.to_segment === 0 && d === opp) {
-          return err("dir_linked", "Direction already explored",
-            `There is already a segment to the ${dir} from the hub. Travel there or pick a different direction.`);
-        }
-      }
-    }
-  } else {
-    const segInfo = ctx.segments.get(curSeg);
-    if (!segInfo) {
-      return err("unknown_segment", "Unknown segment",
-        `Your current segment (${curSeg}) is not in the frontend's cache. Try reconnecting.`);
-    }
-    if (segInfo.links[dir]) {
-      return err("dir_linked", "Direction already explored",
-        `There is already a segment to the ${dir} from here. Travel there or pick a different direction.`);
-    }
+  // Direction already linked from the current segment?  The hub keeps no
+  // segment record of its own, so we read the link off the neighbour.
+  const curSeg = p.segment;
+  if (!isHub(curSeg) && !ctx.segments.has(segKey(curSeg))) {
+    return err("unknown_segment", "Unknown segment",
+      `Your current segment ${segName(curSeg)} is not in the frontend's cache. Try reconnecting.`);
   }
 
-  // UNIQUE (world_x, world_y) check.  Compute target from current.
-  let srcX = 0, srcY = 0;
-  if (curSeg !== 0) {
-    const segInfo = ctx.segments.get(curSeg)!;
-    srcX = segInfo.world_x;
-    srcY = segInfo.world_y;
+  const target = neighbour(curSeg, dir);
+  if (linkedThrough(ctx, curSeg, dir)) {
+    return err("dir_linked", "Direction already explored",
+      `There is already a segment to the ${dir} from here. Travel there or pick a different direction.`);
   }
-  const targetX = srcX + (DIR_DX[dir] ?? 0);
-  const targetY = srcY + (DIR_DY[dir] ?? 0);
-  for (const seg of ctx.segments.values()) {
-    if (seg.world_x === targetX && seg.world_y === targetY) {
-      return err("coord_occupied", "Coordinate already claimed",
-        `Another player has already claimed the segment at world (${targetX}, ${targetY}). Pick a different direction.`);
-    }
+
+  // The coordinate is the identity, so an occupied cell cannot be claimed.
+  if (ctx.segments.has(segKey(target))) {
+    return err("coord_occupied", "Coordinate already claimed",
+      `Another player has already claimed the segment at ${segName(target)}. Pick a different direction.`);
   }
 
   return { ok: true };
@@ -162,27 +172,12 @@ export function validateTravel(
       `"${dir}" is not a valid direction.`);
   }
 
-  const curSeg = p.current_segment;
-  if (curSeg === 0) {
-    // Hub: look for a segment that links back to 0 from the opposite direction.
-    const opp = OPPOSITE[dir];
-    for (const seg of ctx.segments.values()) {
-      for (const [d, lnk] of Object.entries(seg.links)) {
-        if (lnk.to_segment === 0 && d === opp) {
-          return { ok: true };
-        }
-      }
-    }
-    return err("no_link", "No path that way",
-      `There is nothing to the ${dir} from the hub. Discover a new segment first.`);
-  }
-
-  const segInfo = ctx.segments.get(curSeg);
-  if (!segInfo) {
+  const curSeg = p.segment;
+  if (!isHub(curSeg) && !ctx.segments.has(segKey(curSeg))) {
     return err("unknown_segment", "Unknown segment",
       "Your current segment is not in the frontend's cache. Try reconnecting.");
   }
-  if (!segInfo.links[dir]) {
+  if (!linkedThrough(ctx, curSeg, dir)) {
     return err("no_link", "No path that way",
       `There is no segment to the ${dir} from here. Discover one first.`);
   }
@@ -192,7 +187,7 @@ export function validateTravel(
 
 /** Mirror of moveparser.cpp::HandleEnterChannel. */
 export function validateEnterChannel(
-  ctx: ValidatorContext, segmentId: number,
+  ctx: ValidatorContext, seg: SegmentRef,
 ): ValidationResult {
   const p = ctx.player;
 
@@ -204,15 +199,15 @@ export function validateEnterChannel(
     return err("dead", "Out of HP",
       "You have 0 HP. Heal or respawn before entering a dungeon.");
   }
-  if (segmentId === 0) {
+  if (isHub(seg)) {
     return err("hub_no_channel", "Hub has no dungeon",
-      "The hub (segment 0) is a safe zone — there is no dungeon to enter here.");
+      "The hub, at (0, 0), is a safe zone — there is no dungeon to enter here.");
   }
 
-  const segInfo = ctx.segments.get(segmentId);
+  const segInfo = ctx.segments.get(segKey(seg));
   if (!segInfo) {
     return err("unknown_segment", "Unknown segment",
-      `Segment ${segmentId} is not in the frontend's cache. Try reconnecting.`);
+      `Segment ${segName(seg)} is not in the frontend's cache. Try reconnecting.`);
   }
 
   // Provisional segments can only be entered by the discoverer.
@@ -239,9 +234,22 @@ export function validateUseItem(
   return { ok: true };
 }
 
+/**
+ * What the caller intends to attach to this gate-walk.  The GSP's rules
+ * depend on it, so the validator has to see it too: the two checks below
+ * are the ones that used to fail server-side only, with the client left
+ * guessing why.
+ */
+export interface GateWalkPlan {
+  /** A settlement (run proof) will be attached. */
+  hasSettlement: boolean;
+  /** A free transit out of a confirmed segment, carrying no proof. */
+  transit: boolean;
+}
+
 /** Mirror of moveparser.cpp::HandleGateWalk. */
 export function validateGateWalk(
-  ctx: ValidatorContext, dir: string,
+  ctx: ValidatorContext, dir: string, plan?: GateWalkPlan,
 ): ValidationResult {
   const p = ctx.player;
 
@@ -254,84 +262,49 @@ export function validateGateWalk(
       `"${dir}" is not a valid direction.`);
   }
 
-  // Look up the target via the current segment's links.
-  const curSeg = p.current_segment;
-  let targetSeg: number | undefined;
-  let targetExists = false;
-
-  if (curSeg === 0) {
-    // Hub: inferred from neighbours that link back to 0.
-    const opp = OPPOSITE[dir];
-    for (const seg of ctx.segments.values()) {
-      for (const [d, lnk] of Object.entries(seg.links)) {
-        if (lnk.to_segment === 0 && d === opp) {
-          targetSeg = seg.id;
-          targetExists = true;
-          break;
-        }
-      }
-      if (targetExists) break;
-    }
-  } else {
-    const segInfo = ctx.segments.get(curSeg);
-    if (!segInfo) {
-      return err("unknown_segment", "Unknown segment",
-        `Your current segment is not in the frontend's cache. Try reconnecting.`);
-    }
-    const lnk = segInfo.links[dir];
-    if (lnk) {
-      targetSeg = lnk.to_segment;
-      targetExists = true;
-    }
+  const curSeg = p.segment;
+  const curInfo = ctx.segments.get(segKey(curSeg));
+  if (!isHub(curSeg) && !curInfo) {
+    return err("unknown_segment", "Unknown segment",
+      "Your current segment is not in the frontend's cache. Try reconnecting.");
   }
 
-  if (!targetExists) {
-    // No direct link from curSeg in dir.  What happens next depends on
-    // WHAT (if anything) occupies the target coordinate.  A segment already
-    // there was discovered independently from a different parent.
-    let srcX = 0, srcY = 0;
-    if (curSeg !== 0) {
-      const segInfo = ctx.segments.get(curSeg)!;
-      srcX = segInfo.world_x;
-      srcY = segInfo.world_y;
-    }
-    const targetX = srcX + (DIR_DX[dir] ?? 0);
-    const targetY = srcY + (DIR_DY[dir] ?? 0);
+  // Leaving a run must carry something: either a settlement (the proof of
+  // what happened), or -- out of an already-confirmed segment -- a free
+  // transit.  The GSP drops a bare gate-walk out of a channel, which is
+  // what happens when the browser has lost the run it was playing.
+  if (plan && p.in_channel && !plan.hasSettlement && !plan.transit) {
+    return err("no_settlement", "Run state lost",
+      "This run's progress is no longer loaded in the browser, so there is no proof to submit and the chain would refuse the move. Reconnect to resume the run from where it left off.");
+  }
 
-    let occupant: SegmentInfo | undefined;
-    for (const seg of ctx.segments.values()) {
-      if (seg.world_x === targetX && seg.world_y === targetY) {
-        occupant = seg;
-        break;
-      }
-    }
+  // Surviving a run is what confirms the segment you claimed, so you cannot
+  // take the free-transit shortcut out of a provisional one.
+  if (plan && plan.transit && curInfo && !curInfo.confirmed) {
+    return err("provisional_transit", "Segment not confirmed yet",
+      `${segName(curSeg)} is still provisional — it only becomes real once you complete a run here and leave through a gate. Finish the run, or bail out to give up the claim.`);
+  }
 
-    if (occupant) {
-      // Confirmed occupant -> free transit into the coord-adjacent neighbour
-      // (the chain creates the missing link).  Not a discovery, so no
-      // cooldown.  Provisional occupant -> discoverer-only, same as an
-      // existing provisional neighbour reached through a link.
-      if (!occupant.confirmed && occupant.discoverer !== p.name) {
-        return err("not_discoverer", "Segment is provisional",
-          `Only ${occupant.discoverer} can enter the segment at (${targetX}, ${targetY}) while it is provisional. Wait for them to confirm it, then you can join.`);
-      }
-      // else: allowed transit; fall through.
-    } else {
-      // Empty coord -> genuine discovery.  Cooldown applies.
-      const remaining = discoveryCooldownRemaining(p, ctx.currentHeight);
-      if (remaining > 0) {
-        return err("cooldown", "Cooldown",
-          `Walking through an unexplored gate needs a discover, but you're on cooldown for ${remaining} more block${remaining === 1 ? "" : "s"}.`);
-      }
-    }
-  } else if (targetSeg !== undefined && targetSeg !== 0) {
-    // Existing non-hub segment.  Provisional segments can only be
-    // entered by the discoverer.
-    const segInfo = ctx.segments.get(targetSeg);
-    if (segInfo && !segInfo.confirmed && segInfo.discoverer !== p.name) {
+  // A gate opens onto the cell next door -- always.
+  const target = neighbour(curSeg, dir);
+  if (isHub(target)) return { ok: true };
+
+  const occupant = ctx.segments.get(segKey(target));
+  if (occupant) {
+    // Confirmed neighbour -> free transit (the chain records the link if it
+    // is missing).  Provisional neighbour -> discoverer-only.
+    if (!occupant.confirmed && occupant.discoverer !== p.name) {
       return err("not_discoverer", "Segment is provisional",
-        `Only ${segInfo.discoverer} can enter this segment while it is provisional. Wait for them to confirm it, then you can join.`);
+        `Only ${occupant.discoverer} can enter the segment at ${segName(target)} while it is provisional. Wait for them to confirm it, then you can join.`);
     }
+    return { ok: true };
+  }
+
+  // Empty cell -> walking through this gate claims it, which is a discovery.
+  const remaining = discoveryCooldownRemaining(p, ctx.currentHeight);
+  if (remaining > 0) {
+    return err("cooldown", "Cooldown",
+      `Walking through an unexplored gate claims new ground, but you're on cooldown for ${remaining} more block${remaining === 1 ? "" : "s"}.`);
   }
 
   return { ok: true };

@@ -16,7 +16,7 @@
  * Run:  npm run compete
  */
 import { chromium } from "playwright";
-import { navigateOut, sleep } from "./agentcore.mjs";
+import { isHub, navigateOut, sameSeg, segStr, sleep } from "./agentcore.mjs";
 
 const URL = `${process.env.ROG_URL || "http://localhost:8000"}/?e2e=1`;
 const PROXY = process.env.ROG_PROXY || "http://localhost:18380";
@@ -36,7 +36,7 @@ async function gsp(method, params = []) {
 }
 async function segmentsAt(x, y) {
   const st = await gsp("getcurrentstate");
-  return (st?.gamestate?.segments || []).filter(s => s.world_x === x && s.world_y === y);
+  return (st?.gamestate?.segments || []).filter(s => s.x === x && s.y === y);
 }
 const st = (page) => page.evaluate(() => globalThis.__rog.state());
 const act = (page, fn, ...a) =>
@@ -71,9 +71,11 @@ try {
       ? pass("exactly one segment created at (1,0)")
       : fail(`${segs.length} segments at (1,0) — double claim!`);
     const sa = await st(A), sb = await st(B);
-    const winners =
-      (sa.player?.in_channel && sa.player.current_segment === segs[0]?.id ? 1 : 0) +
-      (sb.player?.in_channel && sb.player.current_segment === segs[0]?.id ? 1 : 0);
+    // The contested segment is simply the one at (1,0); "owns it" means the
+    // player is in a channel standing on that coordinate.
+    const won = (s) =>
+      !!segs[0] && s.player?.in_channel && sameSeg(s.player.segment, segs[0]) ? 1 : 0;
+    const winners = won(sa) + won(sb);
     winners === 1
       ? pass("exactly one player won and entered the segment")
       : fail(`${winners} players ended up owning (1,0)`);
@@ -92,7 +94,7 @@ try {
 
     await act(B, "gateWalk", "north"); await sleep(2500);
     const sb1 = await st(B);
-    (!sb1.player?.in_channel && sb1.player?.current_segment === 0)
+    (!sb1.player?.in_channel && isHub(sb1.player?.segment))
       ? pass("B is rejected from A's provisional segment")
       : fail(`B entered another player's provisional segment (in_channel=${sb1.player?.in_channel})`);
     await act(B, "dismissModal");
@@ -106,7 +108,7 @@ try {
 
     await act(B, "gateWalk", "north"); await sleep(2500);
     const sb2 = await st(B);
-    (sb2.player?.in_channel && sb2.player.current_segment === segs[0]?.id)
+    (sb2.player?.in_channel && !!segs[0] && sameSeg(sb2.player.segment, segs[0]))
       ? pass("B can enter once it's confirmed")
       : fail(`B still cannot enter the now-confirmed segment (in_channel=${sb2.player?.in_channel})`);
     await A.context().close(); await B.context().close();
@@ -128,8 +130,10 @@ try {
     await sleep(1500);
     const wSeg = (await segmentsAt(-1, 0))[0];
     const sSeg = (await segmentsAt(0, -1))[0];
-    (wSeg && sSeg && wSeg.id !== sSeg.id)
-      ? pass("two distinct segments, one per player")
+    // Distinctness is now implicit in the coordinate (they sit at (-1,0) and
+    // (0,-1)); what still matters is that BOTH segments actually exist.
+    (wSeg && sSeg && !sameSeg(wSeg, sSeg))
+      ? pass(`two distinct segments, one per player (${segStr(wSeg)} / ${segStr(sSeg)})`)
       : fail("players did not each get a distinct segment");
     (wSeg?.discoverer === A._name && sSeg?.discoverer === B._name)
       ? pass("each segment is owned by its own discoverer (no cross-credit)")

@@ -2,21 +2,19 @@
  * Overworld data model — builds a spatial layout of segments
  * from the GSP segment graph (links between segments).
  *
- * Segment 0 is the origin "hub" — it exists implicitly (not in the
- * segments table) but other segments link back to it.
+ * A segment IS its world coordinate; the hub is (0, 0) and exists
+ * implicitly (it has no row in the segments table).
  */
 
-import { SegmentInfo } from "../net/rpc.js";
+import { SegmentInfo, SegmentRef, segKey, HUB } from "../net/rpc.js";
 
 export interface SegmentNode {
-  id: number;
+  seg: SegmentRef;
   depth: number;
   discoverer: string;
-  worldX: number;
-  worldY: number;
   gridX: number;
   gridY: number;
-  links: Record<string, number>;  // direction -> segment ID
+  links: Record<string, SegmentRef>;  // direction -> neighbouring coordinate
   provisional: boolean;
 }
 
@@ -30,57 +28,48 @@ const OPPOSITE: Record<string, string> = { north: "south", south: "north", east:
  * `gridY = -world_y` because the GSP uses north = +Y while the canvas grows
  * downward — flipping keeps north rendering up.
  */
-export function layoutSegments(segments: Map<number, SegmentInfo>): Map<number, SegmentNode> {
-  const nodes = new Map<number, SegmentNode>();
+export function layoutSegments(
+  segments: Map<string, SegmentInfo>,
+): Map<string, SegmentNode> {
+  const nodes = new Map<string, SegmentNode>();
 
-  // Hub (segment 0): infer its links from neighbours that link back to it.
-  const seg0Links: Record<string, number> = {};
+  // The hub keeps no row of its own: read its links off the neighbours
+  // that link back to (0, 0).
+  const hubLinks: Record<string, SegmentRef> = {};
   for (const seg of segments.values()) {
     for (const [dir, lnk] of Object.entries(seg.links)) {
-      if (lnk.to_segment === 0) {
+      if (lnk.to.x === 0 && lnk.to.y === 0) {
         const reverseDir = OPPOSITE[dir];
-        if (reverseDir) seg0Links[reverseDir] = seg.id;
+        if (reverseDir) hubLinks[reverseDir] = { x: seg.x, y: seg.y };
       }
     }
   }
-  // Honour explicit segment-0 data if it ever exists.
-  const seg0Data = segments.get(0);
-  if (seg0Data) {
-    for (const [dir, lnk] of Object.entries(seg0Data.links)) {
-      seg0Links[dir] = lnk.to_segment;
-    }
-  }
 
-  nodes.set(0, {
-    id: 0,
+  nodes.set(segKey(HUB), {
+    seg: HUB,
     depth: 0,
     discoverer: "",
-    worldX: 0,
-    worldY: 0,
     gridX: 0,
     gridY: 0,
-    links: seg0Links,
+    links: hubLinks,
     provisional: false,
   });
 
-  // Place every other segment at its true world coordinate.
   for (const seg of segments.values()) {
-    if (seg.id === 0) continue;
-    const links: Record<string, number> = {};
+    if (seg.x === 0 && seg.y === 0) continue;
+    const links: Record<string, SegmentRef> = {};
     for (const [dir, lnk] of Object.entries(seg.links)) {
-      links[dir] = lnk.to_segment;
+      links[dir] = lnk.to;
     }
-    nodes.set(seg.id, {
-      id: seg.id,
-      // Display depth is the segment's distance from the hub, derived from its
-      // world coordinates (Manhattan |x| + |y|), so the map is always
-      // symmetric regardless of the stored (discovery-time) depth value.
-      depth: Math.abs(seg.world_x) + Math.abs(seg.world_y),
+    nodes.set(segKey(seg), {
+      seg: { x: seg.x, y: seg.y },
+      // Display depth is the segment's distance from the hub (Manhattan
+      // |x| + |y|), so the map is always symmetric regardless of the
+      // stored discovery-time depth.
+      depth: Math.abs(seg.x) + Math.abs(seg.y),
       discoverer: seg.discoverer,
-      worldX: seg.world_x,
-      worldY: seg.world_y,
-      gridX: seg.world_x,
-      gridY: -seg.world_y,
+      gridX: seg.x,
+      gridY: -seg.y,
       links,
       provisional: !seg.confirmed,
     });
@@ -98,7 +87,7 @@ export function layoutSegments(segments: Map<number, SegmentInfo>): Map<number, 
  * hit test.
  */
 export function hitTestSegment(
-  nodes: Map<number, SegmentNode>,
+  nodes: Map<string, SegmentNode>,
   canvasX: number,
   canvasY: number,
   centerNode: SegmentNode,
@@ -107,7 +96,7 @@ export function hitTestSegment(
   nodeSize: number,
   cellSize: number,
   view?: { panX: number; panY: number; zoom: number },
-): number | null {
+): SegmentRef | null {
   const zoom = view?.zoom ?? 1;
   const panX = view?.panX ?? 0;
   const panY = view?.panY ?? 0;
@@ -123,18 +112,20 @@ export function hitTestSegment(
 
     if (canvasX >= cx - half && canvasX <= cx + half &&
         canvasY >= cy - half && canvasY <= cy + half) {
-      return node.id;
+      return node.seg;
     }
   }
   return null;
 }
 
 /** Check if two segments are directly linked. */
-export function areLinked(nodes: Map<number, SegmentNode>, fromId: number, toId: number): string | null {
-  const from = nodes.get(fromId);
-  if (!from) return null;
-  for (const [dir, targetId] of Object.entries(from.links)) {
-    if (targetId === toId) return dir;
+export function areLinked(
+  nodes: Map<string, SegmentNode>, from: SegmentRef, to: SegmentRef,
+): string | null {
+  const node = nodes.get(segKey(from));
+  if (!node) return null;
+  for (const [dir, target] of Object.entries(node.links)) {
+    if (target.x === to.x && target.y === to.y) return dir;
   }
   return null;
 }

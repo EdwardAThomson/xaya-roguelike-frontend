@@ -20,7 +20,7 @@
  * Stop:  Ctrl-C / SIGTERM (kills the process; bots leave the world as-is).
  */
 import { chromium } from "playwright";
-import { playAgent, sleep } from "./agentcore.mjs";
+import { playAgent, segStr, sleep } from "./agentcore.mjs";
 
 const URL = `${process.env.ROG_URL || "http://localhost:8000"}/?e2e=1`;
 const PROXY = process.env.ROG_PROXY || "http://localhost:18380";
@@ -41,25 +41,29 @@ async function gsp(method, params = []) {
   return (await r.json()).result;
 }
 
-/** Cross-player invariants; logs each distinct violation once, as it appears. */
+/**
+ * Cross-player invariants; logs each distinct violation once, as it appears.
+ * Segments are identified by coordinate (the hub is (0, 0) and is not listed),
+ * so a shared coord can now only mean a duplicated GSP row.
+ */
 function check(gs) {
   if (!gs) return;
   const out = [];
-  const coords = new Map();
+  const coords = new Set();
   for (const s of gs.segments || []) {
-    const k = `${s.world_x},${s.world_y}`;
-    if (s.world_x === 0 && s.world_y === 0)
-      out.push(`segment ${s.id} occupies hub coord (0,0)`);
+    const k = `${s.x},${s.y}`;
+    if (s.x === 0 && s.y === 0)
+      out.push(`a segment occupies the hub coord (0, 0)`);
     if (coords.has(k))
-      out.push(`two segments share coord (${k}): #${coords.get(k)} & #${s.id}`);
-    else coords.set(k, s.id);
+      out.push(`two segments share coord (${k})`);
+    else coords.add(k);
   }
-  const ids = new Set((gs.segments || []).map((s) => s.id));
   for (const p of gs.players || []) {
     if (p.hp < 0 || p.hp > p.max_hp)
       out.push(`${p.name} hp out of range: ${p.hp}/${p.max_hp}`);
-    if (p.current_segment !== 0 && !ids.has(p.current_segment))
-      out.push(`${p.name} on nonexistent segment ${p.current_segment}`);
+    const pk = p.segment ? `${p.segment.x},${p.segment.y}` : null;
+    if (pk !== null && pk !== "0,0" && !coords.has(pk))
+      out.push(`${p.name} on nonexistent segment ${segStr(p.segment)}`);
   }
   for (const v of out) {
     if (!seenViol.has(v)) {
@@ -75,7 +79,7 @@ process.on("SIGTERM", () => { stop = true; });
 
 // Manhattan distance of a segment from the hub (0,0). This is the DEPTH proxy
 // and the "how far can a character get" metric the soak is measuring.
-const segDist = (s) => Math.abs(s.world_x) + Math.abs(s.world_y);
+const segDist = (s) => Math.abs(s.x) + Math.abs(s.y);
 let maxDistEver = 0;
 let maxDistFirstSeen = null;
 
@@ -103,11 +107,11 @@ async function referee() {
         const dist = Object.keys(byDist).map(Number).sort((a, b) => a - b)
           .map((d) => `d${d}:${byDist[d]}`).join(" ");
 
-        // Per-player level + current distance from hub.
-        const segById = new Map(segments.map((s) => [s.id, s]));
+        // Per-player level + current distance from hub. The player's segment
+        // IS a coordinate now, so the distance needs no segment lookup (the hub
+        // at (0, 0) falls out as distance 0).
         const perBot = players.map((p) => {
-          const seg = p.current_segment === 0 ? null : segById.get(p.current_segment);
-          const d = seg ? segDist(seg) : 0;
+          const d = p.segment ? segDist(p.segment) : 0;
           return `${p.name}=L${p.level}@d${d}`;
         }).join(" ");
 

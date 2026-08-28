@@ -9,7 +9,11 @@
  * (register button, inventory buttons, modal tabs, discover buttons, keys) is
  * exercised through genuine DOM events.
  */
-import { bfsStep, OFFSET } from "./agentcore.mjs";
+import { bfsStep, HUB, isHub, sameSeg, segStr, stepCoord } from "./agentcore.mjs";
+
+// Re-exported so the suites can import all their segment-coordinate helpers
+// from one place. A segment IS its {x, y} coordinate; the hub is (0, 0).
+export { HUB, isHub, sameSeg, segStr, stepCoord };
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -65,7 +69,7 @@ export function summary(s) {
   if (!s) return null;
   return {
     status: s.status,
-    seg: s.player?.current_segment,
+    seg: segStr(s.player?.segment),
     inChannel: s.player?.in_channel,
     hp: s.player?.hp,
     maxHp: s.player?.max_hp,
@@ -350,13 +354,14 @@ export async function returnToHub(c) {
   return runOutViaGate(c).catch(() => c.state());
 }
 
-/** Overworld neighbour segment (confirmed?) in a given direction from a seg. */
-export function neighbourInDir(s, segId, dir) {
-  const [dx, dy] = OFFSET[dir];
-  let cx = 0, cy = 0;
-  if (segId !== 0) {
-    const seg = s.segments.find((x) => x.id === segId);
-    if (seg) { cx = seg.world_x; cy = seg.world_y; }
-  }
-  return s.segments.find((x) => x.world_x === cx + dx && x.world_y === cy + dy) || null;
+/**
+ * Overworld neighbour segment (confirmed?) in a given direction from a segment
+ * coordinate. A gate always leads to the neighbouring cell, so this is just the
+ * segment sitting at the offset coordinate. `from` defaults to the hub (0, 0);
+ * note the hub itself is not in the segment list, so asking for the neighbour
+ * of a hub-adjacent segment in the hubward direction returns null.
+ */
+export function neighbourInDir(s, from, dir) {
+  const target = stepCoord(from ?? HUB, dir);
+  return s.segments.find((x) => x.x === target.x && x.y === target.y) || null;
 }

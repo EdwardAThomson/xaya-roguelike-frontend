@@ -17,7 +17,7 @@
  *       http://localhost:18380), ROG_HEADED=1, ROG_OUTBOUND, ROG_TICKS.
  */
 import { chromium } from "playwright";
-import { playAgent, sleep } from "./agentcore.mjs";
+import { playAgent, segStr, sleep } from "./agentcore.mjs";
 
 const URL = `${process.env.ROG_URL || "http://localhost:8000"}/?e2e=1`;
 const PROXY = process.env.ROG_PROXY || "http://localhost:18380";
@@ -35,24 +35,31 @@ async function gsp(method, params = []) {
   return (await r.json()).result;
 }
 
-/** Cross-player invariants checked against one snapshot of global state. */
+/**
+ * Cross-player invariants checked against one snapshot of global state.
+ *
+ * A segment IS its coordinate now, so "two segments share a coord" can only
+ * mean the GSP emitted a duplicate row; the check is kept as a cheap guard on
+ * that. Player location is validated by coordinate against the known segment
+ * set, with the hub (0,0) always legal (it is not in the segment list).
+ */
 function check(gs) {
   if (!gs) return;
-  const coords = new Map();
+  const coords = new Set();
   for (const s of gs.segments || []) {
-    const k = `${s.world_x},${s.world_y}`;
-    if (s.world_x === 0 && s.world_y === 0)
-      violations.push(`segment ${s.id} occupies hub coord (0,0)`);
+    const k = `${s.x},${s.y}`;
+    if (s.x === 0 && s.y === 0)
+      violations.push(`a segment occupies the hub coord (0, 0)`);
     if (coords.has(k))
-      violations.push(`two segments share coord (${k}): #${coords.get(k)} & #${s.id}`);
-    else coords.set(k, s.id);
+      violations.push(`two segments share coord (${k})`);
+    else coords.add(k);
   }
-  const ids = new Set((gs.segments || []).map(s => s.id));
   for (const p of gs.players || []) {
     if (p.hp < 0 || p.hp > p.max_hp)
       violations.push(`${p.name} hp out of range: ${p.hp}/${p.max_hp}`);
-    if (p.current_segment !== 0 && !ids.has(p.current_segment))
-      violations.push(`${p.name} is on nonexistent segment ${p.current_segment}`);
+    const pk = p.segment ? `${p.segment.x},${p.segment.y}` : null;
+    if (pk !== null && pk !== "0,0" && !coords.has(pk))
+      violations.push(`${p.name} is on nonexistent segment ${segStr(p.segment)}`);
   }
 }
 

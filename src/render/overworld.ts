@@ -4,6 +4,7 @@
  */
 
 import { SegmentNode } from "../game/overworld.js";
+import { SegmentRef, segKey, sameSeg, isHub, HUB } from "../net/rpc.js";
 
 /** One other player present on a segment, for the map presence tokens. */
 export interface PlayerMarker {
@@ -43,12 +44,13 @@ function depthColor(depth: number): string {
 
 export function drawOverworld(
   ctx: CanvasRenderingContext2D,
-  nodes: Map<number, SegmentNode>,
-  currentSegment: number,
-  selectedSegment: number | null,
+  nodes: Map<string, SegmentNode>,
+  currentSegment: SegmentRef,
+  selectedSegment: SegmentRef | null,
   canvasW: number,
   canvasH: number,
-  presence?: Map<number, PlayerMarker[]>,
+  /** Other players by segment coordinate key (see segKey). */
+  presence?: Map<string, PlayerMarker[]>,
   view?: OverworldView,
 ): void {
   ctx.fillStyle = "#0a0a0a";
@@ -83,7 +85,8 @@ export function drawOverworld(
   const nodeSize = NODE_SIZE * zoom;
 
   // Center the view on the current segment (or origin), then apply the pan.
-  const centerNode = nodes.get(currentSegment) ?? nodes.get(0) ?? nodes.values().next().value!;
+  const centerNode = nodes.get(segKey(currentSegment))
+      ?? nodes.get(segKey(HUB)) ?? nodes.values().next().value!;
   const offsetX = canvasW / 2 - centerNode.gridX * cell + panX;
   const offsetY = canvasH / 2 - centerNode.gridY * cell + panY;
 
@@ -98,10 +101,14 @@ export function drawOverworld(
     const x1 = node.gridX * cell + offsetX;
     const y1 = node.gridY * cell + offsetY;
 
-    for (const [_dir, neighborId] of Object.entries(node.links)) {
-      const neighbor = nodes.get(neighborId);
+    for (const [_dir, neighborSeg] of Object.entries(node.links)) {
+      const neighbor = nodes.get(segKey(neighborSeg));
       if (!neighbor) continue;
-      if (node.id > neighborId) continue;  // draw each link once
+      // Draw each link once, from the lower coordinate.
+      if (node.seg.x > neighborSeg.x
+          || (node.seg.x === neighborSeg.x && node.seg.y > neighborSeg.y)) {
+        continue;
+      }
 
       const x2 = neighbor.gridX * cell + offsetX;
       const y2 = neighbor.gridY * cell + offsetY;
@@ -124,9 +131,9 @@ export function drawOverworld(
       continue;
     }
 
-    const isOrigin = node.id === 0;
-    const isCurrent = node.id === currentSegment;
-    const isSelected = node.id === selectedSegment;
+    const isOrigin = isHub(node.seg);
+    const isCurrent = sameSeg(node.seg, currentSegment);
+    const isSelected = !!selectedSegment && sameSeg(node.seg, selectedSegment);
 
     // Node background.
     ctx.fillStyle = isOrigin ? "#1a2a1a" : "#1a1a2a";
@@ -170,7 +177,7 @@ export function drawOverworld(
     ctx.font = `bold ${15 * zoom}px monospace`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    const label = `(${node.worldX}, ${node.worldY})${node.provisional ? "?" : ""}`;
+    const label = `(${node.seg.x}, ${node.seg.y})${node.provisional ? "?" : ""}`;
     ctx.fillText(label, cx, cy - 8 * zoom);
 
     // Depth label (or "Provisional" hint).
@@ -190,7 +197,7 @@ export function drawOverworld(
     // along the bottom inside edge of the node (blue = in the hub/overworld
     // here, brighter cyan = currently in a dungeon on this segment).  Data
     // comes from the on-chain world state, so it updates every poll.
-    const markers = presence?.get(node.id);
+    const markers = presence?.get(segKey(node.seg));
     if (markers && markers.length) {
       const R = 8 * zoom;
       const gap = 18 * zoom;

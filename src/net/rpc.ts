@@ -7,6 +7,33 @@
 
 // --- Response types (match statejson.cpp output) ---
 
+/**
+ * A segment's identity: its world coordinate.  There is no id -- a segment
+ * IS the cell it occupies, on the wire, in the GSP database and here.  The
+ * hub is (0, 0).
+ */
+export interface SegmentRef {
+  x: number;
+  y: number;
+}
+
+/** Canonical string form of a coordinate, for use as a Map key. */
+export function segKey(seg: SegmentRef): string {
+  return `${seg.x},${seg.y}`;
+}
+
+/** True when two coordinates name the same segment. */
+export function sameSeg(a: SegmentRef, b: SegmentRef): boolean {
+  return a.x === b.x && a.y === b.y;
+}
+
+/** The hub, at the world origin. */
+export const HUB: SegmentRef = { x: 0, y: 0 };
+
+export function isHub(seg: SegmentRef): boolean {
+  return seg.x === 0 && seg.y === 0;
+}
+
 export interface PlayerInfo {
   name: string;
   level: number;
@@ -28,7 +55,7 @@ export interface PlayerInfo {
   registered_height: number;
   hp: number;
   max_hp: number;
-  current_segment: number;
+  segment: SegmentRef;
   in_channel: boolean;
   last_discover_height: number;
   effective_stats: {
@@ -49,37 +76,36 @@ export interface PlayerInfo {
     item_data?: string;
   }>;
   known_spells: string[];
-  active_visit: { visit_id: number; segment_id: number; entry_direction: string } | null;
+  active_visit:
+    { visit_id: number; segment: SegmentRef; entry_direction: string } | null;
 }
 
 export interface SegmentSummary {
-  id: number;
+  x: number;
+  y: number;
   discoverer: string;
   depth: number;
   max_players: number;
   created_height: number;
   visit_count: number;
-  world_x: number;
-  world_y: number;
   confirmed: boolean;
 }
 
 export interface SegmentInfo {
-  id: number;
+  x: number;
+  y: number;
   discoverer: string;
   seed: string;
   depth: number;
   max_players: number;
   created_height: number;
-  world_x: number;
-  world_y: number;
   confirmed: boolean;
   // Direction of the gate aligned to the neighbour this segment was
   // discovered from ("" = unconstrained). Used to regenerate the same
   // constrained layout the GSP replay uses.
   constraint_dir: string;
   gates: Record<string, { x: number; y: number }>;
-  links: Record<string, { to_segment: number; to_direction: string }>;
+  links: Record<string, { to: SegmentRef; to_direction: string }>;
   visits: Array<{
     id: number;
     initiator: string;
@@ -90,7 +116,7 @@ export interface SegmentInfo {
 
 export interface VisitSummary {
   id: number;
-  segment_id: number;
+  segment: SegmentRef;
   initiator: string;
   status: string;
   depth: number;
@@ -109,7 +135,7 @@ export interface FullState {
     visits_completed: number;
     hp: number;
     max_hp: number;
-    current_segment: number;
+    segment: SegmentRef;
     in_channel: boolean;
   }>;
   segments: SegmentSummary[];
@@ -222,8 +248,9 @@ export class RpcClient {
     return (await this.call("listsegments", [])) as SegmentSummary[];
   }
 
-  async getsegmentinfo(id: number): Promise<SegmentInfo | null> {
-    return (await this.call("getsegmentinfo", [id])) as SegmentInfo | null;
+  async getsegmentinfo(seg: SegmentRef): Promise<SegmentInfo | null> {
+    return (await this.call("getsegmentinfo",
+                            [seg.x, seg.y])) as SegmentInfo | null;
   }
 
   async listvisits(status: string): Promise<VisitSummary[]> {
