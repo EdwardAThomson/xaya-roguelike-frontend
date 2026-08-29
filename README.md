@@ -19,6 +19,7 @@ Browser-based frontend for the [Xaya Roguelike](https://github.com/EdwardAThomso
 - **Character sheet**: Tabbed in-game panel (Character, Inventory, Players, Help) with base and effective stats, XP progress, and mid-run equip of banked gear
 - **Crash-safe runs**: In-progress dungeon runs persist locally and deterministically resume on reload, and explored maps (fog of war) survive reloads too; server-side timeouts and death knock-backs auto-recover
 - **Multiplayer presence**: Other players shown as tokens on the overworld map and listed (active first) in a Players tab
+- **Account picker**: On a hosted deploy, Play opens a character chooser listing the characters this browser has already claimed, plus a "new character" form that registers on-chain; local dev keeps the name + Connect controls in the topbar
 - **Channel integration**: Enter dungeons using real on-chain player stats, exit with cryptographic replay proof
 - **Deterministic**: Dungeon generation and RNG verified identical to C++ backend (SHA-256 + MT19937)
 
@@ -94,7 +95,7 @@ src/
     moves.ts                Move submission client (devnet proxy)
     walletTransport.ts      Wallet (window.ethereum) move transport, dormant until Phase F4b
     validator.ts            Client-side pre-validation (mirrors moveparser.cpp)
-    pending.ts              Post-submit revalidation (detect silently-dropped moves)
+    pending.ts              Post-submit watcher: applied / rejected / pending, counted in blocks
   ui/
     modal.ts                Error/confirm dialogs
     overlay.ts              Overlay rendering
