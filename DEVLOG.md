@@ -1,5 +1,13 @@
 # Development Log
 
+## 2026-08-28
+
+A protocol-level refactor to follow the GSP dropping segment ids in favour of world coordinates. `player.segment`, `active_visit.segment` and every graph link now carry `{x, y}`, the segment cache is keyed by `"x,y"`, the `ec` move sends `x`/`y`, and `getsegmentinfo` takes two params; the hub is (0, 0). That rippled through the RPC client, connection poll, overworld layout and renderer, the validator, and the whole e2e agent harness. It needs the matching backend commit, since the move format itself changed.
+
+Alongside it, two fixes to how the client reports what happened to a submitted move. `waitFor` had been giving every move a flat five seconds and treating that deadline as proof of rejection, which against three-second blocks plus indexing lag is close to a coin flip and produced confident "the GSP did not apply it" messages for moves that were simply still in flight. The replacement `waitForMove` measures in blocks and separates applied, rejected and pending, so only a genuine rejection is reported as a refusal and a pending move says so while noting the run is intact. Separately, `doGateWalk` was validating before deciding whether to attach a settlement or take a free transit, so the two rules that depend on that decision could only ever fail server-side; it now computes the plan first and validates against it, covering "in a channel with no settlement" (what a lost browser session leaves behind) and "no transit out of a provisional segment". The commit also carries an in-progress account picker that was already sitting in the tree.
+
+**Decisions & notes:** Verified by typecheck, build, and a full self-playing browser agent loop (discover, run, confirm, return to hub) with no anomalies or GSP rejections. The honesty theme is the point of both move-reporting fixes: a timeout is not evidence of rejection, and a client-side validator that runs before the plan exists cannot mirror the backend's rules.
+
 ## 2026-08-27
 
 Presentation work for the hosted build: shared links to the deployed game were rendering as bare URLs with no preview. Added a 1200x630 (at 2x) Open Graph card under `assets/og-image.png`, composed from the existing in-dungeon screenshot with the title, tagline, and site URL burned in, and wired up the matching `og:*` and `twitter:*` meta tags in `index.html` along with a page description. The card copy pitches the three things that actually distinguish the game: an on-chain overworld, procedural dungeons, and runs settled on-chain with replay proofs.
