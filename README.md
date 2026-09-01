@@ -26,16 +26,19 @@ Browser-based frontend for the [Xaya Roguelike](https://github.com/EdwardAThomso
 ## Quick start
 
 ```bash
-# Install TypeScript (only dev dependency)
+# Install dev dependencies (TypeScript, plus Playwright for the e2e suite)
 npm install
 
 # Compile
 npx tsc
 
-# Serve
-python3 -m http.server 8000
+# Serve (sends no-store, so a reload always picks up the latest build)
+python3 serve.py 8000
 # Open http://localhost:8000
 ```
+
+`python3 -m http.server 8000` works too, but it sends no cache headers, so the
+browser can keep serving a stale `dist/` module graph after a rebuild.
 
 ### Standalone mode
 
@@ -51,7 +54,7 @@ python3 devnet/frontend_devnet.py
 
 # Terminal 2: Serve frontend
 cd ~/Projects/xaya-roguelike-frontend
-python3 -m http.server 8000
+python3 serve.py 8000
 ```
 
 1. Open `http://localhost:8000` and click **Play** on the title screen
@@ -68,6 +71,7 @@ python3 -m http.server 8000
 index.html                  Single-page app (canvas + sidebar)
 style.css                   Dark theme, monospace layout
 tsconfig.json               TypeScript config (strict, ES2020)
+serve.py                    Static server that disables browser caching
 src/
   main.ts                   Entry point, dual-mode app (overworld / dungeon)
   config.ts                 GSP URL, proxy URL, constants
@@ -117,6 +121,13 @@ Browser
        v
     XayaAccounts contract on Anvil (local EVM)
 ```
+
+On a hosted deploy the two endpoints are same-origin instead: `/gsp` relays the
+read-only GSP calls and `/proxy` carries moves, both behind a TLS reverse proxy,
+so the GSP RPC port is never public and there is no mixed-content or CORS
+problem. `src/config.ts` picks the defaults from the origin (localhost and
+`file://` get the fixed devnet ports), and `?gsp=` / `?proxy=` query params
+override them for test harnesses.
 
 **Overworld mode**: Fetches player info, segments, and visits from the GSP. Renders the segment graph centered on the player's current position. Sidebar shows stats, inventory, and action buttons (discover, enter dungeon).
 
