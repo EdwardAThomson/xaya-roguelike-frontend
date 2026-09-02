@@ -167,4 +167,18 @@ export class Connection {
     }
     void this.poll();
   }
+
+  /**
+   * One-shot, awaited re-fetch of the current player's info (updates state
+   * and notifies). Lets a caller make an authoritative decision right after
+   * submitting a move without depending on the pending watcher's block
+   * budget — used by registration, where the new player can take several
+   * blocks to become visible.
+   */
+  async refreshPlayer(): Promise<PlayerInfo | null> {
+    if (!this.rpc || !this.state.playerName) return this.state.player;
+    this.state.player = await this.rpc.getplayerinfo(this.state.playerName);
+    this.notify();
+    return this.state.player;
+  }
 }

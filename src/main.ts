@@ -1675,9 +1675,24 @@ async function doRegister(): Promise<void> {
   try {
     await moves.registerPlayer(connState.playerName);
 
-    const outcome = await waitForMove(connection, ({ player }) => player !== null);
+    // Registration can take several blocks to become visible on the hosted
+    // stack (name mint + the {r} move + the background miner advancing the
+    // height), and the watcher's `startHeight` is already stale by the time we
+    // begin watching. The 2-block rejection heuristic therefore produces false
+    // negatives here, so wait for the player to appear on a time budget (never
+    // declaring rejection from the block count), then re-check authoritatively
+    // once before reporting failure. A genuinely taken name is caught earlier:
+    // the proxy rejects the submission and we land in the catch block below.
+    const outcome = await waitForMove(
+      connection,
+      ({ player }) => player !== null,
+      { blocks: Infinity, timeoutMs: 20000 },
+    );
 
-    if (outcome === "applied") {
+    let registered = outcome === "applied";
+    if (!registered) registered = (await connection.refreshPlayer()) !== null;
+
+    if (registered) {
       addOverworldMessage("Player registered!", "pickup");
     } else {
       showErrorModal(
