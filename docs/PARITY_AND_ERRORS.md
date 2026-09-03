@@ -85,6 +85,14 @@ layers:
   failure. On a genuine rejection, `diagnoseRejection` in
   [src/main.ts](../src/main.ts) re-runs the validator to name the
   reason, falling back to a generic likely-causes message.
+  Registration is the one exception to the block rule: the watcher's
+  start height is already stale by the time watching begins (the name
+  mint and `{r}` move land first, and a background miner keeps
+  advancing the chain), so `doRegister` waits on a time budget instead
+  (`blocks: Infinity`, 20 s), then re-checks once via
+  `Connection.refreshPlayer()` before reporting failure. A genuinely
+  taken name is still caught earlier, when the proxy rejects the
+  submission.
 
 Action buttons are disabled while a move is in flight, so failed moves
 can't be stacked.
