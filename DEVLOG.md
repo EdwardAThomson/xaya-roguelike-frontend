@@ -1,5 +1,11 @@
 # Development Log
 
+## 2026-09-02
+
+One targeted fix for the hosted stack: registration was succeeding on-chain while the UI reported it as rejected. `doRegister` leaned on the pending watcher's two-block budget, but by the time `registerPlayer` had submitted and mined, the recorded start height was already stale and the hosted background miner kept advancing blocks, so the budget lapsed before the frontend ever observed the new player and the client confidently showed a rejection modal for a registration that had worked. The fix waits for the player on a 20-second time budget instead (block budget effectively infinite), never inferring rejection from block count alone, and before reporting failure re-checks authoritatively via a new `Connection.refreshPlayer()`. A genuinely taken name still fails fast, because the proxy rejects the submission outright and the error path catches it.
+
+**Decisions & notes:** Same honesty principle as the 2026-08-28 `waitForMove` work: a lapsed watching budget is evidence of nothing, and the client should only report rejection when it has positively confirmed it.
+
 ## 2026-08-28
 
 A protocol-level refactor to follow the GSP dropping segment ids in favour of world coordinates. `player.segment`, `active_visit.segment` and every graph link now carry `{x, y}`, the segment cache is keyed by `"x,y"`, the `ec` move sends `x`/`y`, and `getsegmentinfo` takes two params; the hub is (0, 0). That rippled through the RPC client, connection poll, overworld layout and renderer, the validator, and the whole e2e agent harness. It needs the matching backend commit, since the move format itself changed.
