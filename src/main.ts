@@ -9,15 +9,17 @@
  */
 
 import { WIDTH, HEIGHT } from "./game/dungeon.js";
-import { DungeonSession, GameAction } from "./game/session.js";
+import { DungeonSession, GameAction, PlayerSetup, PlayerState } from "./game/session.js";
+import { settleLogHash, toWireAction, toWireResults, computeClaims } from "./game/settle.js";
+import { CoopRunner, ProxyRelayTransport } from "./net/coop.js";
 import { PlayerStats } from "./game/combat.js";
 import { Camera } from "./render/camera.js";
 import { TILE_SIZE, drawTile, initSprites } from "./render/tiles.js";
-import { drawMonsters, drawGroundItems, drawPlayer } from "./render/entities.js";
+import { drawMonsters, drawGroundItems, drawPlayer, drawPartner } from "./render/entities.js";
 import { InputHandler, Direction, isEditableTarget } from "./game/input.js";
 import { FovMap } from "./render/fov.js";
 import { Connection, ConnectionState } from "./net/connection.js";
-import { PlayerInfo, SegmentInfo, SegmentRef, segKey, sameSeg, isHub, HUB }
+import { PlayerInfo, SegmentInfo, SegmentRef, VisitInfo, segKey, sameSeg, isHub, HUB }
   from "./net/rpc.js";
 import { Gate } from "./game/dungeon.js";
 import { MoveClient, createMoveClient } from "./net/moves.js";
@@ -121,6 +123,21 @@ let hubBuiltAtHub = false;
  *  it being shown again on every poll. */
 let reconnectPromptShown = false;
 
+// Co-op (multiplayer visit) state.  A co-op visit shows up on chain as
+// `active_visit` WITHOUT `in_channel` (solo `ec` runs set in_channel); the
+// run itself is driven by the CoopRunner over the relay transport.
+let coop: CoopRunner | null = null;
+/** Latest getvisitinfo for our open/active co-op visit (lobby + settle). */
+let coopVisit: VisitInfo | null = null;
+let coopSyncInFlight = false;
+let coopSettling = false;
+let coopSettleError: string | null = null;
+
+/** The local player's participant state (participant 0 outside co-op). */
+function me(): PlayerState {
+  return session!.players[coop ? coop.me : 0];
+}
+
 // Overworld mode state.
 /** Which sub-view of the Map is showing: the World graph or the Dungeon
  *  minimap.  Only meaningful while `mode === "overworld"`. */
@@ -185,6 +202,7 @@ const connection = new Connection((state: ConnectionState) => {
   updateConnectionUI();
   rebuildOverworld();
   ensureSessionFromChainState();
+  void syncCoopFromChain();
   render();
   updateSidebar();
 });
@@ -201,7 +219,7 @@ function runStorageKey(): string | null {
 }
 function persistRun(): void {
   const key = runStorageKey();
-  if (!key || !channelSession || !session) return;
+  if (!key || !channelSession || !session || coop) return;
   try {
     localStorage.setItem(key, JSON.stringify({
       visitId: channelVisitId,
@@ -238,8 +256,8 @@ function restoreRunFromLog(
   startChannelDungeon(seed, depth, seg, visitId, constraints, entryDirection);
   if (session && fov) {
     for (const a of savedActions) session.processAction(a);
-    fov.update(session.playerX, session.playerY, session.dungeon);
-    camera.centerOn(session.playerX, session.playerY);
+    fov.update(me().x, me().y, session.dungeon);
+    camera.centerOn(me().x, me().y);
     render();
     updateSidebar();
     persistRun();
@@ -270,6 +288,8 @@ function ensureSessionFromChainState(): void {
   // wrongly pops the reconnect modal mid-gate-walk (which then desyncs the
   // session and gets the next gate-walk rejected by the GSP).
   if (busy) return;
+  // Co-op runs are reconciled by syncCoopFromChain (they are not in_channel).
+  if (coop) return;
 
   // A live run can end server-side without the client acting: the 200-block
   // visit timeout force-settles it (a death), or a death/force-settle is
@@ -525,8 +545,8 @@ function ensureHubSessionIfAtHub(entryDirection: string = ""): void {
   fov = new FovMap();
   currentFogKey = "hub";
   fov.explored = persistentExplored("hub");
-  fov.update(session.playerX, session.playerY, session.dungeon);
-  camera.centerOn(session.playerX, session.playerY);
+  fov.update(me().x, me().y, session.dungeon);
+  camera.centerOn(me().x, me().y);
   hubBuiltAtHub = true;
 }
 
@@ -887,8 +907,8 @@ function newStandaloneDungeon(): void {
   session = new DungeonSession(seed, 1, stats, 100, 100,
     [{ itemId: "health_potion", quantity: 3 }]);
   fov = new FovMap();
-  fov.update(session.playerX, session.playerY, session.dungeon);
-  camera.centerOn(session.playerX, session.playerY);
+  fov.update(me().x, me().y, session.dungeon);
+  camera.centerOn(me().x, me().y);
   render();
   updateSidebar();
 }
@@ -954,12 +974,441 @@ function startChannelDungeon(
   fov = new FovMap();
   currentFogKey = "seg:" + segmentSeed;
   fov.explored = persistentExplored("seg:" + segmentSeed);
-  fov.update(session.playerX, session.playerY, session.dungeon);
-  camera.centerOn(session.playerX, session.playerY);
+  fov.update(me().x, me().y, session.dungeon);
+  camera.centerOn(me().x, me().y);
 
   setMode("dungeon");
 }
 
+
+// --- Co-op (multiplayer visits) --------------------------------------------
+// Backend docs/SPEC_multiplayer_coop.md.  Lobby: `v` hosts a visit on a
+// confirmed segment, `j` joins; the visit activates when full.  Run: both
+// clients build the same N-participant session and exchange their own
+// actions over the relay (net/coop.ts).  Settle: participant 0 submits `s`
+// once every other participant's `sc` (consent to the exact merged log) is
+// on chain.
+
+/** Canonical participant order: ascending UTF-8 byte order (spec section 1). */
+function canonicalNames(names: string[]): string[] {
+  const enc = new TextEncoder();
+  const bytes = new Map(names.map(n => [n, enc.encode(n)] as const));
+  return [...names].sort((a, b) => {
+    const x = bytes.get(a)!, y = bytes.get(b)!;
+    const len = Math.min(x.length, y.length);
+    for (let i = 0; i < len; i++) if (x[i] !== y[i]) return x[i] - y[i];
+    return x.length - y.length;
+  });
+}
+
+/**
+ * A participant's engine setup from their on-chain info: EFFECTIVE stats
+ * (what the GSP's ComputePlayerStats gives the replay), HP, carried potions,
+ * and the settled inventory ORDER BY rowid (the replay's SELECT order).
+ */
+function setupFromPlayer(p: PlayerInfo, entryDir: string = ""): PlayerSetup {
+  const stats: PlayerStats = {
+    level: p.level,
+    strength: p.effective_stats.strength,
+    dexterity: p.effective_stats.dexterity,
+    constitution: p.effective_stats.constitution,
+    intelligence: p.effective_stats.intelligence,
+    equipAttack: p.effective_stats.equip_attack,
+    equipDefense: p.effective_stats.equip_defense,
+  };
+  const potions: Array<{ itemId: string; quantity: number }> = [];
+  for (const item of p.inventory) {
+    if (item.slot === "bag" && (item.item_id === "health_potion" || item.item_id === "greater_health_potion")) {
+      potions.push({ itemId: item.item_id, quantity: item.quantity });
+    }
+  }
+  const inventory = p.inventory
+    .map(item => ({ rowid: item.rowid, itemId: item.item_id, slot: item.slot }))
+    .sort((a, b) => a.rowid - b.rowid);
+  return { name: p.name, stats, hp: p.hp, maxHp: p.max_hp, potions, inventory, entryDir };
+}
+
+/** Sleep helper for the settle polling loops. */
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+/**
+ * Reconciles the co-op state with the chain on every poll: starts the run
+ * when our visit turns active, and tears it down once the visit is gone
+ * (settled by the partner's submit, or force-settled by the timeout).
+ */
+async function syncCoopFromChain(): Promise<void> {
+  const p = connState?.player;
+  if (!p || !connection.rpc || coopSyncInFlight || busy) return;
+  const av = p.active_visit;
+  if (!av || p.in_channel) {
+    coopVisit = null;
+    if (coop && !coopSettling) await finishCoop();
+    return;
+  }
+  coopSyncInFlight = true;
+  try {
+    const v = await connection.rpc.getvisitinfo(av.visit_id);
+    coopVisit = v;
+    if (!v) return;
+    if (v.status === "active" && !coop && !coopSettling) {
+      await startCoopRun(v);
+    } else if (v.status !== "active" && v.status !== "open" && coop && !coopSettling) {
+      await finishCoop();
+    }
+  } catch (e) {
+    console.warn("co-op sync failed:", e);
+  } finally {
+    coopSyncInFlight = false;
+    updateSidebar();
+  }
+}
+
+/** Builds the shared N-participant session for an active visit and starts the runner. */
+async function startCoopRun(v: VisitInfo): Promise<void> {
+  if (!connState?.player || !connection.rpc || !moves) return;
+  const myName = connState.playerName;
+  const names = canonicalNames(v.participants);
+  const meIdx = names.indexOf(myName);
+  if (meIdx < 0) return;
+  const segInfo = connState.segments.get(segKey(v.segment));
+  if (!segInfo) return;  // segment cache not populated yet; next poll retries
+
+  // Every participant's setup, in canonical order.  Multiplayer visits have
+  // no entry gate: everyone uses the centre/ring spawn (spec section 2a).
+  const setups: PlayerSetup[] = [];
+  for (const n of names) {
+    const info = n === myName ? connState.player : await connection.rpc.getplayerinfo(n);
+    if (!info) return;
+    setups.push(setupFromPlayer(info));
+  }
+
+  const s = DungeonSession.createMulti(
+    segInfo.seed, segInfo.depth, setups, constraintsFor(segInfo));
+  session = s;
+  channelSession = true;
+  channelSegment = v.segment;
+  channelVisitId = v.id;
+  coopSettling = false;
+  coopSettleError = null;
+  reconnectPromptShown = false;
+
+  coop = new CoopRunner({
+    session: s,
+    me: meIdx,
+    names,
+    transport: new ProxyRelayTransport(DEFAULT_PROXY_URL, v.id, myName),
+    onChange: coopOnChange,
+    onNote: (text, kind) => s.addMessage(text, kind),
+  });
+
+  fov = new FovMap();
+  currentFogKey = "seg:" + segInfo.seed;
+  fov.explored = persistentExplored("seg:" + segInfo.seed);
+  const m = me();
+  fov.update(m.x, m.y, s.dungeon);
+  camera.centerOn(m.x, m.y);
+
+  const partners = names.filter(n => n !== myName).join(", ");
+  s.addMessage(`Co-op run with ${partners} at ${segName(v.segment)}. Rounds: one action each, then the monsters move.`, "info");
+  coop.start();
+  setMode("dungeon");
+}
+
+/** Runner callback: the shared state changed (own or partner action, relay error). */
+function coopOnChange(): void {
+  if (!coop || !session || !fov) return;
+  const m = me();
+  fov.update(m.x, m.y, session.dungeon);
+  camera.centerOn(m.x, m.y);
+  render();
+  updateSidebar();
+  saveCurrentFog();
+  if (session.gameOver && !coopSettling) void coopSettle();
+}
+
+/** Polls getvisitinfo until `pred(status)` holds or the timeout passes. */
+async function waitForVisitStatus(
+  visitId: number, pred: (status: string) => boolean, timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const v = await connection.rpc?.getvisitinfo(visitId);
+      if (!v || pred(v.status)) return true;
+    } catch { /* transient; keep polling */ }
+    await sleep(1000);
+  }
+  return false;
+}
+
+/**
+ * Mutual-consent settlement (spec section 7).  Participant 0 is the
+ * submitter by convention: everyone else sends `sc` with the hash of the
+ * merged log; the submitter waits until those confirms are on chain, then
+ * sends `s` with every participant's claims and the log.
+ */
+async function coopSettle(): Promise<void> {
+  if (!coop || !session || !moves || !connection.rpc || coopSettling) return;
+  const runner = coop;
+  const s = session;
+  const visitId = channelVisitId;
+  const myName = connState!.playerName;
+  coopSettling = true;
+  coopSettleError = null;
+
+  const hash = settleLogHash(visitId, s.mergedLog);
+  const results = toWireResults(s, runner.names);
+  const actions = s.mergedLog.map(toWireAction);
+  const others = runner.names.filter(n => n !== myName);
+
+  busy = true;
+  updateSidebar();
+  try {
+    if (runner.me === 0) {
+      s.addMessage("Run over. Waiting for your partner's confirmation...", "info");
+      updateSidebar();
+      const deadline = Date.now() + 180000;
+      let done = false;
+      while (Date.now() < deadline && coop === runner) {
+        const v = await connection.rpc.getvisitinfo(visitId);
+        if (!v || v.status !== "active") { done = true; break; }
+        const mismatch = others.find(n => v.confirms[n] && v.confirms[n] !== hash);
+        if (mismatch) {
+          throw new Error(
+            `${mismatch} confirmed a different action log than yours, so the ` +
+            `clients diverged and this run cannot settle. The visit will be ` +
+            `force-settled by the timeout.`);
+        }
+        if (others.every(n => v.confirms[n] === hash)) {
+          s.addMessage("Confirmation received. Settling on-chain...", "info");
+          updateSidebar();
+          await moves.settle(myName, visitId, results, actions);
+          const ok = await waitForVisitStatus(visitId, st => st !== "active", 60000);
+          if (!ok) throw new Error("The GSP did not settle the run in time. Retry the settlement.");
+          done = true;
+          break;
+        }
+        await sleep(1500);
+      }
+      if (!done) throw new Error("Timed out waiting for your partner's confirmation. Retry once they are back.");
+    } else {
+      s.addMessage("Run over. Sending your confirmation...", "info");
+      updateSidebar();
+      await moves.settleConfirm(myName, visitId, hash);
+      s.addMessage("Confirmed. Waiting for the host to settle...", "info");
+      updateSidebar();
+      const ok = await waitForVisitStatus(visitId, st => st !== "active", 180000);
+      if (!ok) throw new Error("Timed out waiting for the settlement. Retry to re-send your confirmation.");
+    }
+    busy = false;
+    coopSettling = false;
+    await finishCoop();
+  } catch (e) {
+    coopSettleError = e instanceof Error ? e.message : String(e);
+    showErrorModal("Settlement problem", coopSettleError);
+  } finally {
+    busy = false;
+    coopSettling = false;
+    updateSidebar();
+  }
+}
+
+/** Tears down a finished co-op run and re-syncs the view to the chain. */
+async function finishCoop(): Promise<void> {
+  const runner = coop;
+  if (!runner) return;
+  runner.stop();
+  coop = null;
+  const visitId = channelVisitId;
+
+  let summary = "";
+  try {
+    const v = await connection.rpc?.getvisitinfo(visitId);
+    if (v?.results) {
+      summary = v.results.map(r =>
+        `${r.name}: ${r.survived ? "survived" : "died"}, +${r.xp_gained} XP, ` +
+        `+${r.gold_gained} gold, ${r.kills} kill${r.kills === 1 ? "" : "s"}`).join("\n");
+    }
+  } catch { /* summary is best-effort */ }
+
+  channelSession = false;
+  session = null;
+  fov = null;
+  hubBuiltAtHub = false;
+  coopVisit = null;
+  coopSettling = false;
+  coopSettleError = null;
+  try { await connection.refreshPlayer(); } catch { /* next poll */ }
+  ensureHubSessionIfAtHub();
+  if (!session) setMode("overworld");
+  addOverworldMessage("Co-op run settled.", "info");
+  showModal({
+    title: "Co-op run settled",
+    message: summary || "The run has settled on-chain.",
+    variant: "info",
+  });
+  render();
+  updateSidebar();
+}
+
+/**
+ * True (after telling the player) when they are parked in an open or
+ * active co-op visit, which the GSP treats as "already in a visit": solo
+ * entries and gate-walks would be rejected until it resolves.
+ */
+function inCoopLobby(): boolean {
+  const p = connState?.player;
+  if (!p || p.in_channel || !p.active_visit) return false;
+  showErrorModal(
+    "You are in a co-op visit",
+    coopVisit?.status === "active"
+      ? "Your co-op run is active. Switch to the World view to play it."
+      : "You are waiting in co-op visit #" + p.active_visit.visit_id +
+        ". Solo dungeon entries are blocked until it starts and settles" +
+        (coopVisit && coopVisit.initiator !== p.name ? ", or you leave it from the Map sidebar." : "."));
+  return true;
+}
+
+/** Host a co-op visit on a confirmed segment (`v`). */
+async function doCoopHost(seg: SegmentRef): Promise<void> {
+  if (busy || !moves || !connState?.playerName) return;
+  const p = connState.player;
+  if (!p) return;
+  if (p.in_channel || p.active_visit) {
+    showErrorModal("Already in a run", "Finish or leave your current visit first.");
+    return;
+  }
+  const segInfo = connState.segments.get(segKey(seg));
+  if (!segInfo?.confirmed || isHub(seg)) {
+    showErrorModal("Segment not confirmed", "Co-op runs can only be hosted on confirmed segments.");
+    return;
+  }
+  busy = true;
+  updateSidebar();
+  try {
+    await moves.visit(connState.playerName, seg);
+    const outcome = await waitForMove(connection, ({ player }) =>
+      !!player?.active_visit && sameSeg(player.active_visit.segment, seg));
+    if (outcome === "applied") {
+      addOverworldMessage(`Hosting a co-op run at ${segName(seg)}. Waiting for a partner to join...`, "info");
+    } else {
+      showErrorModal(
+        "Host rejected",
+        "The GSP did not open the visit. The segment may already have an open or active visit, or you may already be in one.");
+    }
+  } catch (e) {
+    showErrorModal("Host failed", e instanceof Error ? e.message : String(e));
+  }
+  busy = false;
+  updateSidebar();
+  void syncCoopFromChain();
+}
+
+/** Join an open co-op visit (`j`); the run starts when the visit is full. */
+async function doCoopJoin(visitId: number): Promise<void> {
+  if (busy || !moves || !connState?.playerName) return;
+  const p = connState.player;
+  if (!p) return;
+  if (p.in_channel || p.active_visit) {
+    showErrorModal("Already in a run", "Finish or leave your current visit first.");
+    return;
+  }
+  busy = true;
+  updateSidebar();
+  try {
+    await moves.join(connState.playerName, visitId);
+    const outcome = await waitForMove(connection, ({ player }) =>
+      player?.active_visit?.visit_id === visitId);
+    if (outcome === "applied") {
+      addOverworldMessage(`Joined visit #${visitId}. The run starts as soon as the visit is full.`, "info");
+    } else {
+      showErrorModal("Join rejected", "The GSP did not add you to the visit. It may be full or no longer open.");
+    }
+  } catch (e) {
+    showErrorModal("Join failed", e instanceof Error ? e.message : String(e));
+  }
+  busy = false;
+  updateSidebar();
+  void syncCoopFromChain();
+}
+
+/** Leave an open visit (`lv`).  The initiator cannot leave their own visit. */
+async function doCoopLeave(visitId: number): Promise<void> {
+  if (busy || !moves || !connState?.playerName) return;
+  busy = true;
+  updateSidebar();
+  try {
+    await moves.leave(connState.playerName, visitId);
+    const outcome = await waitForMove(connection, ({ player }) => !!player && !player.active_visit);
+    if (outcome === "applied") addOverworldMessage(`Left visit #${visitId}.`, "info");
+    else showErrorModal("Leave rejected", "The GSP did not remove you from the visit (the host cannot leave; the visit may already be active).");
+  } catch (e) {
+    showErrorModal("Leave failed", e instanceof Error ? e.message : String(e));
+  }
+  busy = false;
+  updateSidebar();
+}
+
+/** Keyboard input during a co-op run: every action goes through the runner. */
+function handleCoopInput(action: string, dir?: Direction): void {
+  if (!coop || !session || !fov || session.gameOver) return;
+  const m = me();
+  if (m.dead || m.exited) return;  // spectating until the run ends
+
+  let a: GameAction | null = null;
+  switch (action) {
+    case "move":
+      if (dir) a = { type: "move", dx: dir.dx, dy: dir.dy };
+      break;
+    case "pickup":
+      a = { type: "pickup" };
+      break;
+    case "wait":
+      a = { type: "wait" };
+      break;
+    case "use_potion":
+      a = { type: "use", itemId: "health_potion" };
+      break;
+    case "gate": {
+      const g = gateAtPlayer();
+      if (g) confirmCoopExit(g.direction);
+      return;
+    }
+  }
+  if (!a) return;
+
+  if (coop.hasPendingOwn) {
+    session.addMessage("Your previous action is still waiting for the round to close.", "info");
+    updateSidebar();
+    return;
+  }
+  if (!coop.submitLocal(a)) return;  // invalid on our own turn: nothing sent
+
+  if (action === "move") {
+    const g = gateAtPlayer();
+    if (g) {
+      session.addMessage(`On the ${g.direction} gate. Press Enter to leave the dungeon.`, "info");
+      updateSidebar();
+    }
+  }
+}
+
+/** Confirmation before exiting a co-op run through a gate. */
+function confirmCoopExit(dir: string): void {
+  showConfirmModal({
+    title: `Leave through the ${dir} gate?`,
+    message:
+      "You exit the run now and keep what you found. The dungeon keeps going " +
+      "for your partner until they exit or die; then the whole run settles " +
+      "on-chain together, with kill rewards split by the damage each of you dealt.",
+    confirmLabel: "Exit",
+    cancelLabel: "Stay",
+    onConfirm: () => { coop?.submitLocal({ type: "gate" }); },
+    onCancel: () => {},
+  });
+}
 
 const OPPOSITE_DIRECTION: Record<string, string> = {
   north: "south", south: "north", east: "west", west: "east",
@@ -1084,6 +1533,7 @@ async function doTravel(dir: string): Promise<void> {
 
 async function doEnterChannel(seg: SegmentRef): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
+  if (inCoopLobby()) return;
   const ctx = validatorContext();
   if (!ctx) {
     showErrorModal("Not connected", "Connect to a GSP and register a player before entering a dungeon.");
@@ -1129,9 +1579,9 @@ async function doExitChannel(): Promise<void> {
   if (busy || !moves || !connState?.playerName || !session || !channelSession) return;
   // Snapshot gold before settle so we can report how much was lost on death.
   const goldBefore = connState.player?.gold ?? 0;
-  const survived = session.survived;
-  const earnedXp = session.totalXp;
-  const earnedGold = session.totalGold;
+  const survived = me().exited;
+  const earnedXp = me().totalXp;
+  const earnedGold = me().totalGold;
 
   busy = true;
   updateSidebar();
@@ -1140,7 +1590,7 @@ async function doExitChannel(): Promise<void> {
       survived,
       xp: earnedXp,
       gold: earnedGold,
-      kills: session.totalKills,
+      kills: me().totalKills,
     };
 
     // Convert TS actionLog to C++ format: "itemId" -> "item"; equip/unequip
@@ -1267,7 +1717,7 @@ async function doDiscover(dir: string): Promise<void> {
  */
 function effectiveHp(): { hp: number; max: number } {
   if (channelSession && session) {
-    return { hp: session.playerHp, max: session.playerMaxHp };
+    return { hp: me().hp, max: me().maxHp };
   }
   const p = connState?.player;
   return { hp: p?.hp ?? 0, max: p?.max_hp ?? 0 };
@@ -1283,13 +1733,13 @@ async function doUseItem(itemId: string): Promise<void> {
   // p.in_channel, which can lag a poll behind), so a mid-run drink is never
   // blocked by the stale on-chain "full HP" and never submits a bad on-chain use.
   if (itemId.includes("health_potion") && channelSession && session) {
-    if (session.playerHp >= session.playerMaxHp) {
+    if (me().hp >= me().maxHp) {
       showErrorModal("Already at full HP",
         "You are at full health, so this potion would be wasted. It is saved for when you are hurt.");
       return;
     }
     session.processAction({ type: "use", itemId });
-    if (fov) fov.update(session.playerX, session.playerY, session.dungeon);
+    if (fov) fov.update(me().x, me().y, session.dungeon);
     render();
     updateSidebar();
     persistRun();
@@ -1433,6 +1883,10 @@ async function doUnequip(rowid: number): Promise<void> {
  */
 function equipLocal(rowid: number, slot: string): void {
   if (busy || !session || session.gameOver) return;
+  if (coop) {
+    coop.submitLocal({ type: "equip", rowid, slot });
+    return;
+  }
   if (!session.equip(rowid, slot)) return;
   afterLocalLoadoutChange();
 }
@@ -1440,6 +1894,10 @@ function equipLocal(rowid: number, slot: string): void {
 /** Mid-run unequip: local, replayed, costs a turn (see equipLocal). */
 function unequipLocal(rowid: number): void {
   if (busy || !session || session.gameOver) return;
+  if (coop) {
+    coop.submitLocal({ type: "unequip", rowid });
+    return;
+  }
   if (!session.unequip(rowid)) return;
   afterLocalLoadoutChange();
 }
@@ -1447,7 +1905,7 @@ function unequipLocal(rowid: number): void {
 /** Refresh views after a local equip/unequip (the monster turn it ran may
  *  have moved monsters or changed the player's HP). */
 function afterLocalLoadoutChange(): void {
-  if (session && fov) fov.update(session.playerX, session.playerY, session.dungeon);
+  if (session && fov) fov.update(me().x, me().y, session.dungeon);
   render();
   updateSidebar();
   persistRun();
@@ -1497,6 +1955,7 @@ function doDiscard(rowid: number): void {
  */
 async function doGateWalk(dir: string): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
+  if (inCoopLobby()) return;
   const ctx = validatorContext();
   if (!ctx) return;
 
@@ -1529,9 +1988,9 @@ async function doGateWalk(dir: string): Promise<void> {
     const earnedRewards = session.actionLog.some(
         a => a.type === "pickup" || a.type === "use"
           || a.type === "equip" || a.type === "unequip")
-      || (session.totalXp ?? 0) > 0
-      || (session.totalKills ?? 0) > 0
-      || (session.totalGold ?? 0) > 0;
+      || (me().totalXp ?? 0) > 0
+      || (me().totalKills ?? 0) > 0
+      || (me().totalGold ?? 0) > 0;
     if (curConfirmed && !earnedRewards) {
       transit = true;
     } else {
@@ -1545,9 +2004,9 @@ async function doGateWalk(dir: string): Promise<void> {
       settlement = {
         results: {
           survived: true,
-          xp: session.totalXp,
-          gold: session.totalGold,
-          kills: session.totalKills,
+          xp: me().totalXp,
+          gold: me().totalGold,
+          kills: me().totalKills,
         },
         actions,
       };
@@ -1725,7 +2184,7 @@ function resize(): void {
   canvas.height = parent.clientHeight;
   camera.resize(canvas.width, canvas.height);
   if (session && mode === "dungeon") {
-    camera.centerOn(session.playerX, session.playerY);
+    camera.centerOn(me().x, me().y);
   }
   render();
 }
@@ -1828,7 +2287,15 @@ function renderDungeon(): void {
     session.groundItems.filter(gi => fov!.isVisible(gi.x, gi.y)));
   drawMonsters(ctx, camera,
     session.monsters.filter(m => m.alive && fov!.isVisible(m.x, m.y)));
-  drawPlayer(ctx, camera, session.playerX, session.playerY);
+  if (coop) {
+    for (let i = 0; i < session.players.length; i++) {
+      if (i === coop.me) continue;
+      const q = session.players[i];
+      if (q.dead || q.exited || !fov.isVisible(q.x, q.y)) continue;
+      drawPartner(ctx, camera, q.x, q.y);
+    }
+  }
+  drawPlayer(ctx, camera, me().x, me().y);
 
   ctx.font = "bold 14px monospace";
   ctx.textAlign = "center";
@@ -1860,6 +2327,10 @@ function handleGameInput(action: string, dir?: Direction): void {
   }
   if (!session || session.gameOver) return;
   if (busy) return;  // an on-chain action is in flight
+  if (coop) {
+    handleCoopInput(action, dir);
+    return;
+  }
 
   let gameAction: GameAction | null = null;
   switch (action) {
@@ -1892,8 +2363,8 @@ function handleGameInput(action: string, dir?: Direction): void {
 
   if (gameAction && session && fov) {
     session.processAction(gameAction);
-    fov.update(session.playerX, session.playerY, session.dungeon);
-    camera.centerOn(session.playerX, session.playerY);
+    fov.update(me().x, me().y, session.dungeon);
+    camera.centerOn(me().x, me().y);
     render();
     updateSidebar();
     persistRun();
@@ -1915,7 +2386,7 @@ new InputHandler(handleGameInput);
 function gateAtPlayer(): { x: number; y: number; direction: string } | null {
   if (!session) return null;
   for (const g of session.dungeon.gates) {
-    if (g.x === session.playerX && g.y === session.playerY) return g;
+    if (g.x === me().x && g.y === me().y) return g;
   }
   return null;
 }
@@ -1929,6 +2400,7 @@ function gateAtPlayer(): { x: number; y: number; direction: string } | null {
 function confirmGateWalk(dir: string): void {
   const p = connState?.player;
   if (!p) return;
+  if (inCoopLobby()) return;
 
   // Build a context-appropriate message based on what's on the other
   // side of the gate.
@@ -2038,6 +2510,28 @@ document.addEventListener("click", (e) => {
       break;
     case "exit-channel":
       doExitChannel();
+      break;
+    case "coop-host":
+      {
+        const bx = Number(target.dataset.segX);
+        const by = Number(target.dataset.segY);
+        if (Number.isInteger(bx) && Number.isInteger(by)) doCoopHost({ x: bx, y: by });
+      }
+      break;
+    case "coop-join":
+      doCoopJoin(Number(target.dataset.visit));
+      break;
+    case "coop-leave":
+      doCoopLeave(Number(target.dataset.visit));
+      break;
+    case "coop-exit":
+      {
+        const g = gateAtPlayer();
+        if (g) confirmCoopExit(g.direction);
+      }
+      break;
+    case "coop-settle-retry":
+      void coopSettle();
       break;
     case "back-to-overworld":
       channelSession = false;
@@ -2187,7 +2681,7 @@ function renderInventoryTabBody(): string {
 
   // On-chain inventory is the truth at the hub.  Equip/use/discard there are
   // chain moves the GSP rejects mid-channel.  Inside a dungeon the settled
-  // loadout is instead mutated LOCALLY (session.equipped/bag) as a replayed
+  // loadout is instead mutated LOCALLY (me().equipped/bag) as a replayed
   // action, so the bag/equipped view is driven by the live session and the
   // buttons fire local equip/unequip (not on-chain moves).
   const interactive = !!moves && !p.in_channel && !busy;
@@ -2211,9 +2705,9 @@ function renderInventoryTabBody(): string {
   const equipped = new Map<string, InvRow>();
   const bag: InvRow[] = [];
   if (inRun && session) {
-    for (const [slot, e] of session.equipped)
+    for (const [slot, e] of me().equipped)
       equipped.set(slot, { rowid: e.rowid, itemId: e.itemId, quantity: 1 });
-    for (const b of session.bag)
+    for (const b of me().bag)
       bag.push({ rowid: b.rowid, itemId: b.itemId, quantity: chainQty.get(b.rowid) ?? 1 });
   } else {
     for (const it of p.inventory)
@@ -2292,8 +2786,8 @@ function renderInventoryTabBody(): string {
 
   // Pending finds collected during the current run (settle on a winning exit).
   let pendingHtml = "";
-  if (channelSession && session && session.collected.length > 0) {
-    const rows = session.collected.filter(c => c.quantity > 0).map(c =>
+  if (channelSession && session && me().collected.length > 0) {
+    const rows = me().collected.filter(c => c.quantity > 0).map(c =>
       `<div class="inv-row inv-pending">
         <span class="inv-item-icon">${itemIcon(c.itemId)}</span>
         <span class="inv-item-name" style="color:${itemColor(c.itemId)}">${itemName(c.itemId)}${c.quantity > 1 ? ` x${c.quantity}` : ""}</span>
@@ -2316,7 +2810,7 @@ function renderInventoryTabBody(): string {
   let projectedNewRows = 0;
   if (inRun && session) {
     const seen = new Set(bagRows.map(i => i.item_id));
-    for (const c of session.collected) {
+    for (const c of me().collected) {
       if (c.quantity <= 0) continue;
       if (!seen.has(c.itemId)) { projectedNewRows++; seen.add(c.itemId); }
     }
@@ -2438,7 +2932,7 @@ function renderCharacterTabBody(): string {
   const hpColor = hpPct > 60 ? "#4a4" : hpPct > 30 ? "#aa4" : "#c44";
 
   const inRun = !!(channelSession && session && p.in_channel);
-  const pendingGold = inRun && session ? session.totalGold : 0;
+  const pendingGold = inRun && session ? me().totalGold : 0;
   const goldLine = pendingGold > 0
     ? `${p.gold} banked <span class="char-pending">(+${pendingGold} this run, settles on exit)</span>`
     : `${p.gold} banked`;
@@ -2457,10 +2951,10 @@ function renderCharacterTabBody(): string {
   // the on-chain effective stats.  Base attributes are the allocated values;
   // the gap between effective and base is the equipment contribution.
   const eff = (channelSession && session)
-    ? { str: session.stats.strength, dex: session.stats.dexterity,
-        con: session.stats.constitution, intl: session.stats.intelligence,
-        equipAtk: session.stats.equipAttack, equipDef: session.stats.equipDefense,
-        level: session.stats.level }
+    ? { str: me().stats.strength, dex: me().stats.dexterity,
+        con: me().stats.constitution, intl: me().stats.intelligence,
+        equipAtk: me().stats.equipAttack, equipDef: me().stats.equipDefense,
+        level: me().stats.level }
     : { str: es.strength, dex: es.dexterity, con: es.constitution,
         intl: es.intelligence, equipAtk: es.equip_attack, equipDef: es.equip_defense,
         level: p.level };
@@ -2695,7 +3189,7 @@ function goldHeaderHtml(): string {
   const p = connState?.player;
   if (!p) return "";
   const inRun = !!(channelSession && session && p.in_channel);
-  const pending = inRun && session ? session.totalGold : 0;
+  const pending = inRun && session ? me().totalGold : 0;
   const pendingHtml = pending > 0
     ? ` <span class="inv-gold-pending">(+${pending} this run)</span>`
     : "";
@@ -2757,6 +3251,63 @@ function updateOverworldStats(): void {
     ? "Safe Zone (Hub)"
     : `Segment ${segName(locSeg)} - Depth ${Math.abs(locSeg.x) + Math.abs(locSeg.y)}`;
   const locLabel = `${locName}${p.in_channel ? " · in dungeon" : ""}`;
+
+  // Co-op lobby: our pending visit, or ways to host / join one.
+  let coopLobby = "";
+  if (hasProxy && !p.in_channel) {
+    if (p.active_visit) {
+      const v = coopVisit;
+      const vid = p.active_visit.visit_id;
+      const where = segName(p.active_visit.segment);
+      if (!v || v.status === "open") {
+        const count = v ? v.participants.length : 1;
+        const max = v ? (connState?.segments.get(segKey(p.active_visit.segment))?.max_players ?? 2) : 2;
+        const isHost = !v || v.initiator === p.name;
+        coopLobby = `
+          <div style="margin-top:8px;border-top:1px solid #333;padding-top:8px">
+            <div style="color:#8cc;font-weight:bold">Co-op visit #${vid} at ${where}</div>
+            <div style="font-size:11px;color:#aaa">Waiting for players: ${count}/${max}. The run starts automatically when the visit is full.</div>
+            ${isHost
+              ? `<div style="font-size:11px;color:#888">You are hosting; the host cannot leave an open visit.</div>`
+              : `<button data-action="coop-leave" data-visit="${vid}" class="action-btn" ${busy ? "disabled" : ""}>Leave visit</button>`}
+          </div>`;
+      } else if (v.status === "active") {
+        coopLobby = `
+          <div style="margin-top:8px;border-top:1px solid #333;padding-top:8px">
+            <div style="color:#8cc;font-weight:bold">Co-op visit #${vid} at ${where} is active</div>
+            <div style="font-size:11px;color:#aaa">${coop ? "Switch to the World view to play." : "Starting the run..."}</div>
+          </div>`;
+      }
+    } else {
+      const open = (connState?.fullState?.visits ?? []).filter(v =>
+        v.status === "open" && v.initiator !== p.name && v.players < v.max_players);
+      let joinBtns = "";
+      if (open.length > 0) {
+        joinBtns = open.map(v =>
+          `<button data-action="coop-join" data-visit="${v.id}" class="action-btn action-enter" ${busy ? "disabled" : ""}>` +
+          `Join #${v.id} at ${segName(v.segment)} (${v.initiator}, ${v.players}/${v.max_players})</button>`).join(" ");
+      }
+      let hostBtn = "";
+      if (selectedSegment !== null && !isHub(selectedSegment)) {
+        const selInfo = connState?.segments.get(segKey(selectedSegment));
+        const taken = (connState?.fullState?.visits ?? []).some(v =>
+          sameSeg(v.segment, selectedSegment!) && (v.status === "open" || v.status === "active"));
+        if (selInfo?.confirmed && !taken) {
+          hostBtn = `<button data-action="coop-host" data-seg-x="${selectedSegment.x}" data-seg-y="${selectedSegment.y}"
+            class="action-btn action-enter" ${busy ? "disabled" : ""}>Host co-op run at ${segName(selectedSegment)}</button>`;
+        }
+      }
+      if (joinBtns || hostBtn) {
+        coopLobby = `
+          <div style="margin-top:8px;border-top:1px solid #333;padding-top:8px">
+            <div style="color:#8cc;font-weight:bold">Co-op</div>
+            <div style="font-size:11px;color:#888">Two players, one dungeon: rounds of one action each. Kill rewards split by damage dealt.</div>
+            ${hostBtn}
+            ${joinBtns}
+          </div>`;
+      }
+    }
+  }
 
   let selectedInfo = "";
   if (selectedSegment !== null) {
@@ -2864,7 +3415,7 @@ function updateOverworldStats(): void {
       <div class="hp-bar-text">HP ${p.hp} / ${p.max_hp}</div>
     </div>
     <div class="stat-row"><span class="stat-label">XP</span><span class="stat-value">${p.xp}</span></div>
-    <div class="stat-row"><span class="stat-label">Gold</span><span class="stat-value">${p.gold} (banked)${channelSession && session && p.in_channel && session.totalGold > 0 ? ` (+${session.totalGold} this run)` : ""}</span></div>
+    <div class="stat-row"><span class="stat-label">Gold</span><span class="stat-value">${p.gold} (banked)${channelSession && session && p.in_channel && me().totalGold > 0 ? ` (+${me().totalGold} this run)` : ""}</span></div>
     <div class="stat-row"><span class="stat-label">Location</span><span class="stat-value">${locLabel}</span></div>
     <div style="margin-top:6px;color:#888;font-size:11px">
       STR ${p.stats.strength} DEX ${p.stats.dexterity}
@@ -2881,6 +3432,7 @@ function updateOverworldStats(): void {
     ${potionBtn}
     ${discoverBtns}
     ${selectedInfo}
+    ${coopLobby}
     ${busy ? '<div style="margin-top:6px;color:#aa8">Processing...</div>' : ""}
   `;
 }
@@ -2960,7 +3512,7 @@ function updateDungeonStats(): void {
     return;
   }
 
-  const hpPct = Math.max(0, session.playerHp / session.playerMaxHp * 100);
+  const hpPct = Math.max(0, me().hp / me().maxHp * 100);
   const hpColor = hpPct > 60 ? "#4a4" : hpPct > 30 ? "#aa4" : "#c44";
 
   let channelLabel = "";
@@ -2977,16 +3529,54 @@ function updateDungeonStats(): void {
   // in a standalone dungeon there is no banked total, so show the run score.
   const bankedGold = connState?.player?.gold ?? 0;
   const goldLine = channelSession
-    ? `Gold: ${bankedGold} banked (+${session.totalGold} this run, settles on exit)`
-    : `Gold: ${session.totalGold} (this run)`;
+    ? `Gold: ${bankedGold} banked (+${me().totalGold} this run, settles on exit)`
+    : `Gold: ${me().totalGold} (this run)`;
+
+  // Co-op: partner, turn state, projected reward shares, relay health.
+  let coopBlock = "";
+  if (coop) {
+    const claims = computeClaims(session);
+    const rows = coop.names.map((n, i) => {
+      const q = session!.players[i];
+      const c = claims[i];
+      const state = q.dead ? "dead" : q.exited ? `exited ${q.exitGate}` : `HP ${q.hp}/${q.maxHp}`;
+      const you = i === coop!.me ? " (you)" : "";
+      return `<div class="stat-row"><span class="stat-label">${n}${you}</span>` +
+             `<span class="stat-value">${state} \u00b7 ${c.kills}K \u00b7 ~${c.xp}xp ~${c.gold}g</span></div>`;
+    }).join("");
+    let turnLine: string;
+    if (session.gameOver) turnLine = "Run over.";
+    else if (me().dead || me().exited) turnLine = "Spectating until the run ends.";
+    else if (coop.hasPendingOwn) turnLine = `Action sent; waiting for ${coop.waitingOn}...`;
+    else if (coop.myTurn) turnLine = "Your move.";
+    else turnLine = `Waiting for ${coop.waitingOn}...`;
+    const relay = coop.transportError
+      ? `<div style="color:#c44;font-size:11px">Relay: ${coop.transportError}</div>` : "";
+    coopBlock = `
+      <div style="margin-top:6px;border-top:1px solid #333;padding-top:6px">
+        <div style="color:#8cc;font-size:11px;font-weight:bold">Co-op run \u00b7 visit #${channelVisitId}</div>
+        ${rows}
+        <div style="color:#aaa;font-size:11px">${turnLine}</div>
+        <div style="color:#666;font-size:10px">Shares (~) are projected: kill XP and gold pools split by damage dealt, final at settlement.</div>
+        ${relay}
+      </div>`;
+  }
 
   let endButtons = "";
-  if (session.gameOver) {
+  if (session.gameOver && coop) {
+    if (coopSettleError) {
+      endButtons = `
+        <div style="margin-top:6px;color:#c44;font-size:11px">${coopSettleError}</div>
+        <button data-action="coop-settle-retry" class="action-btn action-enter" ${busy ? "disabled" : ""}>Retry settlement</button>`;
+    } else {
+      endButtons = `<div style="margin-top:6px;color:#888;font-size:11px">${coop.me === 0 ? "Settling on-chain (you submit once your partner confirms)..." : "Confirming on-chain; the host settles..."}</div>`;
+    }
+  } else if (session.gameOver) {
     if (channelSession) {
       // Survival exits are auto-settled by gw when the player walks
       // onto the gate.  Only deaths need a manual submit (gw refuses
       // survived=false; xc applies the death penalty).
-      if (!session.survived) {
+      if (!me().exited) {
         endButtons = `
           <button data-action="exit-channel" class="action-btn action-enter" ${busy ? "disabled" : ""}>
             Respawn at Hub
@@ -3005,20 +3595,21 @@ function updateDungeonStats(): void {
     <div>Turn: ${session.turnCount}</div>
     <div class="hp-bar">
       <div class="hp-bar-fill" style="width:${hpPct}%; background:${hpColor}"></div>
-      <div class="hp-bar-text">HP ${session.playerHp} / ${session.playerMaxHp}</div>
+      <div class="hp-bar-text">HP ${me().hp} / ${me().maxHp}</div>
     </div>
-    <div>XP: ${session.totalXp}</div>
+    <div>XP: ${me().totalXp}</div>
     <div>${goldLine}</div>
-    <div>Kills: ${session.totalKills} &nbsp; Depth: ${session.depth}</div>
-    ${session.gameOver
-      ? `<div style="margin-top:8px;color:${session.survived ? '#4a4' : '#c44'};font-weight:bold">
-           ${session.survived ? 'SURVIVED \u2014 Exited ' + session.exitGate : 'YOU DIED'}
+    <div>Kills: ${me().totalKills} &nbsp; Depth: ${session.depth}</div>
+    ${coopBlock}
+    ${(session.gameOver || (coop && (me().dead || me().exited)))
+      ? `<div style="margin-top:8px;color:${me().exited ? '#4a4' : '#c44'};font-weight:bold">
+           ${me().exited ? 'SURVIVED \u2014 Exited ' + me().exitGate : 'YOU DIED'}
          </div>${endButtons}`
       : ''}
     ${busy ? '<div style="margin-top:6px;color:#aa8">Submitting...</div>' : ""}
     <div style="margin-top:8px;font-size:11px;color:#888">
       WASD/Arrows: Move &nbsp; G: Pickup<br>
-      P: Potion &nbsp; Space: Wait &nbsp; Enter: Gate
+      P: Potion &nbsp; Space: Wait &nbsp; Enter: ${coop ? "Exit run (on a gate)" : "Gate"}
       ${!channelSession ? "<br>N: New Dungeon" : ""}
     </div>
   `;
@@ -3051,7 +3642,7 @@ function updateDungeonInventory(): void {
   }
   lines.push(`<div style="margin-top:6px;color:#888;font-size:11px">Bag: ${bagCount} / ${MAX_INVENTORY} (press I to manage)</div>`);
 
-  const pending = session ? session.collected.filter(l => l.quantity > 0) : [];
+  const pending = session ? me().collected.filter(l => l.quantity > 0) : [];
   if (pending.length > 0) {
     lines.push('<div style="margin-top:6px;color:#c9b24a;font-size:11px">Collected this run (pending):</div>');
     for (const l of pending) {
@@ -3095,14 +3686,14 @@ if (typeof location !== "undefined"
       height: connState?.currentHeight ?? null,
       player: connState?.player ?? null,
       session: session ? {
-        playerX: session.playerX,
-        playerY: session.playerY,
-        hp: session.playerHp,
-        maxHp: session.playerMaxHp,
-        survived: session.survived,
+        playerX: me().x,
+        playerY: me().y,
+        hp: me().hp,
+        maxHp: me().maxHp,
+        survived: me().exited,
         gameOver: session.gameOver,
         gates: session.dungeon.gates,
-        tileAtPlayer: session.dungeon.getTile(session.playerX, session.playerY),
+        tileAtPlayer: session.dungeon.getTile(me().x, me().y),
         monsters: session.monsters.filter(m => m.alive)
           .map(m => ({ x: m.x, y: m.y, hp: m.hp, attack: m.attack })),
         groundItems: session.groundItems
@@ -3115,6 +3706,24 @@ if (typeof location !== "undefined"
           }))
         : [],
       modal: document.getElementById("modal-root")?.textContent ?? null,
+      // Co-op runtime view (null outside a co-op run).
+      coop: coop ? {
+        me: coop.me,
+        names: coop.names,
+        myTurn: coop.myTurn,
+        pendingOwn: coop.hasPendingOwn,
+        waitingOn: coop.waitingOn,
+        turns: coop.session.turnCount,
+        logHash: settleLogHash(channelVisitId, coop.session.mergedLog),
+        claims: computeClaims(coop.session),
+        players: coop.session.players.map(q => ({
+          x: q.x, y: q.y, hp: q.hp, dead: q.dead, exited: q.exited, exitGate: q.exitGate,
+        })),
+        settling: coopSettling,
+        settleError: coopSettleError,
+        transportError: coop.transportError,
+      } : null,
+      coopVisit,
     }),
     // Static wall grid for pathfinding (call once per session).
     map: () => {
@@ -3140,6 +3749,12 @@ if (typeof location !== "undefined"
     exitChannel: () => doExitChannel(),
     gateWalk: (dir: string) => doGateWalk(dir),
     forfeit: (visitId: number) => doForfeitVisit(visitId),
+    // Co-op lobby / run control.
+    coopHost: (x: number, y: number) => doCoopHost({ x, y }),
+    coopJoin: (visitId: number) => doCoopJoin(visitId),
+    coopLeave: (visitId: number) => doCoopLeave(visitId),
+    coopExit: () => { coop?.submitLocal({ type: "gate" }); },
+    coopSync: () => syncCoopFromChain(),
     // Dungeon-level control: drives the same path as the keyboard.
     input: (action: string, dx?: number, dy?: number) =>
       handleGameInput(action,

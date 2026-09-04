@@ -68,13 +68,13 @@ export function drawGroundItems(ctx: CanvasRenderingContext2D, camera: Camera,
 }
 
 export function drawPlayer(ctx: CanvasRenderingContext2D, camera: Camera,
-                            x: number, y: number): void {
+                            x: number, y: number, color: string = "#daa520"): void {
   if (!camera.isVisible(x, y)) return;
 
   const [px, py] = camera.toScreen(x, y);
 
-  // Gold circle.
-  ctx.fillStyle = "#daa520";
+  // Gold circle (a co-op partner gets a different colour).
+  ctx.fillStyle = color;
   ctx.beginPath();
   ctx.arc(px + TILE_SIZE / 2, py + TILE_SIZE / 2,
           TILE_SIZE / 2 - 2, 0, Math.PI * 2);
@@ -86,4 +86,10 @@ export function drawPlayer(ctx: CanvasRenderingContext2D, camera: Camera,
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillText("@", px + TILE_SIZE / 2, py + TILE_SIZE / 2 + 1);
+}
+
+/** A co-op partner: same glyph as the player, teal instead of gold. */
+export function drawPartner(ctx: CanvasRenderingContext2D, camera: Camera,
+                            x: number, y: number): void {
+  drawPlayer(ctx, camera, x, y, "#3cb8b0");
 }

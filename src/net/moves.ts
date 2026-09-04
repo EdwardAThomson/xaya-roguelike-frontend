@@ -124,6 +124,47 @@ export class MoveClient {
     await this.transport.submitMove(name, { as: { stat } });
     await this.transport.mine();
   }
+
+  // --- Multiplayer visits (backend docs/SPEC_multiplayer_coop.md) ---
+
+  /** Open a co-op visit on a confirmed segment (the host is participant 1). */
+  async visit(name: string, seg: SegmentRef): Promise<void> {
+    await this.transport.submitMove(name, { v: { x: seg.x, y: seg.y } });
+    await this.transport.mine();
+  }
+
+  /** Join an open visit; the visit activates when it reaches max_players. */
+  async join(name: string, visitId: number): Promise<void> {
+    await this.transport.submitMove(name, { j: { id: visitId } });
+    await this.transport.mine();
+  }
+
+  /** Leave an open (not yet active) visit.  The initiator cannot leave. */
+  async leave(name: string, visitId: number): Promise<void> {
+    await this.transport.submitMove(name, { lv: { id: visitId } });
+    await this.transport.mine();
+  }
+
+  /**
+   * Consent to a merged log (spec section 7): `hash` is settleLogHash of
+   * the exact log the submitter will settle with.
+   */
+  async settleConfirm(name: string, visitId: number, hash: string): Promise<void> {
+    await this.transport.submitMove(name, { sc: { id: visitId, h: hash } });
+    await this.transport.mine();
+  }
+
+  /**
+   * Settle a multiplayer visit with every participant's claims and the
+   * merged action log.  Executes only once every OTHER participant's
+   * confirm for this log is on chain.
+   */
+  async settle(
+    name: string, visitId: number, results: object[], actions: object[],
+  ): Promise<void> {
+    await this.transport.submitMove(name, { s: { id: visitId, results, actions } });
+    await this.transport.mine();
+  }
 }
 
 /* ========== TEMPORARY DEMO AUTH: claim tokens ==========================
@@ -142,7 +183,7 @@ export class MoveClient {
 function claimKey(name: string): string {
   return `rog:claim:${name}`;
 }
-function loadClaim(name: string): string {
+export function loadClaim(name: string): string {
   try {
     return localStorage.getItem(claimKey(name)) ?? "";
   } catch {

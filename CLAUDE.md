@@ -11,9 +11,14 @@ npx tsc --watch        # recompile on change during development
 python3 -m http.server 8000   # serve the app; open http://localhost:8000
 ```
 
-There is no test framework, linter, or bundler. The only automated checks are
-the compiler and `src/game/hash_test.ts`, whose `runHashTests()` is meant to be
-called from the browser console.
+There is no test framework, linter, or bundler. The automated checks are the
+compiler, `npm test` (compiles, then runs `dist/game/parity_test.js`, the
+cross-language parity vectors pinned against the backend's tests, and
+`dist/net/coop_test.js`, a two-runner convergence test of the co-op runtime
+over an in-memory relay; exit code non-zero on any failure), the Playwright
+e2e suites under `tests/e2e/` (need a running devnet; `npm run coop` is the
+two-browser co-op run), and `src/game/hash_test.ts`, whose `runHashTests()`
+is meant to be called from the browser console.
 
 To run against a live backend (connected mode), start the devnet from the
 companion repo: `python3 devnet/frontend_devnet.py` in `~/Projects/xayaroguelike`
@@ -33,7 +38,8 @@ The parity-critical files — do not change behavior without verifying against t
 - `src/game/hash.ts` — SHA-256, matches backend `hash.hpp` byte-for-byte
 - `src/game/rng.ts` — MT19937; `nextInt` uses Lemire's method `(uint64(raw) * n) >> 32`, **not** `raw % n`
 - `src/game/dungeon.ts` — dungeon generation, verified tile-for-tile against `dungeon.cpp`
-- `src/game/session.ts` — port of `dungeongame.cpp`; seed format is `seed + ":game:" + depth`; records `actionLog[]` per turn for the `xc` settlement move
+- `src/game/session.ts` — port of `dungeongame.cpp`: an N-participant engine (rounds of one action per active participant in canonical order, then one monster pass); the solo surface (`playerX`, `processAction(action)`, ...) is a view of participant 0 and must stay byte-identical for N = 1. Seed format is `seed + ":game:" + depth`; records `actionLog[]` (solo) and `mergedLog[]` (with actor indices) for settlement
+- `src/game/settle.ts` — port of the settlement layer in `moveprocessor.cpp`: canonical action lines and the `sc` consent hash (`settleLogHash`), pro-rata `splitPool`, and `computeClaims` (what the GSP verifies a multiplayer `s` settle against). Spec: backend `docs/SPEC_multiplayer_coop.md`
 - `src/game/monsters.ts` / `src/game/items.ts` — databases must match the backend's
 
 `docs/PARITY_AND_ERRORS.md` is the parity audit and lists known gaps.
@@ -74,6 +80,17 @@ Layers under `src/`:
     here or the user gets no feedback on rejection
   - `pending.ts`: `waitFor` helpers to detect whether a submitted move actually
     took effect on-chain (post-submit revalidation)
+  - `coop.ts`: the multiplayer runtime. `CoopTransport` is the pluggable
+    message path between the players of one visit (`ProxyRelayTransport`
+    talks to the devnet proxy's `relay_send`/`relay_recv`; WebRTC and the
+    gamechannel broadcast come later); `CoopRunner` turns both players'
+    real-time inputs into one merged action log by applying participant i's
+    next action whenever the engine says it is i's turn. Each client sends
+    only its own actions; waits are self-authored after a grace window; an
+    action that is invalid by the time its turn comes is replaced by a wait
+    on both clients identically. `main.ts` hosts/joins visits from the Map
+    sidebar, starts the run when the visit turns active, and settles it
+    (participant 0 sends `s` once the others' `sc` confirms are on chain)
 - `ui/` — `modal.ts` (error/confirm dialogs) and `overlay.ts`.
 - `config.ts` — default GSP URL (`localhost:18332`), proxy URL (`localhost:18380`),
   poll interval, game id `"rog"`.

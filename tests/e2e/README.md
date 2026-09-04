@@ -75,6 +75,11 @@ the frontend built (`npx tsc` → `dist/`), the xayax venv at
   competing in the same world (`multi.mjs`), plus a referee that polls the
   global GSP state and asserts cross-player invariants (coordinate
   uniqueness, player/segment sanity). Env: `ROG_AGENTS` (default 3).
+- `npm run coop` — two-player co-op run (`coop.mjs`): one player confirms
+  a segment and hosts a visit, the other joins, both play the shared
+  dungeon over the proxy relay and exit; asserts identical merged-log hashes
+  on both clients, an on-chain `completed` visit with a result row per
+  player, and a clean teardown.
 - `npm run compete` — scripted competition tests with hard assertions
   (`compete.mjs`): coordinate race (one winner), provisional access +
   confirm-unlocks-others, concurrent reward/ownership isolation. Needs a

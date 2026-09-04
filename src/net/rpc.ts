@@ -125,6 +125,31 @@ export interface VisitSummary {
   players: number;
 }
 
+/** Full detail of one visit (`getvisitinfo`). */
+export interface VisitInfo {
+  id: number;
+  segment: SegmentRef;
+  initiator: string;
+  status: string;
+  created_height: number;
+  started_height?: number;
+  settled_height?: number;
+  depth: number;
+  seed: string;
+  /** In join order (NOT canonical order; sort by name for that). */
+  participants: string[];
+  /** Settlement confirms on file: participant name -> log hash. */
+  confirms: Record<string, string>;
+  results?: Array<{
+    name: string;
+    survived: boolean;
+    xp_gained: number;
+    gold_gained: number;
+    kills: number;
+    loot: Array<{ item_id: string; quantity: number }>;
+  }>;
+}
+
 export interface FullState {
   players: Array<{
     name: string;
@@ -251,6 +276,10 @@ export class RpcClient {
   async getsegmentinfo(seg: SegmentRef): Promise<SegmentInfo | null> {
     return (await this.call("getsegmentinfo",
                             [seg.x, seg.y])) as SegmentInfo | null;
+  }
+
+  async getvisitinfo(visitId: number): Promise<VisitInfo | null> {
+    return (await this.call("getvisitinfo", [visitId])) as VisitInfo | null;
   }
 
   async listvisits(status: string): Promise<VisitSummary[]> {

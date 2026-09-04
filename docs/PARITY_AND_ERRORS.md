@@ -17,8 +17,10 @@ UX** for moves the backend silently rejects.
 All three implementation passes below have since shipped:
 [src/net/validator.ts](../src/net/validator.ts) does the client-side
 pre-validation and [src/net/pending.ts](../src/net/pending.ts) the
-post-submission watch. The only feature gap still open is multi-player
-visit moves, which remain out of scope.
+post-submission watch. The multiplayer engine and settlement helpers
+(`session.ts`, `settle.ts`) mirror the backend's co-op spec and are
+pinned by the parity vectors in `npm test`; the co-op runtime, lobby and
+settle flow (`net/coop.ts`, `main.ts`) are covered by `npm run coop`.
 
 The on-chain stat-fabrication attack vector documented in
 `~/Projects/xayaroguelike/docs/SECURITY_Attack_and_Mitigations.md`
