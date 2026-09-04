@@ -30,6 +30,8 @@ export function drawDungeonMap(
   fov: FovMap | null,
   canvasW: number,
   canvasH: number,
+  /** Which participant is "you" (0 outside co-op). */
+  meIndex: number = 0,
 ): void {
   ctx.fillStyle = "#0a0a0a";
   ctx.fillRect(0, 0, canvasW, canvasH);
@@ -143,9 +145,23 @@ export function drawDungeonMap(
     ctx.fill();
   }
 
+  // Co-op partners still in the dungeon (teal), when in view.
+  for (let i = 0; i < session.players.length; i++) {
+    if (i === meIndex) continue;
+    const q = session.players[i];
+    if (q.dead || q.exited || !fov.isVisible(q.x, q.y)) continue;
+    const qx = offX + q.x * cell + cell / 2;
+    const qy = offY + q.y * cell + cell / 2;
+    ctx.fillStyle = "#3cb8b0";
+    ctx.beginPath();
+    ctx.arc(qx, qy, Math.max(2.5, cell / 1.4), 0, Math.PI * 2);
+    ctx.fill();
+  }
+
   // Player position (always drawn on top).
-  const px = offX + session.playerX * cell + cell / 2;
-  const py = offY + session.playerY * cell + cell / 2;
+  const meP = session.players[meIndex];
+  const px = offX + meP.x * cell + cell / 2;
+  const py = offY + meP.y * cell + cell / 2;
   ctx.fillStyle = "#daa520";
   ctx.beginPath();
   ctx.arc(px, py, Math.max(2.5, cell / 1.4), 0, Math.PI * 2);

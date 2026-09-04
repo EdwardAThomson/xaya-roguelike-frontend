@@ -52,6 +52,20 @@ export interface ValidatorContext {
 
 export const DISCOVERY_COOLDOWN_BLOCKS = 50;
 
+/**
+ * Mirror of moveparser.cpp::PlayerInActiveVisit as applied to the stat and
+ * inventory moves: the settlement replay runs with the on-chain stats and
+ * inventory as they are at settle time, so the GSP refuses to change them
+ * while any visit (a solo channel or an open/active co-op visit) exists.
+ */
+function inVisit(p: PlayerInfo, what: string): ValidationResult | null {
+  if (!p.active_visit) return null;
+  return err("in_visit", "In a visit",
+    p.in_channel
+      ? `You are in a dungeon. Exit it before ${what}.`
+      : `You are in co-op visit #${p.active_visit.visit_id}. Leave it, or play it out, before ${what}.`);
+}
+
 const OPPOSITE: Record<string, string> = {
   north: "south", south: "north", east: "west", west: "east",
 };
@@ -224,6 +238,8 @@ export function validateUseItem(
   ctx: ValidatorContext, itemId: string,
 ): ValidationResult {
   const p = ctx.player;
+  const blocked = inVisit(p, "using items from the bag");
+  if (blocked) return blocked;
   const item = p.inventory.find(
     (i) => i.item_id === itemId && i.slot === "bag",
   );
@@ -319,6 +335,8 @@ export function validateAllocateStat(
     return err("invalid_stat", "Unknown stat",
       `"${stat}" is not a valid stat. Use strength, dexterity, constitution, or intelligence.`);
   }
+  const blocked = inVisit(p, "allocating stat points");
+  if (blocked) return blocked;
   if (p.stat_points <= 0) {
     return err("no_stat_points", "No stat points available",
       "You don't have any stat points to allocate. Earn more by leveling up.");
@@ -339,6 +357,8 @@ export function validateEquip(
     return err("in_channel", "In a dungeon",
       "You are currently in a dungeon channel. Exit it before changing equipment.");
   }
+  const blocked = inVisit(p, "changing equipment");
+  if (blocked) return blocked;
   if (!EQUIP_SLOTS.has(slot)) {
     return err("invalid_slot", "Invalid slot",
       `"${slot}" is not a valid equipment slot.`);
@@ -364,6 +384,8 @@ export function validateUnequip(
     return err("in_channel", "In a dungeon",
       "You are currently in a dungeon channel. Exit it before changing equipment.");
   }
+  const blocked = inVisit(p, "changing equipment");
+  if (blocked) return blocked;
   const item = p.inventory.find((i) => i.rowid === rowid);
   if (!item) {
     return err("no_item", "Item not found",
@@ -385,6 +407,8 @@ export function validateDiscard(
     return err("in_channel", "In a dungeon",
       "You are currently in a dungeon channel. Exit it before discarding items.");
   }
+  const blocked = inVisit(p, "discarding items");
+  if (blocked) return blocked;
   const item = p.inventory.find((i) => i.rowid === rowid);
   if (!item) {
     return err("no_item", "Item not found",

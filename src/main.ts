@@ -1266,8 +1266,8 @@ function inCoopLobby(): boolean {
     coopVisit?.status === "active"
       ? "Your co-op run is active. Switch to the World view to play it."
       : "You are waiting in co-op visit #" + p.active_visit.visit_id +
-        ". Solo dungeon entries are blocked until it starts and settles" +
-        (coopVisit && coopVisit.initiator !== p.name ? ", or you leave it from the Map sidebar." : "."));
+        ". Solo dungeon entries are blocked until it starts and settles, " +
+        "or you leave it from the Map sidebar.");
   return true;
 }
 
@@ -1334,7 +1334,7 @@ async function doCoopJoin(visitId: number): Promise<void> {
   void syncCoopFromChain();
 }
 
-/** Leave an open visit (`lv`).  The initiator cannot leave their own visit. */
+/** Leave an open visit (`lv`); the host leaving cancels it for everyone. */
 async function doCoopLeave(visitId: number): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
   busy = true;
@@ -1343,7 +1343,7 @@ async function doCoopLeave(visitId: number): Promise<void> {
     await moves.leave(connState.playerName, visitId);
     const outcome = await waitForMove(connection, ({ player }) => !!player && !player.active_visit);
     if (outcome === "applied") addOverworldMessage(`Left visit #${visitId}.`, "info");
-    else showErrorModal("Leave rejected", "The GSP did not remove you from the visit (the host cannot leave; the visit may already be active).");
+    else showErrorModal("Leave rejected", "The GSP did not remove you from the visit; it may already be active.");
   } catch (e) {
     showErrorModal("Leave failed", e instanceof Error ? e.message : String(e));
   }
@@ -2199,7 +2199,8 @@ function render(): void {
       // The Dungeon tab reflects a real dungeon run only; the hub and the
       // no-session state fall through to the renderer's placeholder.
       drawDungeonMap(ctx, channelSession ? session : null,
-        channelSession ? fov : null, canvas.width, canvas.height);
+        channelSession ? fov : null, canvas.width, canvas.height,
+        coop ? coop.me : 0);
     } else {
       renderOverworld();
     }
@@ -3267,9 +3268,7 @@ function updateOverworldStats(): void {
           <div style="margin-top:8px;border-top:1px solid #333;padding-top:8px">
             <div style="color:#8cc;font-weight:bold">Co-op visit #${vid} at ${where}</div>
             <div style="font-size:11px;color:#aaa">Waiting for players: ${count}/${max}. The run starts automatically when the visit is full.</div>
-            ${isHost
-              ? `<div style="font-size:11px;color:#888">You are hosting; the host cannot leave an open visit.</div>`
-              : `<button data-action="coop-leave" data-visit="${vid}" class="action-btn" ${busy ? "disabled" : ""}>Leave visit</button>`}
+            <button data-action="coop-leave" data-visit="${vid}" class="action-btn" ${busy ? "disabled" : ""}>${isHost ? "Cancel visit" : "Leave visit"}</button>
           </div>`;
       } else if (v.status === "active") {
         coopLobby = `
@@ -3364,7 +3363,7 @@ function updateOverworldStats(): void {
 
   // Stat-point allocation (shown when player has points to spend).
   let statBtns = "";
-  if (p.stat_points > 0 && !p.in_channel && hasProxy) {
+  if (p.stat_points > 0 && !p.in_channel && !p.active_visit && hasProxy) {
     statBtns = `
       <div style="margin-top:6px;font-size:11px;color:#8c8">
         ${p.stat_points} stat point${p.stat_points === 1 ? "" : "s"} to spend:
@@ -3379,7 +3378,7 @@ function updateOverworldStats(): void {
 
   // Overworld potion-use button (shown when HP < max and player has potions).
   let potionBtn = "";
-  if (!p.in_channel && hasProxy && p.hp < p.max_hp) {
+  if (!p.in_channel && !p.active_visit && hasProxy && p.hp < p.max_hp) {
     const potion = p.inventory.find(
       i => i.slot === "bag"
         && (i.item_id === "health_potion" || i.item_id === "greater_health_potion")
