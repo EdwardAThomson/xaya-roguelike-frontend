@@ -1,6 +1,13 @@
 /**
  * Dungeon game session — TS port of dungeongame.cpp.
- * Manages a complete dungeon play session with turn-based actions.
+ *
+ * The engine holds N participants (docs/SPEC_multiplayer_coop.md in the
+ * backend repo): rounds of one action per active participant in canonical
+ * order, then one monster pass.  The long-standing single-player surface
+ * (playerX, playerHp, processAction(action), ...) is preserved as a view of
+ * participant 0, and with one participant every code path degenerates to
+ * the original solo behaviour byte-for-byte (this is consensus: settled
+ * solo runs re-verify against the C++ twin of this class).
  */
 
 import { MT19937 } from "./rng.js";
@@ -59,6 +66,67 @@ export interface GameAction {
   slot?: string;
 }
 
+/**
+ * One entry of a multiplayer merged action log: which participant
+ * (canonical index) performed the action.  Mirrors C++ LoggedAction.
+ */
+export interface LoggedAction {
+  actor: number;
+  action: GameAction;
+}
+
+/**
+ * Everything one participant carries into a run.  `stats` arrive ALREADY
+ * effective (base + entry-equipped bonuses).  Mirrors C++ PlayerSetup.
+ */
+export interface PlayerSetup {
+  stats: PlayerStats;
+  hp: number;
+  maxHp: number;
+  potions?: CollectedItem[];
+  inventory?: EntryInvItem[];
+  /** Entry gate direction ("" = spawn at the room centre / ring). */
+  entryDir?: string;
+  /** Display name for messages (not part of consensus). */
+  name?: string;
+}
+
+/**
+ * Per-participant state.  `loot` holds this-run pickups plus carried
+ * potions (never equippable); `bag` is the banked un-equipped inventory
+ * carried in.  Mirrors C++ PlayerState.
+ */
+export interface PlayerState {
+  x: number;
+  y: number;
+  hp: number;
+  maxHp: number;
+  stats: PlayerStats;
+  equipped: Map<string, EquippedItem>;
+  bag: BagItem[];
+  totalXp: number;
+  totalGold: number;
+  totalKills: number;
+  /**
+   * Total damage dealt to monsters, capped at each target's remaining HP
+   * (spec section 5): the basis of the pro-rata pool split at settlement.
+   */
+  damageDealt: number;
+  loot: CollectedItem[];
+  /**
+   * Items picked up during this run, tracked separately from `loot`
+   * (which is seeded with carried potions and decremented as they are
+   * drunk).  Display-only; not part of determinism.
+   */
+  collected: CollectedItem[];
+  dead: boolean;
+  exited: boolean;
+  /** Direction of the exit gate, or "". */
+  exitGate: string;
+  /** Display name for messages. */
+  name: string;
+}
+
 /** maxHp = BASE_HP + effectiveConstitution*HP_PER_CON (must match items.cpp). */
 const BASE_HP = 50;
 const HP_PER_CON = 5;
@@ -68,69 +136,130 @@ export interface GameMessage {
   type: "combat" | "pickup" | "info" | "warning";
 }
 
-export class DungeonSession {
-  dungeon: Dungeon;
-  rng: MT19937;
+function newPlayerState(name: string): PlayerState {
+  return {
+    x: 0, y: 0, hp: 0, maxHp: 0,
+    stats: {
+      level: 1, strength: 0, dexterity: 0, constitution: 0, intelligence: 0,
+      equipAttack: 0, equipDefense: 0,
+    },
+    equipped: new Map(), bag: [],
+    totalXp: 0, totalGold: 0, totalKills: 0, damageDealt: 0,
+    loot: [], collected: [],
+    dead: false, exited: false, exitGate: "",
+    name,
+  };
+}
 
-  playerX: number = 0;
-  playerY: number = 0;
-  playerHp: number = 100;
-  playerMaxHp: number = 100;
-  stats: PlayerStats;
+export class DungeonSession {
+  dungeon!: Dungeon;
+  rng!: MT19937;
+
+  /** Participants in canonical order (index = canonical index). */
+  players: PlayerState[] = [];
+
+  /** Next participant expected to act (round structure, spec section 2). */
+  curTurn: number = 0;
 
   monsters: Monster[] = [];
   groundItems: GroundItem[] = [];
-  loot: CollectedItem[] = [];
-
-  /**
-   * Settled loadout, seeded from the on-chain inventory at run start.
-   * `equipped` maps slot -> {rowid,itemId}; `bag` holds settled items not
-   * currently worn.  Mid-run equip/unequip mutates these plus the effective
-   * `stats` by deltas — this is the anti-cheat-verified, replayed loadout,
-   * kept SEPARATE from this-run `loot`/`collected` (which is not equippable).
-   */
-  equipped: Map<string, EquippedItem> = new Map();
-  bag: BagItem[] = [];
-
-  /**
-   * Items picked up during this run, tracked separately from `loot` (which
-   * is seeded with carried potions and decremented as they are drunk).
-   * Display-only: shown as "collected this run (pending)" until the run
-   * settles. Does not affect gameplay determinism.
-   */
-  collected: CollectedItem[] = [];
 
   turnCount: number = 0;
-  totalXp: number = 0;
-  totalGold: number = 0;
-  totalKills: number = 0;
+
+  /**
+   * Run-level kill-reward pools (spec sections 5/5a).  XP accrues here for
+   * every kill in addition to the killer's own counter; monster gold drops
+   * accrue here instead of the floor ONLY with more than one participant
+   * (solo keeps floor drops: solo replay must stay byte-identical).
+   */
+  xpPool: number = 0;
+  killGoldPool: number = 0;
 
   gameOver: boolean = false;
-  survived: boolean = false;
-  exitGate: string = "";
-  depth: number;
+  depth: number = 0;
 
   messages: GameMessage[] = [];
 
-  /** Action log for replay verification proof. */
+  /** Action log for replay verification proof (solo view, no actor). */
   actionLog: GameAction[] = [];
 
+  /** Same history with actor indices (multiplayer merged log). */
+  mergedLog: LoggedAction[] = [];
+
+  /**
+   * Single-player constructor (original API, byte-identical behaviour):
+   * builds one participant and delegates to the shared initialiser.
+   */
   constructor(seed: string, depth: number, stats: PlayerStats,
               hp: number, maxHp: number, startingPotions: CollectedItem[] = [],
               constraints: Gate[] = [], entryDirection: string = "",
               entryInventory: EntryInvItem[] = []) {
-    this.depth = depth;
-    this.stats = stats;
-    this.playerHp = hp;
-    this.playerMaxHp = maxHp;
+    this.init(seed, depth, [{
+      stats, hp, maxHp, potions: startingPotions, inventory: entryInventory,
+      entryDir: entryDirection,
+    }], constraints);
+  }
 
-    // Seed the settled loadout from the on-chain inventory (ORDER BY rowid
-    // asc on the caller side).  `stats` arrives ALREADY effective (base +
-    // entry-equipped); equip/unequip mutate it by deltas, never re-derived.
-    for (const e of entryInventory) {
-      if (e.slot === "bag") this.bag.push({ rowid: e.rowid, itemId: e.itemId });
-      else this.equipped.set(e.slot, { rowid: e.rowid, itemId: e.itemId });
+  /**
+   * Creates a session with N participants in canonical order.  Mirrors
+   * DungeonGame::CreateMulti.
+   */
+  static createMulti(seed: string, depth: number, setups: PlayerSetup[],
+                     constraints: Gate[] = []): DungeonSession {
+    const s: DungeonSession = Object.create(DungeonSession.prototype);
+    s.players = [];
+    s.curTurn = 0;
+    s.monsters = [];
+    s.groundItems = [];
+    s.turnCount = 0;
+    s.xpPool = 0;
+    s.killGoldPool = 0;
+    s.gameOver = false;
+    s.messages = [];
+    s.actionLog = [];
+    s.mergedLog = [];
+    s.init(seed, depth, setups, constraints);
+    return s;
+  }
+
+  /**
+   * Replays a merged multiplayer log on a fresh session.  Stops at the
+   * first invalid action (including a wrong-turn actor), like the GSP.
+   * Mirrors DungeonGame::ReplayMulti.
+   */
+  static replayMulti(seed: string, depth: number, setups: PlayerSetup[],
+                     log: LoggedAction[], constraints: Gate[] = []): DungeonSession {
+    const s = DungeonSession.createMulti(seed, depth, setups, constraints);
+    for (const la of log)
+      if (!s.processActionBy(la.actor, la.action)) break;
+    return s;
+  }
+
+  private init(seed: string, depth: number, setups: PlayerSetup[],
+               constraints: Gate[]): void {
+    this.depth = depth;
+    this.players = [];
+
+    for (let i = 0; i < setups.length; i++) {
+      const su = setups[i];
+      const p = newPlayerState(su.name ?? (setups.length > 1 ? `P${i}` : ""));
+      p.stats = su.stats;
+      p.hp = su.hp;
+      p.maxHp = su.maxHp;
+
+      // Seed the settled loadout from the on-chain inventory (ORDER BY rowid
+      // asc on the caller side).  `stats` arrives ALREADY effective (base +
+      // entry-equipped); equip/unequip mutate it by deltas, never re-derived.
+      for (const e of su.inventory ?? []) {
+        if (e.slot === "bag") p.bag.push({ rowid: e.rowid, itemId: e.itemId });
+        else p.equipped.set(e.slot, { rowid: e.rowid, itemId: e.itemId });
+      }
+      this.players.push(p);
     }
+
+    this.turnCount = 0;
+    this.gameOver = false;
+    this.curTurn = 0;
 
     // Seed the RNG — must match C++ dungeongame.cpp.
     this.rng = new MT19937(hashSeedSync(seed + ":game:" + depth));
@@ -140,50 +269,94 @@ export class DungeonSession {
     // layout matches the GSP replay byte-for-byte.
     this.dungeon = Dungeon.generate(seed, depth, constraints);
 
-    // Spawn: one tile inside the entry gate if we came in through one;
-    // otherwise at the first room's centre.  Must match DungeonGame::Create.
-    let spawned = false;
-    if (entryDirection) {
-      const gate = this.dungeon.gates.find(g => g.direction === entryDirection);
-      if (gate) {
-        this.playerX = gate.x;
-        this.playerY = gate.y;
-        if (entryDirection === "north") this.playerY += 1;
-        else if (entryDirection === "south") this.playerY -= 1;
-        else if (entryDirection === "east") this.playerX -= 1;
-        else if (entryDirection === "west") this.playerX += 1;
-        spawned = true;
-      }
-    }
-    if (!spawned) {
-      if (this.dungeon.rooms.length > 0) {
-        const r = this.dungeon.rooms[0];
-        this.playerX = r.x + Math.floor(r.width / 2);
-        this.playerY = r.y + Math.floor(r.height / 2);
-      } else {
-        this.playerX = Math.floor(WIDTH / 2);
-        this.playerY = Math.floor(HEIGHT / 2);
-      }
-    }
+    // Place the participants in canonical order (draws no RNG).
+    for (let i = 0; i < setups.length; i++)
+      this.placePlayer(i, setups[i].entryDir ?? "");
 
     // Spawn monsters (must match C++ order).
     this.monsters = spawnMonsters(this.dungeon, depth, this.rng);
-    // Remove monsters too close to player.
-    this.monsters = this.monsters.filter(m =>
-      Math.abs(m.x - this.playerX) + Math.abs(m.y - this.playerY) >= 5
-    );
+    // Remove any monster that spawned on or near any participant.
+    this.monsters = this.monsters.filter(m => {
+      for (const p of this.players)
+        if (Math.abs(m.x - p.x) + Math.abs(m.y - p.y) < 5) return false;
+      return true;
+    });
 
     // Spawn ground items.
     this.spawnGroundItems();
 
-    // Starting potions.
-    for (const p of startingPotions) {
-      if (p.quantity > 0) {
-        this.loot.push({ ...p });
+    // Each participant's starting potions go into their session loot.
+    for (let i = 0; i < setups.length; i++)
+      for (const pot of setups[i].potions ?? [])
+        if (pot.quantity > 0) this.players[i].loot.push({ ...pot });
+
+    this.addMessage("You enter the dungeon. Depth " + depth + ".", "info");
+  }
+
+  /**
+   * Places participant i on entry (spec section 2a): gate spawn, or a
+   * deterministic ring scan around the first room's centre.  Draws no RNG.
+   * Mirrors DungeonGame::PlacePlayer.
+   */
+  private placePlayer(i: number, entryDir: string): void {
+    const p = this.players[i];
+
+    if (entryDir) {
+      const gate = this.dungeon.gates.find(g => g.direction === entryDir);
+      if (gate) {
+        p.x = gate.x;
+        p.y = gate.y;
+        if (entryDir === "north") p.y += 1;
+        else if (entryDir === "south") p.y -= 1;
+        else if (entryDir === "east") p.x -= 1;
+        else if (entryDir === "west") p.x += 1;
+        return;
       }
     }
 
-    this.addMessage("You enter the dungeon. Depth " + depth + ".", "info");
+    let cx: number, cy: number;
+    if (this.dungeon.rooms.length > 0) {
+      const r = this.dungeon.rooms[0];
+      cx = r.x + Math.floor(r.width / 2);
+      cy = r.y + Math.floor(r.height / 2);
+    } else {
+      cx = Math.floor(WIDTH / 2);
+      cy = Math.floor(HEIGHT / 2);
+    }
+
+    const taken = (x: number, y: number): boolean => {
+      for (let j = 0; j < i; j++)
+        if (this.players[j].x === x && this.players[j].y === y) return true;
+      return false;
+    };
+
+    if (!taken(cx, cy)) {
+      p.x = cx;
+      p.y = cy;
+      return;
+    }
+
+    // Ring scan: radius 1, 2, ... with dy-major, dx-minor iteration; first
+    // in-bounds non-wall tile not occupied by an earlier participant.
+    for (let r = 1; r < Math.max(WIDTH, HEIGHT); r++) {
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+          const nx = cx + dx;
+          const ny = cy + dy;
+          if (nx < 0 || nx >= WIDTH || ny < 0 || ny >= HEIGHT) continue;
+          if (this.dungeon.getTile(nx, ny) === Tile.Wall) continue;
+          if (taken(nx, ny)) continue;
+          p.x = nx;
+          p.y = ny;
+          return;
+        }
+      }
+    }
+
+    // Unreachable in practice; keep the centre as a last resort.
+    p.x = cx;
+    p.y = cy;
   }
 
   /**
@@ -197,11 +370,15 @@ export class DungeonSession {
   ): DungeonSession {
     const s: DungeonSession = Object.create(DungeonSession.prototype);
     s.depth = 0;
-    s.stats = stats;
-    s.playerHp = hp;
-    s.playerMaxHp = maxHp;
     s.rng = new MT19937(0);  // unused — no procedural content
     s.dungeon = Dungeon.buildHub();
+
+    const p = newPlayerState("");
+    p.stats = stats;
+    p.hp = hp;
+    p.maxHp = maxHp;
+    s.players = [p];
+    s.curTurn = 0;
 
     // Spawn one tile inside the gate we entered through (so arriving back
     // at the hub feels like stepping through the door), else room centre.
@@ -210,48 +387,114 @@ export class DungeonSession {
     if (entryDirection) {
       const gate = s.dungeon.gates.find(g => g.direction === entryDirection);
       if (gate) {
-        s.playerX = gate.x;
-        s.playerY = gate.y;
-        if (entryDirection === "north") s.playerY += 1;
-        else if (entryDirection === "south") s.playerY -= 1;
-        else if (entryDirection === "east") s.playerX -= 1;
-        else if (entryDirection === "west") s.playerX += 1;
+        p.x = gate.x;
+        p.y = gate.y;
+        if (entryDirection === "north") p.y += 1;
+        else if (entryDirection === "south") p.y -= 1;
+        else if (entryDirection === "east") p.x -= 1;
+        else if (entryDirection === "west") p.x += 1;
         spawned = true;
       }
     }
     if (!spawned) {
       const r = s.dungeon.rooms[0];
-      s.playerX = r.x + Math.floor(r.width / 2);
-      s.playerY = r.y + Math.floor(r.height / 2);
+      p.x = r.x + Math.floor(r.width / 2);
+      p.y = r.y + Math.floor(r.height / 2);
     }
 
     s.monsters = [];
     s.groundItems = [];
-    s.loot = [];
-    s.equipped = new Map();
-    s.bag = [];
-    s.collected = [];
     s.turnCount = 0;
-    s.totalXp = 0;
-    s.totalGold = 0;
-    s.totalKills = 0;
+    s.xpPool = 0;
+    s.killGoldPool = 0;
     s.gameOver = false;
-    s.survived = false;
-    s.exitGate = "";
     s.messages = [];
     s.actionLog = [];
+    s.mergedLog = [];
     s.addMessage("Welcome to the hub. Walk to a gate to head out.", "info");
     return s;
   }
+
+  // --- Solo view of participant 0 (original API) -------------------------
+
+  get playerX(): number { return this.players[0].x; }
+  get playerY(): number { return this.players[0].y; }
+  get playerHp(): number { return this.players[0].hp; }
+  get playerMaxHp(): number { return this.players[0].maxHp; }
+  get stats(): PlayerStats { return this.players[0].stats; }
+  get equipped(): Map<string, EquippedItem> { return this.players[0].equipped; }
+  get bag(): BagItem[] { return this.players[0].bag; }
+  get loot(): CollectedItem[] { return this.players[0].loot; }
+  get collected(): CollectedItem[] { return this.players[0].collected; }
+  get totalXp(): number { return this.players[0].totalXp; }
+  get totalGold(): number { return this.players[0].totalGold; }
+  get totalKills(): number { return this.players[0].totalKills; }
+  get survived(): boolean { return this.players[0].exited; }
+  get exitGate(): string { return this.players[0].exitGate; }
+
+  // --- Multiplayer accessors ---------------------------------------------
+
+  get playerCount(): number { return this.players.length; }
+  /** Next participant expected to act. */
+  get nextActor(): number { return this.curTurn; }
+  isPlayerActive(i: number): boolean { return this.isActive(i); }
 
   addMessage(text: string, type: GameMessage["type"]): void {
     this.messages.push({ text, type });
     if (this.messages.length > 50) this.messages.shift();
   }
 
+  /** "You" in solo, the participant's name otherwise. */
+  private who(i: number): string {
+    return this.players.length > 1 ? this.players[i].name : "You";
+  }
+
+  private isActive(i: number): boolean {
+    const p = this.players[i];
+    return !p.dead && !p.exited;
+  }
+
+  private firstActive(): number {
+    for (let i = 0; i < this.players.length; i++)
+      if (this.isActive(i)) return i;
+    return -1;
+  }
+
+  private nextActiveAfter(i: number): number {
+    for (let j = i + 1; j < this.players.length; j++)
+      if (this.isActive(j)) return j;
+    return -1;
+  }
+
+  /** Active participant occupying (x,y), or -1. */
+  private playerAt(x: number, y: number): number {
+    for (let i = 0; i < this.players.length; i++)
+      if (this.isActive(i) && this.players[i].x === x && this.players[i].y === y)
+        return i;
+    return -1;
+  }
+
+  /** Solo shorthand: participant 0 acts (original API). */
   processAction(action: GameAction): boolean {
+    return this.processActionBy(0, action);
+  }
+
+  /**
+   * Processes one action by participant `actor`.  Returns false (turn not
+   * consumed, nothing logged) if the action is invalid or it is not this
+   * participant's turn under the round structure.  After the last active
+   * participant of a round acts, monsters take their turn.  Mirrors
+   * DungeonGame::ProcessAction.
+   */
+  processActionBy(actor: number, action: GameAction): boolean {
     if (this.gameOver) return false;
 
+    // Round structure (spec section 2): only the expected participant may
+    // act.  With one participant this is always index 0.
+    if (actor < 0 || actor >= this.players.length) return false;
+    if (actor !== this.curTurn || !this.isActive(actor)) return false;
+
+    const p = this.players[actor];
     let valid = false;
 
     switch (action.type) {
@@ -261,66 +504,77 @@ export class DungeonSession {
         if (Math.abs(dx) > 1 || Math.abs(dy) > 1 || (dx === 0 && dy === 0))
           return false;
 
-        const nx = this.playerX + dx;
-        const ny = this.playerY + dy;
+        const nx = p.x + dx;
+        const ny = p.y + dy;
 
         // Attack monster?
         const target = this.monsterAt(nx, ny);
         if (target) {
-          const result = playerAttackMonster(this.stats, target.defense, this.rng);
+          const result = playerAttackMonster(p.stats, target.defense, this.rng);
           if (result.hit) {
+            // Contribution is capped at the target's remaining HP so
+            // overkill does not inflate the pro-rata split (spec section 5).
+            p.damageDealt += Math.min(result.damage, target.hp);
             target.hp -= result.damage;
             const critText = result.critical ? " CRIT!" : "";
             this.addMessage(
-              `You hit ${target.name} for ${result.damage}${critText}`, "combat");
+              `${this.who(actor)} hit ${target.name} for ${result.damage}${critText}`, "combat");
             if (target.hp <= 0) {
               target.alive = false;
               // XP per kill scales with depth so pushing deeper levels
-              // faster: floor(xpValue * (1 + (depth-1) * 0.15)).
+              // faster: floor(xpValue * (1 + (depth-1) * 0.15)).  The award
+              // goes to the killer's own counter (what solo claims verify
+              // against) AND the run pool (the multiplayer pro-rata split).
               const xpGain = Math.floor(
                 target.xpValue * (1.0 + (this.depth - 1) * 0.15));
-              this.totalXp += xpGain;
-              this.totalKills++;
+              p.totalXp += xpGain;
+              this.xpPool += xpGain;
+              p.totalKills++;
               this.addMessage(`${target.name} defeated! +${xpGain} XP`, "combat");
 
               // Monster drops (35% chance).
               if (this.rng.nextRange(1, 100) <= 35) {
                 const dropRoll = this.rng.nextRange(1, 100);
-                let dropId: string;
-                let dropQty: number;
-
                 if (dropRoll <= 50) {
-                  dropId = "gold_coins";
-                  dropQty = this.rng.nextRange(1, 5 + this.depth * 3);
+                  // Gold.  Multiplayer: to the kill-gold pool for the
+                  // pro-rata split.  Solo: to the floor, byte-identical to
+                  // the original behaviour.
+                  const amt = this.rng.nextRange(1, 5 + this.depth * 3);
+                  if (this.players.length > 1) {
+                    this.killGoldPool += amt;
+                    this.addMessage(`${target.name} dropped ${amt} gold into the party pool`, "pickup");
+                  } else {
+                    this.groundItems.push({
+                      x: target.x, y: target.y, itemId: "gold_coins", quantity: amt,
+                    });
+                    this.addMessage(`${target.name} dropped Gold Coins!`, "pickup");
+                  }
                 } else if (dropRoll <= 75) {
-                  dropId = "health_potion";
-                  dropQty = 1;
+                  this.groundItems.push({
+                    x: target.x, y: target.y, itemId: "health_potion", quantity: 1,
+                  });
+                  this.addMessage(`${target.name} dropped Health Potion!`, "pickup");
                 } else {
+                  // Random equipment.
                   const spawnable = getSpawnableItems(this.depth);
                   if (spawnable.length > 0) {
-                    dropId = spawnable[this.rng.nextInt(spawnable.length)].id;
-                    dropQty = 1;
-                  } else {
-                    dropId = "health_potion";
-                    dropQty = 1;
+                    const dropId = spawnable[this.rng.nextInt(spawnable.length)].id;
+                    this.groundItems.push({
+                      x: target.x, y: target.y, itemId: dropId, quantity: 1,
+                    });
+                    const def = lookupItem(dropId);
+                    this.addMessage(`${target.name} dropped ${def?.name ?? dropId}!`, "pickup");
                   }
                 }
-
-                this.groundItems.push({
-                  x: target.x, y: target.y,
-                  itemId: dropId, quantity: dropQty,
-                });
-                const def = lookupItem(dropId);
-                this.addMessage(`${target.name} dropped ${def?.name ?? dropId}!`, "pickup");
               }
             }
           } else {
-            this.addMessage(`You miss ${target.name}!`, "combat");
+            this.addMessage(`${this.who(actor)} miss${this.players.length > 1 ? "es" : ""} ${target.name}!`, "combat");
           }
           valid = true;
-        } else if (this.isWalkable(nx, ny)) {
-          this.playerX = nx;
-          this.playerY = ny;
+        } else if (this.isWalkable(nx, ny, actor)) {
+          p.x = nx;
+          p.y = ny;
           valid = true;
         } else {
           return false;
@@ -329,29 +583,29 @@ export class DungeonSession {
       }
 
       case "pickup": {
-        const item = this.itemAt(this.playerX, this.playerY);
+        const item = this.itemAt(p.x, p.y);
         if (!item) return false;
 
         if (item.itemId === "gold_coins") {
-          this.totalGold += item.quantity;
-          this.addMessage(`Picked up ${item.quantity} gold`, "pickup");
+          p.totalGold += item.quantity;
+          this.addMessage(`${this.who(actor)} picked up ${item.quantity} gold`, "pickup");
         } else {
-          const existing = this.loot.find(l => l.itemId === item.itemId);
+          const existing = p.loot.find(l => l.itemId === item.itemId);
           if (existing) {
             existing.quantity += item.quantity;
           } else {
-            this.loot.push({ itemId: item.itemId, quantity: item.quantity });
+            p.loot.push({ itemId: item.itemId, quantity: item.quantity });
           }
-          const got = this.collected.find(l => l.itemId === item.itemId);
+          const got = p.collected.find(l => l.itemId === item.itemId);
           if (got) got.quantity += item.quantity;
-          else this.collected.push({ itemId: item.itemId, quantity: item.quantity });
+          else p.collected.push({ itemId: item.itemId, quantity: item.quantity });
           const def = lookupItem(item.itemId);
-          this.addMessage(`Picked up ${def?.name ?? item.itemId}`, "pickup");
+          this.addMessage(`${this.who(actor)} picked up ${def?.name ?? item.itemId}`, "pickup");
         }
 
+        const px = p.x, py = p.y, pickedId = item.itemId;
         this.groundItems = this.groundItems.filter(gi =>
-          !(gi.x === this.playerX && gi.y === this.playerY
-            && gi.itemId === item.itemId));
+          !(gi.x === px && gi.y === py && gi.itemId === pickedId));
         valid = true;
         break;
       }
@@ -361,29 +615,29 @@ export class DungeonSession {
         const def = lookupItem(itemId);
         if (!def || !def.consumable || def.healAmount <= 0) return false;
 
-        const lootEntry = this.loot.find(l => l.itemId === itemId && l.quantity > 0);
+        const lootEntry = p.loot.find(l => l.itemId === itemId && l.quantity > 0);
         if (!lootEntry) return false;
 
         lootEntry.quantity--;
-        this.playerHp = Math.min(this.playerHp + def.healAmount, this.playerMaxHp);
-        this.addMessage(`Used ${def.name}. HP restored by ${def.healAmount}.`, "info");
+        p.hp = Math.min(p.hp + def.healAmount, p.maxHp);
+        this.addMessage(`${this.who(actor)} used ${def.name}. HP restored by ${def.healAmount}.`, "info");
         valid = true;
         break;
       }
 
       case "gate": {
-        if (this.dungeon.getTile(this.playerX, this.playerY) !== Tile.Gate)
+        if (this.dungeon.getTile(p.x, p.y) !== Tile.Gate)
           return false;
 
         for (const gate of this.dungeon.gates) {
-          if (gate.x === this.playerX && gate.y === this.playerY) {
-            this.exitGate = gate.direction;
+          if (gate.x === p.x && gate.y === p.y) {
+            p.exitGate = gate.direction;
             break;
           }
         }
-        this.gameOver = true;
-        this.survived = true;
-        this.addMessage(`You exit through the ${this.exitGate} gate!`, "info");
+        p.exited = true;
+        if (this.firstActive() === -1) this.gameOver = true;
+        this.addMessage(`${this.who(actor)} exit${this.players.length > 1 ? "s" : ""} through the ${p.exitGate} gate!`, "info");
         valid = true;
         break;
       }
@@ -393,25 +647,25 @@ export class DungeonSession {
         const slot = action.slot ?? "";
         // 1. Must be a settled bag item (this-run pickups live in `loot`, not
         //    `bag`, so equipping them is auto-rejected).
-        const idx = this.bag.findIndex(b => b.rowid === rowid);
+        const idx = p.bag.findIndex(b => b.rowid === rowid);
         if (idx < 0) return false;
-        const bagItem = this.bag[idx];
+        const bagItem = p.bag[idx];
         // 2. Item def must exist and its slot must match the requested slot.
         const def = lookupItem(bagItem.itemId);
         if (!def || def.slot === "" || def.slot !== slot) return false;
         // 3. Displace whatever occupies the slot: subtract its bonuses, bag it.
-        const old = this.equipped.get(slot);
+        const old = p.equipped.get(slot);
         if (old) {
-          this.applyItemStats(old.itemId, -1);
-          this.bag.push({ rowid: old.rowid, itemId: old.itemId });
+          this.applyItemStats(p, old.itemId, -1);
+          p.bag.push({ rowid: old.rowid, itemId: old.itemId });
         }
         // 4. Remove the new item from the bag; add its bonuses; equip it.
-        this.bag.splice(idx, 1);
-        this.applyItemStats(bagItem.itemId, +1);
-        this.equipped.set(slot, { rowid: bagItem.rowid, itemId: bagItem.itemId });
+        p.bag.splice(idx, 1);
+        this.applyItemStats(p, bagItem.itemId, +1);
+        p.equipped.set(slot, { rowid: bagItem.rowid, itemId: bagItem.itemId });
         // 5. Recompute maxHp cap (raise = no heal; lower = clamp current hp).
-        this.recomputeMaxHp();
-        this.addMessage(`Equipped ${def.name}.`, "info");
+        this.recomputeMaxHp(p);
+        this.addMessage(`${this.who(actor)} equipped ${def.name}.`, "info");
         valid = true;
         break;
       }
@@ -419,17 +673,17 @@ export class DungeonSession {
       case "unequip": {
         const rowid = action.rowid ?? -1;
         let foundSlot: string | null = null;
-        for (const [s, it] of this.equipped) {
+        for (const [s, it] of p.equipped) {
           if (it.rowid === rowid) { foundSlot = s; break; }
         }
         if (foundSlot === null) return false;
-        const it = this.equipped.get(foundSlot)!;
-        this.applyItemStats(it.itemId, -1);
-        this.bag.push({ rowid: it.rowid, itemId: it.itemId });
-        this.equipped.delete(foundSlot);
-        this.recomputeMaxHp();
+        const it = p.equipped.get(foundSlot)!;
+        this.applyItemStats(p, it.itemId, -1);
+        p.bag.push({ rowid: it.rowid, itemId: it.itemId });
+        p.equipped.delete(foundSlot);
+        this.recomputeMaxHp(p);
         const def = lookupItem(it.itemId);
-        this.addMessage(`Unequipped ${def?.name ?? it.itemId}.`, "info");
+        this.addMessage(`${this.who(actor)} unequipped ${def?.name ?? it.itemId}.`, "info");
         valid = true;
         break;
       }
@@ -442,11 +696,19 @@ export class DungeonSession {
     if (!valid) return false;
 
     this.actionLog.push(action);
+    this.mergedLog.push({ actor, action });
     this.turnCount++;
 
-    // Monsters act.
-    if (!this.gameOver) {
-      this.processMonsterTurns();
+    // Round advance (spec section 2): after the last active participant of
+    // the round, monsters act once; otherwise pass the turn along.  With
+    // one participant this reduces to "monsters act after the player".
+    const next = this.nextActiveAfter(actor);
+    if (next === -1) {
+      if (!this.gameOver) this.processMonsterTurns();
+      const first = this.firstActive();
+      this.curTurn = first === -1 ? 0 : first;
+    } else {
+      this.curTurn = next;
     }
 
     return true;
@@ -471,21 +733,28 @@ export class DungeonSession {
    * bonuses.  maxHealth is intentionally NOT applied here — maxHp derives
    * only from constitution (matches items.cpp ComputeEffectiveStats).
    */
-  private applyItemStats(itemId: string, sign: number): void {
+  private applyItemStats(p: PlayerState, itemId: string, sign: number): void {
     const d = lookupItem(itemId);
     if (!d) return;
-    this.stats.equipAttack += sign * d.attackPower;
-    this.stats.equipDefense += sign * d.defense;
-    this.stats.strength += sign * d.strength;
-    this.stats.dexterity += sign * d.dexterity;
-    this.stats.constitution += sign * d.constitution;
-    this.stats.intelligence += sign * d.intelligence;
+    p.stats.equipAttack += sign * d.attackPower;
+    p.stats.equipDefense += sign * d.defense;
+    p.stats.strength += sign * d.strength;
+    p.stats.dexterity += sign * d.dexterity;
+    p.stats.constitution += sign * d.constitution;
+    p.stats.intelligence += sign * d.intelligence;
   }
 
   /** Recompute maxHp from constitution and clamp current hp down if needed. */
-  private recomputeMaxHp(): void {
-    this.playerMaxHp = BASE_HP + this.stats.constitution * HP_PER_CON;
-    if (this.playerMaxHp < this.playerHp) this.playerHp = this.playerMaxHp;
+  private recomputeMaxHp(p: PlayerState): void {
+    p.maxHp = BASE_HP + p.stats.constitution * HP_PER_CON;
+    if (p.maxHp < p.hp) p.hp = p.maxHp;
+  }
+
+  private playerDied(i: number): void {
+    const p = this.players[i];
+    p.hp = 0;
+    p.dead = true;
+    if (this.firstActive() === -1) this.gameOver = true;
   }
 
   private processMonsterTurns(): void {
@@ -497,12 +766,18 @@ export class DungeonSession {
   }
 
   private monsterAct(m: Monster): void {
-    const dist = Math.abs(m.x - this.playerX) + Math.abs(m.y - this.playerY);
-
-    // Check awareness.
-    if (!m.awareOfPlayer && dist <= m.detectionRange
-        && this.hasLineOfSight(m.x, m.y, this.playerX, this.playerY)) {
-      m.awareOfPlayer = true;
+    // Check awareness: any active participant in range with line of sight
+    // (spec section 4).  Iterate in canonical order with an early out.
+    if (!m.awareOfPlayer) {
+      for (let i = 0; i < this.players.length; i++) {
+        if (!this.isActive(i)) continue;
+        const p = this.players[i];
+        if (Math.abs(m.x - p.x) + Math.abs(m.y - p.y) <= m.detectionRange
+            && this.hasLineOfSight(m.x, m.y, p.x, p.y)) {
+          m.awareOfPlayer = true;
+          break;
+        }
+      }
     }
 
     if (!m.awareOfPlayer) {
@@ -514,7 +789,7 @@ export class DungeonSession {
         const ny = m.y + dy;
         if (nx >= 0 && nx < WIDTH && ny >= 0 && ny < HEIGHT
             && this.dungeon.getTile(nx, ny) !== Tile.Wall
-            && !(nx === this.playerX && ny === this.playerY)
+            && this.playerAt(nx, ny) === -1
             && !this.monsterAt(nx, ny)) {
           m.x = nx;
           m.y = ny;
@@ -523,28 +798,47 @@ export class DungeonSession {
       return;
     }
 
-    // Adjacent? Attack.
-    if (Math.abs(m.x - this.playerX) <= 1 && Math.abs(m.y - this.playerY) <= 1) {
-      const result = monsterAttackPlayer(m.attack, m.critChance, this.stats, this.rng);
+    // Monster is aware.  Target the nearest active participant by
+    // Manhattan distance, ties to the lower index (spec section 4);
+    // recomputed every act.
+    let target = -1;
+    let targetDist = 0;
+    for (let i = 0; i < this.players.length; i++) {
+      if (!this.isActive(i)) continue;
+      const d = Math.abs(m.x - this.players[i].x) + Math.abs(m.y - this.players[i].y);
+      if (target === -1 || d < targetDist) {
+        target = i;
+        targetDist = d;
+      }
+    }
+    if (target === -1) return;
+
+    const tp = this.players[target];
+
+    // Adjacent (including diagonal)? Attack.
+    if (Math.abs(m.x - tp.x) <= 1 && Math.abs(m.y - tp.y) <= 1) {
+      const result = monsterAttackPlayer(m.attack, m.critChance, tp.stats, this.rng);
+      const whom = this.players.length > 1 ? tp.name : "you";
       if (result.hit) {
-        this.playerHp -= result.damage;
+        tp.hp -= result.damage;
         const critText = result.critical ? " CRIT!" : "";
         this.addMessage(
-          `${m.name} hits you for ${result.damage}${critText}`, "combat");
-        if (this.playerHp <= 0) {
-          this.playerHp = 0;
-          this.gameOver = true;
-          this.survived = false;
-          this.addMessage("You have been slain!", "warning");
+          `${m.name} hits ${whom} for ${result.damage}${critText}`, "combat");
+        if (tp.hp <= 0) {
+          this.playerDied(target);
+          this.addMessage(
+            this.players.length > 1 ? `${tp.name} has been slain!` : "You have been slain!",
+            "warning");
         }
       } else {
-        this.addMessage(`${m.name} misses you`, "combat");
+        this.addMessage(`${m.name} misses ${whom}`, "combat");
       }
       return;
     }
 
-    // Move toward player.
-    let bestDist = dist;
+    // Move toward the target (pick the adjacent tile that minimises
+    // Manhattan distance).
+    let bestDist = targetDist;
     let bestX = m.x, bestY = m.y;
     for (let ddx = -1; ddx <= 1; ddx++) {
       for (let ddy = -1; ddy <= 1; ddy++) {
@@ -553,9 +847,9 @@ export class DungeonSession {
         const ny = m.y + ddy;
         if (nx < 0 || nx >= WIDTH || ny < 0 || ny >= HEIGHT) continue;
         if (this.dungeon.getTile(nx, ny) === Tile.Wall) continue;
-        if (nx === this.playerX && ny === this.playerY) continue;
+        if (this.playerAt(nx, ny) !== -1) continue;
         if (this.monsterAt(nx, ny)) continue;
-        const d = Math.abs(nx - this.playerX) + Math.abs(ny - this.playerY);
+        const d = Math.abs(nx - tp.x) + Math.abs(ny - tp.y);
         if (d < bestDist) {
           bestDist = d;
           bestX = nx;
@@ -567,11 +861,14 @@ export class DungeonSession {
     m.y = bestY;
   }
 
-  private isWalkable(x: number, y: number): boolean {
+  /** Walkable for participant `self`: no wall, monster, or other participant. */
+  private isWalkable(x: number, y: number, self: number): boolean {
     if (x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT) return false;
     if (this.dungeon.getTile(x, y) === Tile.Wall) return false;
     for (const m of this.monsters)
       if (m.alive && m.x === x && m.y === y) return false;
+    const occ = this.playerAt(x, y);
+    if (occ !== -1 && occ !== self) return false;
     return true;
   }
 
@@ -612,7 +909,11 @@ export class DungeonSession {
     for (let i = 0; i < count; i++) {
       const [x, y] = this.dungeon.getRandomFloorPosition(this.rng);
       if (x < 0) continue;
-      if (x === this.playerX && y === this.playerY) continue;
+      // Never on a participant's spawn tile.
+      let onPlayer = false;
+      for (const p of this.players)
+        if (x === p.x && y === p.y) { onPlayer = true; break; }
+      if (onPlayer) continue;
 
       const roll = this.rng.nextRange(1, 100);
       let itemId: string;

@@ -12,8 +12,12 @@
  */
 import { hashSeedSync } from "./hash.js";
 import { Dungeon, Gate, WIDTH, HEIGHT } from "./dungeon.js";
-import { DungeonSession, GameAction, EntryInvItem } from "./session.js";
+import { DungeonSession, GameAction, EntryInvItem, PlayerSetup } from "./session.js";
 import { PlayerStats } from "./combat.js";
+import {
+  canonicalActionLine, computeClaims, parseCanonicalLog, settleLogHash,
+  splitPool,
+} from "./settle.js";
 
 /**
  * Canonical signature: depth, entry-gate spawn, gates (sorted by direction),
@@ -131,5 +135,165 @@ export function runEquipParityVector(): void {
     `,exitGate=${s.exitGate}`);
 }
 
-runParityTest();
+/**
+ * Multiplayer parity vectors (backend tests/coop_parity_tests.cpp,
+ * SPEC_multiplayer_coop.md section 9).  Everything below is pinned on
+ * both sides; the summary line must match byte-for-byte.
+ */
+
+/* Pinned 2-player co-op run (generated once by a scripted greedy policy on
+   this engine; both sides now replay this exact log).  Seed
+   "coop-parity-4", depth 2, no entry gates (so participant 1 takes the
+   ring spawn).  Covers every action type: an equip, a wait, potion use,
+   raced pickups, kills by both participants, and both exits.  */
+const COOP_FIXTURE_SEED = "coop-parity-4";
+const COOP_FIXTURE_DEPTH = 2;
+const COOP_FIXTURE_VISIT_ID = 7;
+const COOP_FIXTURE_LOG =
+  "0 equip 3 weapon;1 wait;0 move 1 0;1 move 1 0;0 move 1 0;1 move 0 -1;" +
+  "0 move 1 0;1 move 0 -1;0 move 1 -1;1 move 0 1;0 move 0 -1;1 move 1 1;" +
+  "0 move 0 -1;1 move 1 1;0 move 0 -1;1 move 1 0;0 use health_potion;" +
+  "1 move 1 0;0 move 0 -1;1 move 1 0;0 move 1 0;1 move 1 0;0 move 1 0;" +
+  "1 move 1 0;0 move 1 0;1 move 1 0;0 move 1 0;1 pickup;0 move 1 0;" +
+  "1 move 1 0;0 move 1 0;1 move 1 0;0 move 1 0;1 move 1 0;0 move 1 0;" +
+  "1 move 1 0;0 move 1 0;1 move 1 0;0 move 1 0;1 move 1 0;0 move 1 0;" +
+  "1 move 1 0;0 move 1 0;1 move 1 0;0 move 1 0;1 move 1 0;0 move 1 0;" +
+  "1 move 1 0;0 move 1 1;1 move 1 0;0 move 1 -1;1 move 1 -1;0 move 1 -1;" +
+  "1 move 1 -1;0 move 0 -1;1 move 1 -1;0 move 0 -1;1 move 0 -1;0 move 1 0;" +
+  "1 move 1 -1;0 move 1 -1;1 move 1 -1;0 move 1 -1;1 move 0 -1;0 move 0 -1;" +
+  "1 move 0 -1;0 move 1 -1;1 move 0 -1;0 move -1 -1;1 move 0 -1;" +
+  "0 move -1 1;1 move 0 -1;0 move -1 1;1 move 0 -1;0 move -1 1;1 move 0 -1;" +
+  "0 move -1 1;1 move 0 -1;0 move -1 1;1 move 0 -1;0 move -1 0;1 move 0 1;" +
+  "0 move -1 1;1 move 0 1;0 move -1 1;1 move 0 1;0 move -1 1;1 move 1 1;" +
+  "0 move 0 1;1 move 1 1;0 move 0 1;1 move 1 1;0 move 0 1;1 move 1 1;" +
+  "0 move 0 1;1 move 1 0;0 move 0 1;1 move 1 0;0 move 0 1;1 move 1 0;" +
+  "0 move 0 1;1 move 1 0;0 move 0 1;1 move 1 0;0 gate;1 move 1 0;" +
+  "1 use health_potion;1 move 1 0;1 move -1 0;1 move -1 0;1 move -1 0;" +
+  "1 move -1 0;1 move -1 0;1 move -1 0;1 move -1 0;1 move -1 0;1 move -1 0;" +
+  "1 move -1 0;1 move -1 0;1 move -1 0;1 move -1 0;1 move -1 1;1 move -1 1;" +
+  "1 move 0 1;1 move 0 1;1 move 0 1;1 move 0 1;1 move 0 1;1 move 0 1;" +
+  "1 move 0 1;1 move 0 1;1 gate;";
+
+function coopFixtureSetups(): PlayerSetup[] {
+  return [
+    {
+      name: "alice",
+      stats: { level: 2, strength: 10, dexterity: 11, constitution: 10,
+               intelligence: 10, equipAttack: 5, equipDefense: 2 },
+      hp: 90, maxHp: 100,
+      potions: [{ itemId: "health_potion", quantity: 2 }],
+      inventory: [
+        { rowid: 1, itemId: "short_sword", slot: "weapon" },
+        { rowid: 2, itemId: "leather_armor", slot: "body" },
+        { rowid: 3, itemId: "iron_sword", slot: "bag" },
+      ],
+    },
+    {
+      name: "bob",
+      stats: { level: 1, strength: 12, dexterity: 9, constitution: 11,
+               intelligence: 9, equipAttack: 5, equipDefense: 2 },
+      hp: 105, maxHp: 105,
+      potions: [{ itemId: "health_potion", quantity: 3 }],
+      inventory: [
+        { rowid: 11, itemId: "short_sword", slot: "weapon" },
+        { rowid: 12, itemId: "leather_armor", slot: "body" },
+      ],
+    },
+  ];
+}
+
+export function runCoopParityVector(): boolean {
+  const log = parseCanonicalLog(COOP_FIXTURE_LOG.replace(/;/g, "\n"));
+  const s = DungeonSession.replayMulti(
+    COOP_FIXTURE_SEED, COOP_FIXTURE_DEPTH, coopFixtureSetups(), log);
+
+  // The whole log must replay (a prefix stop means the engines disagree
+  // on validity somewhere).
+  if (s.mergedLog.length !== log.length) {
+    console.log(`[coop-parity] ✗ FAIL — replay stopped at action ` +
+                `${s.mergedLog.length} of ${log.length}`);
+    return false;
+  }
+
+  const claims = computeClaims(s);
+  let line = "PARITY-COOP";
+  for (let i = 0; i < s.playerCount; i++) {
+    const p = s.players[i];
+    const c = claims[i];
+    line += ` p${i}[survived=${c.survived ? 1 : 0} xp=${c.xp} gold=${c.gold}` +
+            ` kills=${c.kills} hp=${p.hp} maxHp=${p.maxHp} dmg=${p.damageDealt}` +
+            ` exit=${p.exitGate}]`;
+  }
+  line += ` pools[xp=${s.xpPool} gold=${s.killGoldPool}]`;
+  line += ` turns=${s.turnCount}`;
+  line += ` hash=${settleLogHash(COOP_FIXTURE_VISIT_ID, s.mergedLog)}`;
+  console.log(line);
+
+  const expected =
+    "PARITY-COOP" +
+    " p0[survived=1 xp=44 gold=2 kills=3 hp=95 maxHp=100 dmg=106 exit=south]" +
+    " p1[survived=1 xp=58 gold=6 kills=3 hp=102 maxHp=105 dmg=137 exit=south]" +
+    " pools[xp=102 gold=4] turns=132" +
+    " hash=3d92df40b001849551cc05dd5efc77905a9fe9dc59c92e46313e639425b6ab71";
+  const ok = line === expected;
+  console.log(`[coop-parity] ${ok ? "✓ OK" : "✗ FAIL — C++/TS co-op engine diverged"}`);
+  return ok;
+}
+
+export function runSettleHashVector(): boolean {
+  // One entry of every action type, so the whole canonical encoding is
+  // locked (pinned in coop_parity_tests.cpp as well).
+  const text =
+    "0 move 1 0\n1 move -1 -1\n0 pickup\n1 use health_potion\n" +
+    "0 equip 5 weapon\n1 unequip 12\n0 wait\n1 gate\n0 gate\n";
+  const log = parseCanonicalLog(text);
+  let data = "rog-settle-v1\n42\n";
+  for (const la of log) data += canonicalActionLine(la.actor, la.action);
+  const encodingOk = data === "rog-settle-v1\n42\n" + text;
+
+  const got = settleLogHash(42, log);
+  const expected = "7ce422e908ecfe7bd587de2740aa91f94a8631ead9bd80f794166b0ad5267297";
+  const gotEmpty = settleLogHash(42, []);
+  const expectedEmpty = "892bdea5bc97abd2bc0d0b4991d445aaf42c6d5ee7e68fa572ec5e1ea3d81ffd";
+  const ok = encodingOk && got === expected && gotEmpty === expectedEmpty;
+  console.log(`[settle-hash] got ${got} ${ok ? "✓ OK" : "✗ FAIL — settle hash encoding diverged"}`);
+  return ok;
+}
+
+export function runSplitPoolVectors(): boolean {
+  // Mirrors the SplitPoolTests cases in the backend's moveprocessor_tests.
+  const cases: [number, number[], number[]][] = [
+    [100, [50, 50], [50, 50]],
+    [100, [75, 25], [75, 25]],
+    [100, [40, 0], [100, 0]],
+    [7, [0, 3], [0, 7]],
+    [10, [1, 2], [3, 7]],
+    [3, [1, 1], [2, 1]],
+    [100, [0, 0], [0, 0]],
+    [0, [5, 3], [0, 0]],
+  ];
+  let ok = true;
+  for (const [pool, damages, expected] of cases) {
+    const got = splitPool(pool, damages);
+    const same = got.length === expected.length && got.every((v, i) => v === expected[i]);
+    if (!same) {
+      console.log(`[split-pool] ✗ FAIL splitPool(${pool}, [${damages}]) = [${got}], expected [${expected}]`);
+      ok = false;
+    }
+  }
+  // Conservation: shares always sum to the pool when anyone dealt damage.
+  const shares = splitPool(101, [7, 11, 3]);
+  if (shares.reduce((a, b) => a + b, 0) !== 101) { console.log("[split-pool] ✗ FAIL conservation"); ok = false; }
+  if (ok) console.log("[split-pool] ✓ OK");
+  return ok;
+}
+
+const results = [
+  runParityTest(),
+  runSettleHashVector(),
+  runSplitPoolVectors(),
+  runCoopParityVector(),
+];
 runEquipParityVector();
+// A thrown error makes `node dist/game/parity_test.js` exit non-zero.
+if (results.some(r => !r)) throw new Error("parity vectors FAILED");

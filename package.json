@@ -5,13 +5,14 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "tsc && node dist/game/parity_test.js && node dist/net/coop_test.js",
     "e2e": "node tests/e2e/run.mjs",
     "e2e:ui": "node tests/e2e/ui.mjs",
     "agent": "node tests/e2e/agent.mjs",
     "multi": "node tests/e2e/multi.mjs",
     "compete": "node tests/e2e/compete.mjs",
-    "persist": "node tests/e2e/persist.mjs"
+    "persist": "node tests/e2e/persist.mjs",
+    "coop": "node tests/e2e/coop.mjs"
   },
   "repository": {
     "type": "git",

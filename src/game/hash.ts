@@ -15,6 +15,18 @@ export function hashSeedSync(data: string): number {
   return (hash[0] << 24 | hash[1] << 16 | hash[2] << 8 | hash[3]) >>> 0;
 }
 
+/**
+ * Full SHA-256 of the input as a lowercase hex string.  Matches C++
+ * Sha256Hex() in hash.hpp; used for the multiplayer settlement consent
+ * hash (settle.ts).
+ */
+export function sha256Hex(data: string): string {
+  const hash = sha256(stringToBytes(data));
+  let out = "";
+  for (const b of hash) out += b.toString(16).padStart(2, "0");
+  return out;
+}
+
 function stringToBytes(s: string): number[] {
   const bytes: number[] = [];
   for (let i = 0; i < s.length; i++) {
