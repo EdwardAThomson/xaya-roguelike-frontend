@@ -31,9 +31,11 @@ with deterministic RNG, and submits action-replay proofs on-chain. Pairs with th
 ## Next
 
 - [ ] MetaMask wallet integration (Phase F4b) — `window.ethereum`, ABI encoding, tx tracking
-- [ ] Co-op Phase 2 robustness: mid-run checkpoint confirms so a survivor can settle after a partner vanishes; WebRTC transport
+- [x] Co-op Phase 2 robustness: checkpoint confirms with a heartbeat, partner-staleness detection, "continue alone" from the last checkpoint and the abandonment settle (`solo_from`); covered by the absent-partner parity vector and the second scenario of `npm run coop`
 
 ## Backlog
+
+- [ ] Co-op: WebRTC transport (the relay is the only `CoopTransport` today); true state channels (backend Phase 3)
 
 - [ ] Visual polish (Phase F6) — sprite tiles, monster/item art, camera scrolling, attack/particle animations, sound
 - [ ] Multi-player robustness (mid-run checkpoints) and PvP

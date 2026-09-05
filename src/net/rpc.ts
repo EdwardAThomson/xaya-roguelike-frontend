@@ -138,8 +138,12 @@ export interface VisitInfo {
   seed: string;
   /** In join order (NOT canonical order; sort by name for that). */
   participants: string[];
-  /** Settlement confirms on file: participant name -> log hash. */
-  confirms: Record<string, string>;
+  /**
+   * Settlement confirms on file: participant name -> the hash of the
+   * first `n` merged-log actions and the block height it was recorded at
+   * (a checkpoint, or the whole log at the end).
+   */
+  confirms: Record<string, { h: string; n: number; height: number }>;
   results?: Array<{
     name: string;
     survived: boolean;

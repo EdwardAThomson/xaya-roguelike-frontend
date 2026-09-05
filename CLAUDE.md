@@ -89,8 +89,13 @@ Layers under `src/`:
     only its own actions; waits are self-authored after a grace window; an
     action that is invalid by the time its turn comes is replaced by a wait
     on both clients identically. `main.ts` hosts/joins visits from the Map
-    sidebar, starts the run when the visit turns active, and settles it
-    (participant 0 sends `s` once the others' `sc` confirms are on chain)
+    sidebar, starts the run when the visit turns active, sends checkpoint
+    confirms (`sc` with `n`) every few actions and as a heartbeat, and
+    settles it (participant 0 sends `s` once the others' `sc` confirms are
+    on chain). If a partner's checkpoint goes stale (`ABANDON_WINDOW_BLOCKS`
+    in config.ts) the sidebar offers "continue alone": the run is rebuilt
+    at that checkpoint, the partner marked absent, played out solo, and
+    settled with `solo_from` (backend spec section 11)
 - `ui/` — `modal.ts` (error/confirm dialogs) and `overlay.ts`.
 - `config.ts` — default GSP URL (`localhost:18332`), proxy URL (`localhost:18380`),
   poll interval, game id `"rog"`.

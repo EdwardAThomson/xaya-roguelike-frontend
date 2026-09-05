@@ -8,6 +8,12 @@
  * same log hash at the end, the visit completed on-chain with a result
  * row per player, and both players' visits_completed advanced.
  *
+ * Scenario 2 (abandonment, backend spec section 11): a second visit on the
+ * same segment; a few rounds in, Bob's browser closes.  Alice's client
+ * sees Bob's last checkpoint go stale (the test mines the window), takes
+ * "continue alone", finishes the dungeon solo, and settles with solo_from.
+ * Asserts Alice survived and Bob was banked as a death.
+ *
  * Prerequisites (rate limit must be off — it's off locally by default):
  *   1. source ~/Explore/xayax/.venv/bin/activate && python3 devnet/frontend_devnet.py
  *   2. python3 serve.py 8000        (in this repo)
@@ -23,6 +29,15 @@ const STAMP = Date.now().toString(36).slice(-5);
 const findings = [];
 const fail = (m) => { findings.push(m); console.log("  ✗ " + m); };
 const ok = (m) => console.log("  ✓ " + m);
+
+async function proxy(body) {
+  const r = await fetch(PROXY, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return r.json();
+}
 
 async function gsp(method, params = []) {
   const r = await fetch(`${PROXY}/gsp`, {
@@ -137,7 +152,9 @@ async function playCoop(d, walls, label) {
     ticks++;
     const s = await d.state();
     if (s.coop) {
-      lastHash = s.coop.logHash;
+      // Sample the hash only once this client's run is over: mid-run the two
+      // pages are legitimately a relay hop apart.
+      if (s.session?.gameOver || lastHash === null) lastHash = s.coop.logHash;
       if (s.coop.turns === lastTurns) idle++; else { idle = 0; lastTurns = s.coop.turns; }
       if (s.coop.settleError) { fail(`[${label}] settle error: ${s.coop.settleError}`); }
     }
@@ -246,6 +263,102 @@ try {
     B.until(st => !st.coop && !st.player?.active_visit, 30000, "bob teardown"),
   ]);
   ok("both clients tore the run down");
+
+  // ---------------------------------------------------------------------
+  console.log("7. abandonment: host again, bob vanishes mid-run");
+  for (const d of [A, B]) {
+    const st = await d.state();
+    if (st.modal) await d.call("dismissModal");
+  }
+  await A.call("coopHost", segCoord.x, segCoord.y);
+  s = await A.until(st => !!st.player?.active_visit, 30000, "host visit 2");
+  const visit2 = s.player?.active_visit?.visit_id;
+  if (!visit2) { fail("no second visit id"); throw new Error("host2"); }
+  await B.call("coopJoin", visit2);
+  await Promise.all([
+    A.until(st => !!st.coop, 30000, "alice coop runner (2)"),
+    B.until(st => !!st.coop, 30000, "bob coop runner (2)"),
+  ]);
+  ok(`visit #${visit2} active, both runners up`);
+
+  // Play a few rounds together so bob has a checkpoint beyond the start.
+  const walls2 = (await A.map()).walls;
+  const t1 = Date.now();
+  while (Date.now() - t1 < 20000) {
+    const [ra, rb] = await Promise.all([coopTick(A, walls2, 400), coopTick(B, walls2, 400)]);
+    const sa2 = await A.state();
+    if (!sa2.coop || sa2.coop.turns >= 24 || ra === "done" || rb === "done") break;
+    await sleep(80);
+  }
+  await B.call("coopCheckpoint");
+  await sleep(1500);
+  let sb2 = await B.state();
+  const bobName = B.name;
+  const beforeClose = await A.state();
+  console.log(`   bob leaves at ${beforeClose.coop?.turns} turns; his checkpoint: ${JSON.stringify(beforeClose.coopVisit?.confirms?.[bobName] ?? null)}`);
+  await B.page.context().close();
+
+  // Alice keeps playing on her own turn until bob's checkpoint is stale.
+  // Mine the window (the devnet auto-mines slowly), then abandon.
+  await proxy({ action: "mine", blocks: 25 });
+  s = await A.until(st => !!st.partnerCheckpoint && st.partnerCheckpoint.stale, 60000, "bob's checkpoint to go stale");
+  console.log(`   partner checkpoint: ${JSON.stringify(s.partnerCheckpoint)}`);
+  if (!s.partnerCheckpoint?.stale) throw new Error("not stale");
+  const soloFrom = s.partnerCheckpoint.n;
+  await A.call("coopAbandon");
+  s = await A.until(st => !!st.coopSolo, 10000, "solo continuation");
+  if (!s.coopSolo) { fail(`continue-alone did not start: ${s.modal ?? ""}`); throw new Error("abandon"); }
+  ok(`alice continues alone from action ${s.coopSolo.from} (bob confirmed ${soloFrom})`);
+
+  // Solo play: same driver, but the state comes from the session directly.
+  const t2 = Date.now();
+  let soloTicks = 0;
+  while (Date.now() - t2 < 180000) {
+    const st = await A.state();
+    if (st.modal) { const c = await A.page.$(".modal-confirm"); if (c) await c.click(); else await A.call("dismissModal"); continue; }
+    if (!st.coopSolo) break;                       // settled and torn down
+    if (st.session?.gameOver || st.busy) { await sleep(400); continue; }
+    const sess = st.session;
+    const px = sess.playerX, py = sess.playerY;
+    const adj = sess.monsters.find(m => Math.abs(m.x - px) <= 1 && Math.abs(m.y - py) <= 1);
+    if (sess.hp < sess.maxHp * 0.5 && st.player.inventory.some(i => i.slot === "bag" && i.item_id === "health_potion")) {
+      await A.call("input", "use_potion");
+    } else if (adj) {
+      await A.call("input", "move", adj.x - px, adj.y - py);
+    } else if (sess.gates.some(g => g.x === px && g.y === py)) {
+      await A.call("input", "gate");
+    } else {
+      const gate = sess.gates.map(g => ({ g, d: Math.abs(g.x - px) + Math.abs(g.y - py) })).sort((a, b) => a.d - b.d)[0].g;
+      const step = bfsStep(walls2, px, py, gate.x, gate.y);
+      if (!step || (!step[0] && !step[1])) await A.call("input", "wait");
+      else await A.call("input", "move", step[0], step[1]);
+    }
+    soloTicks++;
+    await sleep(40);
+  }
+  console.log(`   solo ticks: ${soloTicks}`);
+
+  const t3 = Date.now();
+  let v2 = null;
+  while (Date.now() - t3 < 90000) {
+    v2 = await gsp("getvisitinfo", [visit2]);
+    if (v2 && v2.status !== "active") break;
+    await sleep(1000);
+  }
+  if (!v2 || v2.status !== "completed") fail(`abandonment visit did not complete (status ${v2?.status})`);
+  else {
+    ok(`visit #${visit2} completed via abandonment settle`);
+    for (const r of v2.results ?? [])
+      console.log(`   ${r.name}: survived=${r.survived} xp=${r.xp_gained} gold=${r.gold_gained} kills=${r.kills}`);
+    const ra = (v2.results ?? []).find(r => r.name === A.name);
+    const rb = (v2.results ?? []).find(r => r.name === bobName);
+    if (!ra?.survived) fail("alice did not survive the solo continuation");
+    if (!rb || rb.survived) fail("bob should be banked as a death");
+  }
+  const pb = await gsp("getplayerinfo", [bobName]);
+  if (pb?.active_visit) fail("bob still has an active visit after abandonment");
+  await A.until(st => !st.coop && !st.coopSolo && !st.player?.active_visit, 30000, "alice teardown (2)");
+  ok("alice tore the run down");
 } catch (e) {
   fail(`exception: ${e.message}`);
 } finally {

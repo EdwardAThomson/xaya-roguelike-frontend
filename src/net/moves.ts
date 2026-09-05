@@ -146,23 +146,33 @@ export class MoveClient {
   }
 
   /**
-   * Consent to a merged log (spec section 7): `hash` is settleLogHash of
-   * the exact log the submitter will settle with.
+   * Consent to the first `n` actions of the merged log (spec sections 7
+   * and 11): a periodic checkpoint, or the whole log at the end.  `hash`
+   * is settleLogHash of exactly those actions.
    */
-  async settleConfirm(name: string, visitId: number, hash: string): Promise<void> {
-    await this.transport.submitMove(name, { sc: { id: visitId, h: hash } });
+  async settleConfirm(
+    name: string, visitId: number, hash: string, n: number,
+  ): Promise<void> {
+    await this.transport.submitMove(name, { sc: { id: visitId, h: hash, n } });
     await this.transport.mine();
   }
 
   /**
    * Settle a multiplayer visit with every participant's claims and the
    * merged action log.  Executes only once every OTHER participant's
-   * confirm for this log is on chain.
+   * confirm for this log is on chain.  With `soloFrom`, an abandonment
+   * settle (spec section 11): the first `soloFrom` actions are the
+   * partner's last (stale) checkpoint and the rest the submitter's own
+   * solo continuation.
    */
   async settle(
     name: string, visitId: number, results: object[], actions: object[],
+    soloFrom?: number,
   ): Promise<void> {
-    await this.transport.submitMove(name, { s: { id: visitId, results, actions } });
+    const s: { id: number; results: object[]; actions: object[]; solo_from?: number } =
+      { id: visitId, results, actions };
+    if (soloFrom !== undefined) s.solo_from = soloFrom;
+    await this.transport.submitMove(name, { s });
     await this.transport.mine();
   }
 }

@@ -121,6 +121,11 @@ export interface PlayerState {
   collected: CollectedItem[];
   dead: boolean;
   exited: boolean;
+  /**
+   * Marked absent by an abandonment settle (spec section 11): inactive
+   * from that point on, banked as a forfeit.
+   */
+  absent: boolean;
   /** Direction of the exit gate, or "". */
   exitGate: string;
   /** Display name for messages. */
@@ -146,7 +151,7 @@ function newPlayerState(name: string): PlayerState {
     equipped: new Map(), bag: [],
     totalXp: 0, totalGold: 0, totalKills: 0, damageDealt: 0,
     loot: [], collected: [],
-    dead: false, exited: false, exitGate: "",
+    dead: false, exited: false, absent: false, exitGate: "",
     name,
   };
 }
@@ -451,7 +456,35 @@ export class DungeonSession {
 
   private isActive(i: number): boolean {
     const p = this.players[i];
-    return !p.dead && !p.exited;
+    return !p.dead && !p.exited && !p.absent;
+  }
+
+  /**
+   * Marks participant i absent (spec section 11): they take no further
+   * part, monsters ignore them, and they are banked as not having exited.
+   * If it was their turn, the turn passes on exactly as if they had been
+   * skipped; if they were the last active participant of the round, the
+   * monsters act.  Mirrors DungeonGame::MarkAbsent byte for byte.
+   */
+  markAbsent(i: number): void {
+    if (i < 0 || i >= this.players.length || !this.isActive(i)) return;
+    this.players[i].absent = true;
+
+    if (this.firstActive() === -1) {
+      this.gameOver = true;
+      return;
+    }
+
+    if (this.curTurn === i) {
+      const next = this.nextActiveAfter(i);
+      if (next === -1) {
+        this.processMonsterTurns();
+        const first = this.firstActive();
+        this.curTurn = first === -1 ? 0 : first;
+      } else {
+        this.curTurn = next;
+      }
+    }
   }
 
   private firstActive(): number {

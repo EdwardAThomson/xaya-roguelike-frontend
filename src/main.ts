@@ -26,7 +26,10 @@ import { MoveClient, createMoveClient } from "./net/moves.js";
 import { layoutSegments, SegmentNode, hitTestSegment } from "./game/overworld.js";
 import { drawOverworld, NODE_SIZE, CELL, PlayerMarker, OverworldView } from "./render/overworld.js";
 import { drawDungeonMap } from "./render/dungeonmap.js";
-import { DEFAULT_GSP_URL, DEFAULT_PROXY_URL, isHostedOrigin } from "./config.js";
+import {
+  DEFAULT_GSP_URL, DEFAULT_PROXY_URL, isHostedOrigin,
+  ABANDON_WINDOW_BLOCKS, COOP_CHECKPOINT_ACTIONS, COOP_HEARTBEAT_MS,
+} from "./config.js";
 import {
   ValidatorContext, ValidationResult,
   validateDiscover, validateTravel, validateEnterChannel,
@@ -132,10 +135,25 @@ let coopVisit: VisitInfo | null = null;
 let coopSyncInFlight = false;
 let coopSettling = false;
 let coopSettleError: string | null = null;
+/** Everything needed to rebuild the shared session at a checkpoint. */
+let coopSetup: { seed: string; depth: number; constraints: Gate[];
+                 setups: PlayerSetup[]; names: string[]; me: number } | null = null;
+/**
+ * Solo continuation after abandoning a partner (spec section 11): the run
+ * was rebuilt at the partner's last checkpoint (`from` actions), the
+ * partner marked absent, and this client plays on alone until it settles
+ * with `solo_from`.
+ */
+let coopSolo: { visitId: number; names: string[]; me: number; from: number } | null = null;
+/** Checkpoint bookkeeping (see maybeCheckpoint). */
+let coopCheckpointN = -1;
+let coopCheckpointAt = 0;
+let coopCheckpointInFlight = false;
+let coopCheckpointTimer: ReturnType<typeof setInterval> | null = null;
 
 /** The local player's participant state (participant 0 outside co-op). */
 function me(): PlayerState {
-  return session!.players[coop ? coop.me : 0];
+  return session!.players[coop ? coop.me : coopSolo ? coopSolo.me : 0];
 }
 
 // Overworld mode state.
@@ -219,7 +237,7 @@ function runStorageKey(): string | null {
 }
 function persistRun(): void {
   const key = runStorageKey();
-  if (!key || !channelSession || !session || coop) return;
+  if (!key || !channelSession || !session || coop || coopSolo) return;
   try {
     localStorage.setItem(key, JSON.stringify({
       visitId: channelVisitId,
@@ -289,7 +307,7 @@ function ensureSessionFromChainState(): void {
   // session and gets the next gate-walk rejected by the GSP).
   if (busy) return;
   // Co-op runs are reconciled by syncCoopFromChain (they are not in_channel).
-  if (coop) return;
+  if (coop || coopSolo) return;
 
   // A live run can end server-side without the client acting: the 200-block
   // visit timeout force-settles it (a death), or a death/force-settle is
@@ -1044,7 +1062,7 @@ async function syncCoopFromChain(): Promise<void> {
   const av = p.active_visit;
   if (!av || p.in_channel) {
     coopVisit = null;
-    if (coop && !coopSettling) await finishCoop();
+    if ((coop || coopSolo) && !coopSettling) await finishCoop();
     return;
   }
   coopSyncInFlight = true;
@@ -1052,9 +1070,10 @@ async function syncCoopFromChain(): Promise<void> {
     const v = await connection.rpc.getvisitinfo(av.visit_id);
     coopVisit = v;
     if (!v) return;
-    if (v.status === "active" && !coop && !coopSettling) {
+    if (v.status === "active" && !coop && !coopSolo && !coopSettling) {
       await startCoopRun(v);
-    } else if (v.status !== "active" && v.status !== "open" && coop && !coopSettling) {
+    } else if (v.status !== "active" && v.status !== "open"
+               && (coop || coopSolo) && !coopSettling) {
       await finishCoop();
     }
   } catch (e) {
@@ -1084,14 +1103,18 @@ async function startCoopRun(v: VisitInfo): Promise<void> {
     setups.push(setupFromPlayer(info));
   }
 
-  const s = DungeonSession.createMulti(
-    segInfo.seed, segInfo.depth, setups, constraintsFor(segInfo));
+  const constraints = constraintsFor(segInfo);
+  const s = DungeonSession.createMulti(segInfo.seed, segInfo.depth, setups, constraints);
   session = s;
   channelSession = true;
   channelSegment = v.segment;
   channelVisitId = v.id;
   coopSettling = false;
   coopSettleError = null;
+  coopSolo = null;
+  coopSetup = { seed: segInfo.seed, depth: segInfo.depth, constraints, setups, names, me: meIdx };
+  coopCheckpointN = -1;
+  coopCheckpointAt = 0;
   reconnectPromptShown = false;
 
   coop = new CoopRunner({
@@ -1113,7 +1136,36 @@ async function startCoopRun(v: VisitInfo): Promise<void> {
   const partners = names.filter(n => n !== myName).join(", ");
   s.addMessage(`Co-op run with ${partners} at ${segName(v.segment)}. Rounds: one action each, then the monsters move.`, "info");
   coop.start();
+  if (coopCheckpointTimer) clearInterval(coopCheckpointTimer);
+  coopCheckpointTimer = setInterval(() => maybeCheckpoint(false), 5000);
+  maybeCheckpoint(true);
   setMode("dungeon");
+}
+
+/**
+ * Sends a checkpoint confirm (`sc` over the first n merged-log actions,
+ * spec section 11) when due: every COOP_CHECKPOINT_ACTIONS applied
+ * actions, and at least every COOP_HEARTBEAT_MS while the run is live so a
+ * live partner never looks abandoned.  Fire-and-forget; the final confirm
+ * at game over is sent by coopSettle.
+ */
+function maybeCheckpoint(force: boolean): void {
+  if (!coop || !moves || !connState?.playerName || coopSettling || coopCheckpointInFlight) return;
+  const s = coop.session;
+  if (s.gameOver) return;
+  const n = s.mergedLog.length;
+  const now = Date.now();
+  const due = force
+    || n - coopCheckpointN >= COOP_CHECKPOINT_ACTIONS
+    || now - coopCheckpointAt >= COOP_HEARTBEAT_MS;
+  if (!due) return;
+  coopCheckpointN = n;
+  coopCheckpointAt = now;
+  coopCheckpointInFlight = true;
+  const hash = settleLogHash(channelVisitId, s.mergedLog.slice(0, n));
+  moves.settleConfirm(connState.playerName, channelVisitId, hash, n)
+    .catch(e => console.warn("checkpoint failed:", e))
+    .finally(() => { coopCheckpointInFlight = false; });
 }
 
 /** Runner callback: the shared state changed (own or partner action, relay error). */
@@ -1126,6 +1178,136 @@ function coopOnChange(): void {
   updateSidebar();
   saveCurrentFog();
   if (session.gameOver && !coopSettling) void coopSettle();
+  else maybeCheckpoint(false);
+}
+
+/**
+ * The partner's latest checkpoint, and whether it is stale enough for an
+ * abandonment settle (spec section 11).  Null when they have none yet.
+ */
+function partnerCheckpoint(): { name: string; n: number; age: number; stale: boolean } | null {
+  const names = coop?.names ?? coopSetup?.names;
+  const meIdx = coop?.me ?? coopSetup?.me;
+  if (!names || meIdx === undefined || !coopVisit) return null;
+  const height = connState?.currentHeight ?? 0;
+  let best: { name: string; n: number; age: number; stale: boolean } | null = null;
+  for (let i = 0; i < names.length; i++) {
+    if (i === meIdx) continue;
+    const c = coopVisit.confirms[names[i]];
+    if (!c) return null;  // no checkpoint at all: nothing to continue from
+    const age = height - c.height;
+    const entry = { name: names[i], n: c.n, age, stale: age >= ABANDON_WINDOW_BLOCKS };
+    if (!best || entry.age < best.age) best = entry;
+  }
+  return best;
+}
+
+/**
+ * Leave a vanished partner behind: rebuild the shared session at their
+ * last checkpoint (exactly the first n actions; anything later, including
+ * our own, is discarded), mark them absent, and play on alone.
+ */
+function continueAlone(): void {
+  if (!coop || !coopSetup || !session || !fov) return;
+  const cp = partnerCheckpoint();
+  if (!cp || !cp.stale) {
+    showErrorModal("Partner not stale yet",
+      "Your partner's last checkpoint is too recent to abandon the run. Wait for the window to pass.");
+    return;
+  }
+  const runner = coop;
+  const prefix = runner.session.mergedLog.slice(0, cp.n);
+  if (prefix.length < cp.n) {
+    showErrorModal("Missing actions",
+      `Your partner confirmed ${cp.n} actions but this client only has ${prefix.length}. Wait for the relay to catch up.`);
+    return;
+  }
+  runner.stop();
+  coop = null;
+  if (coopCheckpointTimer) { clearInterval(coopCheckpointTimer); coopCheckpointTimer = null; }
+
+  const s = DungeonSession.replayMulti(
+    coopSetup.seed, coopSetup.depth, coopSetup.setups, prefix, coopSetup.constraints);
+  for (let i = 0; i < coopSetup.names.length; i++)
+    if (i !== coopSetup.me) s.markAbsent(i);
+  session = s;
+  coopSolo = { visitId: channelVisitId, names: coopSetup.names, me: coopSetup.me, from: cp.n };
+  const m = me();
+  fov.update(m.x, m.y, s.dungeon);
+  camera.centerOn(m.x, m.y);
+  s.addMessage(
+    `${cp.name} is gone. Continuing alone from their last checkpoint (${cp.n} actions in); ` +
+    `reach a gate to settle.`, "warning");
+  render();
+  updateSidebar();
+  if (s.gameOver) void coopSoloSettle();
+}
+
+/** Keyboard input while continuing alone after an abandonment. */
+function handleSoloSuffixInput(action: string, dir?: Direction): void {
+  if (!coopSolo || !session || !fov || session.gameOver) return;
+  const m = me();
+  if (m.dead || m.exited) return;
+  let a: GameAction | null = null;
+  switch (action) {
+    case "move": if (dir) a = { type: "move", dx: dir.dx, dy: dir.dy }; break;
+    case "pickup": a = { type: "pickup" }; break;
+    case "wait": a = { type: "wait" }; break;
+    case "use_potion": a = { type: "use", itemId: "health_potion" }; break;
+    case "gate": {
+      const g = gateAtPlayer();
+      if (g) confirmCoopExit(g.direction);
+      return;
+    }
+    case "gate-now":
+      a = { type: "gate" };
+      break;
+  }
+  if (!a) return;
+  if (!session.processActionBy(coopSolo.me, a)) return;
+  const m2 = me();
+  fov.update(m2.x, m2.y, session.dungeon);
+  camera.centerOn(m2.x, m2.y);
+  render();
+  updateSidebar();
+  saveCurrentFog();
+  if (session.gameOver) void coopSoloSettle();
+  else if (action === "move") {
+    const g = gateAtPlayer();
+    if (g) {
+      session.addMessage(`On the ${g.direction} gate. Press Enter to leave the dungeon.`, "info");
+      updateSidebar();
+    }
+  }
+}
+
+/** Abandonment settle: the checkpoint prefix plus our solo suffix, with solo_from. */
+async function coopSoloSettle(): Promise<void> {
+  if (!coopSolo || !session || !moves || !connection.rpc || coopSettling) return;
+  const solo = coopSolo;
+  const s = session;
+  const myName = connState!.playerName;
+  coopSettling = true;
+  coopSettleError = null;
+  busy = true;
+  updateSidebar();
+  try {
+    s.addMessage("Run over. Settling alone on-chain...", "info");
+    await moves.settle(myName, solo.visitId, toWireResults(s, solo.names),
+                       s.mergedLog.map(toWireAction), solo.from);
+    const ok = await waitForVisitStatus(solo.visitId, st => st !== "active", 60000);
+    if (!ok) throw new Error("The GSP did not settle the run in time. Retry the settlement.");
+    busy = false;
+    coopSettling = false;
+    await finishCoop();
+  } catch (e) {
+    coopSettleError = e instanceof Error ? e.message : String(e);
+    showErrorModal("Settlement problem", coopSettleError);
+  } finally {
+    busy = false;
+    coopSettling = false;
+    updateSidebar();
+  }
 }
 
 /** Polls getvisitinfo until `pred(status)` holds or the timeout passes. */
@@ -1174,14 +1356,16 @@ async function coopSettle(): Promise<void> {
       while (Date.now() < deadline && coop === runner) {
         const v = await connection.rpc.getvisitinfo(visitId);
         if (!v || v.status !== "active") { done = true; break; }
-        const mismatch = others.find(n => v.confirms[n] && v.confirms[n] !== hash);
+        const total = s.mergedLog.length;
+        const mismatch = others.find(n =>
+          v.confirms[n] && v.confirms[n].n === total && v.confirms[n].h !== hash);
         if (mismatch) {
           throw new Error(
             `${mismatch} confirmed a different action log than yours, so the ` +
             `clients diverged and this run cannot settle. The visit will be ` +
             `force-settled by the timeout.`);
         }
-        if (others.every(n => v.confirms[n] === hash)) {
+        if (others.every(n => v.confirms[n]?.h === hash && v.confirms[n]?.n === total)) {
           s.addMessage("Confirmation received. Settling on-chain...", "info");
           updateSidebar();
           await moves.settle(myName, visitId, results, actions);
@@ -1196,7 +1380,7 @@ async function coopSettle(): Promise<void> {
     } else {
       s.addMessage("Run over. Sending your confirmation...", "info");
       updateSidebar();
-      await moves.settleConfirm(myName, visitId, hash);
+      await moves.settleConfirm(myName, visitId, hash, s.mergedLog.length);
       s.addMessage("Confirmed. Waiting for the host to settle...", "info");
       updateSidebar();
       const ok = await waitForVisitStatus(visitId, st => st !== "active", 180000);
@@ -1217,10 +1401,12 @@ async function coopSettle(): Promise<void> {
 
 /** Tears down a finished co-op run and re-syncs the view to the chain. */
 async function finishCoop(): Promise<void> {
-  const runner = coop;
-  if (!runner) return;
-  runner.stop();
+  if (!coop && !coopSolo) return;
+  coop?.stop();
   coop = null;
+  coopSolo = null;
+  coopSetup = null;
+  if (coopCheckpointTimer) { clearInterval(coopCheckpointTimer); coopCheckpointTimer = null; }
   const visitId = channelVisitId;
 
   let summary = "";
@@ -1405,7 +1591,10 @@ function confirmCoopExit(dir: string): void {
       "on-chain together, with kill rewards split by the damage each of you dealt.",
     confirmLabel: "Exit",
     cancelLabel: "Stay",
-    onConfirm: () => { coop?.submitLocal({ type: "gate" }); },
+    onConfirm: () => {
+      if (coop) coop.submitLocal({ type: "gate" });
+      else if (coopSolo) handleSoloSuffixInput("gate-now");
+    },
     onCancel: () => {},
   });
 }
@@ -1887,6 +2076,10 @@ function equipLocal(rowid: number, slot: string): void {
     coop.submitLocal({ type: "equip", rowid, slot });
     return;
   }
+  if (coopSolo) {
+    if (session.processActionBy(coopSolo.me, { type: "equip", rowid, slot })) afterLocalLoadoutChange();
+    return;
+  }
   if (!session.equip(rowid, slot)) return;
   afterLocalLoadoutChange();
 }
@@ -1896,6 +2089,10 @@ function unequipLocal(rowid: number): void {
   if (busy || !session || session.gameOver) return;
   if (coop) {
     coop.submitLocal({ type: "unequip", rowid });
+    return;
+  }
+  if (coopSolo) {
+    if (session.processActionBy(coopSolo.me, { type: "unequip", rowid })) afterLocalLoadoutChange();
     return;
   }
   if (!session.unequip(rowid)) return;
@@ -2332,6 +2529,10 @@ function handleGameInput(action: string, dir?: Direction): void {
     handleCoopInput(action, dir);
     return;
   }
+  if (coopSolo) {
+    handleSoloSuffixInput(action, dir);
+    return;
+  }
 
   let gameAction: GameAction | null = null;
   switch (action) {
@@ -2532,7 +2733,10 @@ document.addEventListener("click", (e) => {
       }
       break;
     case "coop-settle-retry":
-      void coopSettle();
+      if (coopSolo) void coopSoloSettle(); else void coopSettle();
+      break;
+    case "coop-abandon":
+      continueAlone();
       break;
     case "back-to-overworld":
       channelSession = false;
@@ -3551,24 +3755,45 @@ function updateDungeonStats(): void {
     else turnLine = `Waiting for ${coop.waitingOn}...`;
     const relay = coop.transportError
       ? `<div style="color:#c44;font-size:11px">Relay: ${coop.transportError}</div>` : "";
+    const cp = partnerCheckpoint();
+    let cpLine = "";
+    if (!session.gameOver) {
+      if (!cp) cpLine = `<div style="color:#666;font-size:10px">Partner has no checkpoint on chain yet.</div>`;
+      else if (cp.stale) {
+        cpLine = `<div style="color:#c86;font-size:11px">${cp.name}'s last checkpoint (${cp.n} actions) is ${cp.age} blocks old.</div>` +
+          `<button data-action="coop-abandon" class="action-btn" ${busy ? "disabled" : ""}>Continue alone from their checkpoint</button>`;
+      } else {
+        cpLine = `<div style="color:#666;font-size:10px">${cp.name}'s checkpoint: ${cp.n} actions, ${cp.age} block${cp.age === 1 ? "" : "s"} ago (abandon after ${ABANDON_WINDOW_BLOCKS}).</div>`;
+      }
+    }
     coopBlock = `
       <div style="margin-top:6px;border-top:1px solid #333;padding-top:6px">
         <div style="color:#8cc;font-size:11px;font-weight:bold">Co-op run \u00b7 visit #${channelVisitId}</div>
         ${rows}
         <div style="color:#aaa;font-size:11px">${turnLine}</div>
         <div style="color:#666;font-size:10px">Shares (~) are projected: kill XP and gold pools split by damage dealt, final at settlement.</div>
+        ${cpLine}
         ${relay}
+      </div>`;
+  } else if (coopSolo) {
+    const claims = computeClaims(session);
+    const c = claims[coopSolo.me];
+    coopBlock = `
+      <div style="margin-top:6px;border-top:1px solid #333;padding-top:6px">
+        <div style="color:#8cc;font-size:11px;font-weight:bold">Co-op run \u00b7 visit #${coopSolo.visitId} \u00b7 continuing alone</div>
+        <div style="color:#aaa;font-size:11px">Partner left behind at action ${coopSolo.from}; reach a gate to settle.</div>
+        <div class="stat-row"><span class="stat-label">Projected</span><span class="stat-value">${c.kills}K \u00b7 ~${c.xp}xp ~${c.gold}g</span></div>
       </div>`;
   }
 
   let endButtons = "";
-  if (session.gameOver && coop) {
+  if (session.gameOver && (coop || coopSolo)) {
     if (coopSettleError) {
       endButtons = `
         <div style="margin-top:6px;color:#c44;font-size:11px">${coopSettleError}</div>
         <button data-action="coop-settle-retry" class="action-btn action-enter" ${busy ? "disabled" : ""}>Retry settlement</button>`;
     } else {
-      endButtons = `<div style="margin-top:6px;color:#888;font-size:11px">${coop.me === 0 ? "Settling on-chain (you submit once your partner confirms)..." : "Confirming on-chain; the host settles..."}</div>`;
+      endButtons = `<div style="margin-top:6px;color:#888;font-size:11px">${coopSolo ? "Settling alone on-chain..." : coop!.me === 0 ? "Settling on-chain (you submit once your partner confirms)..." : "Confirming on-chain; the host settles..."}</div>`;
     }
   } else if (session.gameOver) {
     if (channelSession) {
@@ -3600,7 +3825,7 @@ function updateDungeonStats(): void {
     <div>${goldLine}</div>
     <div>Kills: ${me().totalKills} &nbsp; Depth: ${session.depth}</div>
     ${coopBlock}
-    ${(session.gameOver || (coop && (me().dead || me().exited)))
+    ${(session.gameOver || ((coop || coopSolo) && (me().dead || me().exited)))
       ? `<div style="margin-top:8px;color:${me().exited ? '#4a4' : '#c44'};font-weight:bold">
            ${me().exited ? 'SURVIVED \u2014 Exited ' + me().exitGate : 'YOU DIED'}
          </div>${endButtons}`
@@ -3608,7 +3833,7 @@ function updateDungeonStats(): void {
     ${busy ? '<div style="margin-top:6px;color:#aa8">Submitting...</div>' : ""}
     <div style="margin-top:8px;font-size:11px;color:#888">
       WASD/Arrows: Move &nbsp; G: Pickup<br>
-      P: Potion &nbsp; Space: Wait &nbsp; Enter: ${coop ? "Exit run (on a gate)" : "Gate"}
+      P: Potion &nbsp; Space: Wait &nbsp; Enter: ${coop || coopSolo ? "Exit run (on a gate)" : "Gate"}
       ${!channelSession ? "<br>N: New Dungeon" : ""}
     </div>
   `;
@@ -3723,6 +3948,8 @@ if (typeof location !== "undefined"
         transportError: coop.transportError,
       } : null,
       coopVisit,
+      coopSolo,
+      partnerCheckpoint: (coop || coopSolo) ? partnerCheckpoint() : null,
     }),
     // Static wall grid for pathfinding (call once per session).
     map: () => {
@@ -3754,6 +3981,8 @@ if (typeof location !== "undefined"
     coopLeave: (visitId: number) => doCoopLeave(visitId),
     coopExit: () => { coop?.submitLocal({ type: "gate" }); },
     coopSync: () => syncCoopFromChain(),
+    coopCheckpoint: () => maybeCheckpoint(true),
+    coopAbandon: () => continueAlone(),
     // Dungeon-level control: drives the same path as the keyboard.
     input: (action: string, dx?: number, dy?: number) =>
       handleGameInput(action,

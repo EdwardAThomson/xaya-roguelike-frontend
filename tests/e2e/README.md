@@ -79,7 +79,10 @@ the frontend built (`npx tsc` → `dist/`), the xayax venv at
   a segment and hosts a visit, the other joins, both play the shared
   dungeon over the proxy relay and exit; asserts identical merged-log hashes
   on both clients, an on-chain `completed` visit with a result row per
-  player, and a clean teardown.
+  player, and a clean teardown. A second scenario closes one browser
+  mid-run, mines the abandonment window, and has the survivor continue
+  alone from the partner's last checkpoint and settle (partner banked as a
+  death).
 - `npm run compete` — scripted competition tests with hard assertions
   (`compete.mjs`): coordinate race (one winner), provisional access +
   confirm-unlocks-others, concurrent reward/ownership isolation. Needs a

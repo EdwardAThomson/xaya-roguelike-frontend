@@ -240,6 +240,52 @@ export function runCoopParityVector(): boolean {
   return ok;
 }
 
+/* Abandonment vector (spec section 11): the first ABSENT_PREFIX actions of
+   the co-op fixture, participant 1 marked absent, then participant 0's
+   pinned solo continuation to a gate. */
+const ABSENT_PREFIX = 60;
+const ABSENT_SUFFIX_LOG =
+  "0 move -1 0;0 move -1 1;0 move -1 0;0 move -1 1;0 move -1 1;0 move -1 1;" +
+  "0 move 0 1;0 move 0 1;0 move 0 1;0 move 0 1;0 move 0 1;0 move 0 1;" +
+  "0 move 0 1;0 move 0 1;0 gate;";
+
+export function runAbsentParityVector(): boolean {
+  const full = parseCanonicalLog(COOP_FIXTURE_LOG.replace(/;/g, "\n"));
+  const suffix = parseCanonicalLog(ABSENT_SUFFIX_LOG.replace(/;/g, "\n"));
+  const s = DungeonSession.replayMulti(
+    COOP_FIXTURE_SEED, COOP_FIXTURE_DEPTH, coopFixtureSetups(), full.slice(0, ABSENT_PREFIX));
+  if (s.mergedLog.length !== ABSENT_PREFIX) {
+    console.log("[absent-parity] ✗ FAIL — prefix did not replay");
+    return false;
+  }
+  s.markAbsent(1);
+  for (const la of suffix) {
+    if (!s.processActionBy(la.actor, la.action)) {
+      console.log(`[absent-parity] ✗ FAIL — suffix action rejected: ${JSON.stringify(la)}`);
+      return false;
+    }
+  }
+  const claims = computeClaims(s);
+  let line = "PARITY-COOP-ABSENT";
+  for (let i = 0; i < s.playerCount; i++) {
+    const p = s.players[i];
+    const c = claims[i];
+    line += ` p${i}[survived=${c.survived ? 1 : 0} absent=${p.absent ? 1 : 0} xp=${c.xp}` +
+            ` gold=${c.gold} kills=${c.kills} hp=${p.hp} dmg=${p.damageDealt} exit=${p.exitGate}]`;
+  }
+  line += ` turns=${s.turnCount}`;
+  line += ` hash=${settleLogHash(COOP_FIXTURE_VISIT_ID, s.mergedLog)}`;
+  console.log(line);
+  const expected =
+    "PARITY-COOP-ABSENT" +
+    " p0[survived=1 absent=0 xp=43 gold=0 kills=2 hp=95 dmg=101 exit=south]" +
+    " p1[survived=0 absent=1 xp=0 gold=4 kills=1 hp=105 dmg=1 exit=]" +
+    " turns=75 hash=fc4fa9c95fa60f93a14798ae4da7a618995deb07f6927ced08521bdcf998c602";
+  const ok = line === expected && s.gameOver;
+  console.log(`[absent-parity] ${ok ? "✓ OK" : "✗ FAIL — C++/TS absent-partner handling diverged"}`);
+  return ok;
+}
+
 export function runSettleHashVector(): boolean {
   // One entry of every action type, so the whole canonical encoding is
   // locked (pinned in coop_parity_tests.cpp as well).
@@ -293,6 +339,7 @@ const results = [
   runSettleHashVector(),
   runSplitPoolVectors(),
   runCoopParityVector(),
+  runAbsentParityVector(),
 ];
 runEquipParityVector();
 // A thrown error makes `node dist/game/parity_test.js` exit non-zero.

@@ -83,3 +83,15 @@ export const MOVE_TRANSPORT: MoveTransportKind = "proxy";
  */
 export const XAYA_ACCOUNTS_ADDRESS = ""; // XayaAccounts contract address
 export const EVM_CHAIN_ID = 0; // target chain id (e.g. 137 for Polygon)
+
+/**
+ * Co-op abandonment (backend SPEC_multiplayer_coop.md section 11).  A
+ * partner whose latest checkpoint is at least ABANDON_WINDOW_BLOCKS old
+ * (mirrors MoveProcessor::ABANDON_WINDOW_BLOCKS) can be left behind: the
+ * survivor continues alone from that checkpoint.  Checkpoints go out every
+ * COOP_CHECKPOINT_ACTIONS applied actions, and at least every
+ * COOP_HEARTBEAT_MS while the run is live, so a live partner is never stale.
+ */
+export const ABANDON_WINDOW_BLOCKS = 20;
+export const COOP_CHECKPOINT_ACTIONS = 16;
+export const COOP_HEARTBEAT_MS = 30000;
