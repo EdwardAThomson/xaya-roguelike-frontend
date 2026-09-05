@@ -26,12 +26,12 @@ with deterministic RNG, and submits action-replay proofs on-chain. Pairs with th
 - [x] Crash-safe runs — persist/resume in-progress runs, auto-recover server-side timeouts and death knock-back
 - [x] Dark monospace theme; `tsc` build with source maps
 - [x] Multiplayer engine mirror: N-participant `session.ts` (round structure, ring spawn, multi-target monster AI, damage tracking and reward pools) plus `settle.ts` (consent hash, pool split, claims), with pinned 2-player parity fixtures against the C++ backend (`npm test`)
-- [x] 2-player co-op, end to end: `net/coop.ts` transport + runner over the devnet proxy relay, host/join/leave lobby in the Map sidebar, shared run with a partner sprite and projected reward shares, mutual-consent settlement (`sc` + `s`), runner convergence test and a two-browser Playwright run (`npm run coop`)
+- [x] 2-player co-op, end to end: `net/coop.ts` transport + runner over the devnet proxy relay, host/join/leave/cancel lobby in the Map sidebar, shared run with a partner sprite and projected reward shares, mutual-consent settlement (`sc` + `s`), runner convergence test and a two-browser Playwright run (`npm run coop`)
 
 ## Next
 
 - [ ] MetaMask wallet integration (Phase F4b) — `window.ethereum`, ABI encoding, tx tracking
-- [ ] Co-op Phase 2 robustness: mid-run checkpoint confirms so a survivor can settle after a partner vanishes; host cancel for an open visit; WebRTC transport
+- [ ] Co-op Phase 2 robustness: mid-run checkpoint confirms so a survivor can settle after a partner vanishes; WebRTC transport
 
 ## Backlog
 

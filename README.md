@@ -19,6 +19,7 @@ Browser-based frontend for the [Xaya Roguelike](https://github.com/EdwardAThomso
 - **Character sheet**: Tabbed in-game panel (Character, Inventory, Players, Help) with base and effective stats, XP progress, and mid-run equip of banked gear
 - **Crash-safe runs**: In-progress dungeon runs persist locally and deterministically resume on reload, and explored maps (fog of war) survive reloads too; server-side timeouts and death knock-backs auto-recover
 - **Multiplayer presence**: Other players shown as tokens on the overworld map and listed (active first) in a Players tab
+- **Two-player co-op**: Host or join a visit from the Map sidebar, then play one shared dungeon in rounds of one action each; your partner is drawn in the dungeon and on the minimap, kill rewards split by damage dealt, and the run settles on-chain by mutual consent (`sc` confirm + `s` settle)
 - **Account picker**: On a hosted deploy, Play opens a character chooser listing the characters this browser has already claimed, plus a "new character" form that registers on-chain; local dev keeps the name + Connect controls in the topbar
 - **Channel integration**: Enter dungeons using real on-chain player stats, exit with cryptographic replay proof
 - **Deterministic**: Dungeon generation and RNG verified identical to C++ backend (SHA-256 + MT19937)
@@ -31,6 +32,10 @@ npm install
 
 # Compile
 npx tsc
+
+# Compile and run the automated checks: the cross-language parity vectors
+# (pinned against the backend's tests) and the co-op runner convergence test
+npm test
 
 # Serve (sends no-store, so a reload always picks up the latest build)
 python3 serve.py 8000
@@ -65,6 +70,17 @@ python3 serve.py 8000
 6. Click a segment, then **Enter Dungeon** (to travel between segments, walk to a gate inside a dungeon and step through)
 7. Play the dungeon, then click **Submit Results On-Chain**
 
+### Co-op (two browsers)
+
+Connect two different player names to the same devnet, then in the Map view:
+
+1. Player A selects a **confirmed** segment (not the hub) and clicks **Host co-op run at ...**; the sidebar shows the open visit with a **Cancel visit** button
+2. Player B clicks the **Join #N at ...** button for that visit (**Leave visit** backs out again)
+3. The run starts automatically once the visit is full; both clients play the same dungeon in rounds of one action per player, with the partner drawn in teal
+4. When the run is over, settlement is automatic: the joiner sends an `sc` confirm of the merged action log, and the host sends the `s` settle once that confirm is on chain
+
+`npm run coop` drives this flow end to end in two headless browsers (see `tests/e2e/README.md`).
+
 ## Project structure
 
 ```
@@ -77,7 +93,10 @@ src/
   config.ts                 GSP URL, proxy URL, constants
   game/
     dungeon.ts              Procedural dungeon generation (80x40 grid)
-    session.ts              Turn-based dungeon session engine
+    session.ts              Turn-based dungeon session engine (N participants; solo is participant 0)
+    settle.ts               Multiplayer settlement: canonical action lines, consent hash, pool split, claims
+    parity_test.ts          Cross-language parity vectors pinned against the backend (`npm test`)
+    hash_test.ts            SHA-256 test vectors (`runHashTests()` from the browser console)
     combat.ts               Attack/defense/crit/dodge math
     monsters.ts             12 monster templates scaled by depth
     items.ts                31 item definitions (weapons, armor, potions)
@@ -100,6 +119,8 @@ src/
     walletTransport.ts      Wallet (window.ethereum) move transport, dormant until Phase F4b
     validator.ts            Client-side pre-validation (mirrors moveparser.cpp)
     pending.ts              Post-submit watcher: applied / rejected / pending, counted in blocks
+    coop.ts                 Co-op runtime: relay transport (devnet proxy) + runner that merges both players' actions
+    coop_test.ts            Two-runner convergence test over an in-memory relay (`npm test`)
   ui/
     modal.ts                Error/confirm dialogs
     overlay.ts              Overlay rendering
@@ -129,9 +150,14 @@ problem. `src/config.ts` picks the defaults from the origin (localhost and
 `file://` get the fixed devnet ports), and `?gsp=` / `?proxy=` query params
 override them for test harnesses.
 
-**Overworld mode**: Fetches player info, segments, and visits from the GSP. Renders the segment graph centered on the player's current position. Sidebar shows stats, inventory, and action buttons (discover, enter dungeon).
+In connected mode the move proxy also carries the co-op message relay
+(`relay_send` / `relay_recv`): each client sends only its own dungeon actions,
+and `net/coop.ts` applies them on both sides in the engine's turn order so the
+two clients converge on one merged action log.
 
-**Dungeon mode**: Runs a `DungeonSession` locally. In channel mode, uses the real segment seed and player stats from the GSP. On exit, submits the action replay proof on-chain for verification.
+**Overworld mode**: Fetches player info, segments, and visits from the GSP. Renders the segment graph centered on the player's current position. Sidebar shows stats, inventory, and action buttons (discover, enter dungeon, host/join a co-op visit).
+
+**Dungeon mode**: Runs a `DungeonSession` locally. In channel mode, uses the real segment seed and player stats from the GSP. On exit, submits the action replay proof on-chain for verification. In co-op the same session runs with two participants and the merged log is settled by mutual consent (`sc` confirm, then `s` settle from the host).
 
 ## Determinism
 
@@ -142,6 +168,7 @@ All game-critical algorithms are verified to produce identical output in TypeScr
 | SHA-256 | `game/hash.ts` | `hash.hpp` | byte-for-byte |
 | MT19937 RNG | `game/rng.ts` | `std::mt19937` | output sequence |
 | Dungeon gen | `game/dungeon.ts` | `dungeon.cpp` | 3200/3200 tiles |
+| Co-op session + settlement | `game/session.ts`, `game/settle.ts` | `dungeongame.cpp`, `moveprocessor.cpp` | pinned 2-player vectors (`npm test`) |
 
 This ensures the browser can generate dungeons and record action logs that the GSP will accept during on-chain verification.
 
