@@ -67,7 +67,7 @@ export class MoveClient {
     name: string,
     visitId: number,
     results: { survived: boolean; xp: number; gold: number; kills: number },
-    actions: object[],
+    actions: object[] | string,
   ): Promise<void> {
     await this.transport.submitMove(name, { xc: { id: visitId, results, actions } });
     await this.transport.mine();
@@ -109,7 +109,7 @@ export class MoveClient {
     dir: string,
     settlement?: {
       results: { survived: boolean; xp: number; gold: number; kills: number };
-      actions: object[];
+      actions: object[] | string;
     },
     transit = false,
   ): Promise<void> {
@@ -166,10 +166,10 @@ export class MoveClient {
    * solo continuation.
    */
   async settle(
-    name: string, visitId: number, results: object[], actions: object[],
+    name: string, visitId: number, results: object[], actions: object[] | string,
     soloFrom?: number,
   ): Promise<void> {
-    const s: { id: number; results: object[]; actions: object[]; solo_from?: number } =
+    const s: { id: number; results: object[]; actions: object[] | string; solo_from?: number } =
       { id: visitId, results, actions };
     if (soloFrom !== undefined) s.solo_from = soloFrom;
     await this.transport.submitMove(name, { s });

@@ -39,7 +39,7 @@ The parity-critical files — do not change behavior without verifying against t
 - `src/game/rng.ts` — MT19937; `nextInt` uses Lemire's method `(uint64(raw) * n) >> 32`, **not** `raw % n`
 - `src/game/dungeon.ts` — dungeon generation, verified tile-for-tile against `dungeon.cpp`
 - `src/game/session.ts` — port of `dungeongame.cpp`: an N-participant engine (rounds of one action per active participant in canonical order, then one monster pass); the solo surface (`playerX`, `processAction(action)`, ...) is a view of participant 0 and must stay byte-identical for N = 1. Seed format is `seed + ":game:" + depth`; records `actionLog[]` (solo) and `mergedLog[]` (with actor indices) for settlement
-- `src/game/settle.ts` — port of the settlement layer in `moveprocessor.cpp`: canonical action lines and the `sc` consent hash (`settleLogHash`), pro-rata `splitPool`, and `computeClaims` (what the GSP verifies a multiplayer `s` settle against). Spec: backend `docs/SPEC_multiplayer_coop.md`
+- `src/game/settle.ts` — port of the settlement layer in `moveprocessor.cpp`: canonical action lines and the `sc` consent hash (`settleLogHash`), pro-rata `splitPool`, `computeClaims` (what the GSP verifies a multiplayer `s` settle against), and the compact proof encoding (`encodeCompactLog`, parsed by the GSP's `ParseCompactActions`; all settlement moves send it when `COMPACT_ACTIONS` is on). Spec: backend `docs/SPEC_multiplayer_coop.md`, `docs/STRATEGY_action_proofs.md`
 - `src/game/monsters.ts` / `src/game/items.ts` — databases must match the backend's
 
 `docs/PARITY_AND_ERRORS.md` is the parity audit and lists known gaps.

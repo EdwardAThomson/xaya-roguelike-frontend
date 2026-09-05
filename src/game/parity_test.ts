@@ -16,7 +16,7 @@ import { DungeonSession, GameAction, EntryInvItem, PlayerSetup } from "./session
 import { PlayerStats } from "./combat.js";
 import {
   canonicalActionLine, computeClaims, parseCanonicalLog, settleLogHash,
-  splitPool,
+  splitPool, encodeCompactLog, decodeCompactLog,
 } from "./settle.js";
 
 /**
@@ -286,6 +286,45 @@ export function runAbsentParityVector(): boolean {
   return ok;
 }
 
+/* Pinned compact form of the co-op fixture (backend
+   tests/compact_actions_tests.cpp): the encoder must emit exactly this. */
+const COOP_FIXTURE_COMPACT =
+  "0:e3,weapon;1:w;0:m6;1:m6;0:m6;1:m8;0:m6;1:m8;0:m9;1:m2;0:m8;1:m3;0:m8;" +
+  "1:m3;0:m8;1:m6;0:uhealth_potion;1:m6;0:m8;1:m6;0:m6;1:m6;0:m6;1:m6;0:m6;" +
+  "1:m6;0:m6;1:p;0:m6;1:m6;0:m6;1:m6;0:m6;1:m6;0:m6;1:m6;0:m6;1:m6;0:m6;" +
+  "1:m6;0:m6;1:m6;0:m6;1:m6;0:m6;1:m6;0:m6;1:m6;0:m3;1:m6;0:m9;1:m9;0:m9;" +
+  "1:m9;0:m8;1:m9;0:m8;1:m8;0:m6;1:m9;0:m9;1:m9;0:m9;1:m8;0:m8;1:m8;0:m9;" +
+  "1:m8;0:m7;1:m8;0:m1;1:m8;0:m1;1:m8;0:m1;1:m8;0:m1;1:m8;0:m1;1:m8;0:m4;" +
+  "1:m2;0:m1;1:m2;0:m1;1:m2;0:m1;1:m3;0:m2;1:m3;0:m2;1:m3;0:m2;1:m3;0:m2;" +
+  "1:m6;0:m2;1:m6;0:m2;1:m6;0:m2;1:m6;0:m2;1:m6;0:g;1:m6;1:uhealth_potion;" +
+  "1:m6;1:m4*13;1:m1*2;1:m2*8;1:g";
+
+export function runCompactEncodingVector(): boolean {
+  const log = parseCanonicalLog(COOP_FIXTURE_LOG.replace(/;/g, "\n"));
+  const encoded = encodeCompactLog(log, true);
+  const encodeOk = encoded === COOP_FIXTURE_COMPACT;
+  let decodeOk = false;
+  try {
+    const decoded = decodeCompactLog(COOP_FIXTURE_COMPACT, true);
+    decodeOk = decoded.length === log.length
+      && settleLogHash(COOP_FIXTURE_VISIT_ID, decoded) === settleLogHash(COOP_FIXTURE_VISIT_ID, log);
+  } catch (e) {
+    console.log("[compact] decode threw: " + (e instanceof Error ? e.message : String(e)));
+  }
+  // Solo form round-trips too (no actor prefixes).
+  const solo = log.map(la => la.action);
+  let soloOk = false;
+  try {
+    const back = decodeCompactLog(encodeCompactLog(solo.map(a => ({ actor: 0, action: a })), false), false);
+    soloOk = back.length === solo.length
+      && settleLogHash(1, back) === settleLogHash(1, solo.map(a => ({ actor: 0, action: a })));
+  } catch { /* reported below */ }
+  const ok = encodeOk && decodeOk && soloOk;
+  console.log(`[compact] ${encoded.length} bytes for ${log.length} actions ` +
+    `${ok ? "✓ OK" : `✗ FAIL (encode=${encodeOk} decode=${decodeOk} solo=${soloOk})`}`);
+  return ok;
+}
+
 export function runSettleHashVector(): boolean {
   // One entry of every action type, so the whole canonical encoding is
   // locked (pinned in coop_parity_tests.cpp as well).
@@ -340,6 +379,7 @@ const results = [
   runSplitPoolVectors(),
   runCoopParityVector(),
   runAbsentParityVector(),
+  runCompactEncodingVector(),
 ];
 runEquipParityVector();
 // A thrown error makes `node dist/game/parity_test.js` exit non-zero.

@@ -95,3 +95,10 @@ export const EVM_CHAIN_ID = 0; // target chain id (e.g. 137 for Polygon)
 export const ABANDON_WINDOW_BLOCKS = 20;
 export const COOP_CHECKPOINT_ACTIONS = 16;
 export const COOP_HEARTBEAT_MS = 30000;
+
+/**
+ * Send settlement action proofs (xc, gw, s) in the compact string encoding
+ * (settle.ts encodeCompactLog; parsed by the GSP's ParseCompactActions)
+ * instead of the JSON array.  Roughly a quarter of the calldata.
+ */
+export const COMPACT_ACTIONS = true;

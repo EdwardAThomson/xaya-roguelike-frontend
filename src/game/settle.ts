@@ -151,3 +151,114 @@ export function toWireResults(
 ): object[] {
   return computeClaims(session).map((c, i) => ({ p: names[i], ...c }));
 }
+
+/**
+ * Compact settlement encoding (backend docs/STRATEGY_action_proofs.md
+ * option A, parsed by ParseCompactActions in moveprocessor.cpp): entries
+ * separated by ";", each "[<i>:]<code><args>[*<count>]" with codes
+ * m<numpad digit> (move), p (pickup), w (wait), g (gate), u<item> (use),
+ * e<rowid>,<slot> (equip), q<rowid> (unequip).  The actor prefix is used
+ * for merged (multiplayer) logs only.  Maximal runs of identical entries
+ * collapse to "*<n>": the GSP expands them before anything else sees the
+ * log, so the canonical hash lines are unaffected.  Roughly a quarter of
+ * the JSON array's size.
+ */
+const NUMPAD: Record<string, string> = {
+  "-1,-1": "7", "0,-1": "8", "1,-1": "9",
+  "-1,0": "4",               "1,0": "6",
+  "-1,1": "1",  "0,1": "2",  "1,1": "3",
+};
+const NUMPAD_INV: Record<string, [number, number]> = {
+  "7": [-1, -1], "8": [0, -1], "9": [1, -1],
+  "4": [-1, 0],                "6": [1, 0],
+  "1": [-1, 1],  "2": [0, 1],  "3": [1, 1],
+};
+
+function compactEntry(a: GameAction): string {
+  switch (a.type) {
+    case "move": {
+      const code = NUMPAD[`${a.dx ?? 0},${a.dy ?? 0}`];
+      if (!code) throw new Error(`bad move delta ${a.dx},${a.dy}`);
+      return "m" + code;
+    }
+    case "pickup":  return "p";
+    case "wait":    return "w";
+    case "gate":    return "g";
+    case "use":     return "u" + (a.itemId ?? "");
+    case "equip":   return `e${a.rowid ?? 0},${a.slot ?? ""}`;
+    case "unequip": return `q${a.rowid ?? 0}`;
+  }
+}
+
+/** Encodes a solo action log (no actor prefixes). */
+export function encodeCompactActions(actions: GameAction[]): string {
+  return encodeCompactLog(actions.map(a => ({ actor: 0, action: a })), false);
+}
+
+/** Encodes a merged log; `withActor` adds the "<i>:" prefix to every entry. */
+export function encodeCompactLog(log: LoggedAction[], withActor: boolean): string {
+  const entries = log.map(la => (withActor ? `${la.actor}:` : "") + compactEntry(la.action));
+  const out: string[] = [];
+  for (let k = 0; k < entries.length;) {
+    let j = k;
+    while (j + 1 < entries.length && entries[j + 1] === entries[k]) j++;
+    const n = j - k + 1;
+    out.push(entries[k] + (n > 1 ? `*${n}` : ""));
+    k = j + 1;
+  }
+  return out.join(";");
+}
+
+/** Decodes the compact encoding (mirrors the GSP parser; throws on bad input). */
+export function decodeCompactLog(text: string, withActor: boolean): LoggedAction[] {
+  const out: LoggedAction[] = [];
+  if (text === "") return out;
+  for (let entry of text.split(";")) {
+    let count = 1;
+    const star = entry.indexOf("*");
+    if (star >= 0) {
+      count = Number(entry.slice(star + 1));
+      if (!/^[0-9]+$/.test(entry.slice(star + 1)) || count < 1 || count > 10000)
+        throw new Error("bad repeat: " + entry);
+      entry = entry.slice(0, star);
+    }
+    let actor = 0;
+    const colon = entry.indexOf(":");
+    if (withActor) {
+      if (colon < 0 || !/^[0-9]+$/.test(entry.slice(0, colon))) throw new Error("missing actor: " + entry);
+      actor = Number(entry.slice(0, colon));
+      entry = entry.slice(colon + 1);
+    } else if (colon >= 0) {
+      throw new Error("unexpected actor: " + entry);
+    }
+    if (!entry) throw new Error("empty entry");
+    const arg = entry.slice(1);
+    let action: GameAction;
+    switch (entry[0]) {
+      case "m": {
+        const d = NUMPAD_INV[arg];
+        if (arg.length !== 1 || !d) throw new Error("bad move: " + entry);
+        action = { type: "move", dx: d[0], dy: d[1] };
+        break;
+      }
+      case "p": if (arg) throw new Error("bad pickup"); action = { type: "pickup" }; break;
+      case "w": if (arg) throw new Error("bad wait"); action = { type: "wait" }; break;
+      case "g": if (arg) throw new Error("bad gate"); action = { type: "gate" }; break;
+      case "u": if (!arg) throw new Error("bad use"); action = { type: "use", itemId: arg }; break;
+      case "e": {
+        const comma = arg.indexOf(",");
+        if (comma < 1 || comma + 1 >= arg.length || !/^-?[0-9]+$/.test(arg.slice(0, comma)))
+          throw new Error("bad equip: " + entry);
+        action = { type: "equip", rowid: Number(arg.slice(0, comma)), slot: arg.slice(comma + 1) };
+        break;
+      }
+      case "q":
+        if (!/^-?[0-9]+$/.test(arg)) throw new Error("bad unequip: " + entry);
+        action = { type: "unequip", rowid: Number(arg) };
+        break;
+      default: throw new Error("bad code: " + entry);
+    }
+    for (let k = 0; k < count; k++) out.push({ actor, action });
+  }
+  return out;
+}

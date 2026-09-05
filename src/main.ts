@@ -10,7 +10,11 @@
 
 import { WIDTH, HEIGHT } from "./game/dungeon.js";
 import { DungeonSession, GameAction, PlayerSetup, PlayerState } from "./game/session.js";
-import { settleLogHash, toWireAction, toWireResults, computeClaims } from "./game/settle.js";
+import {
+  settleLogHash, toWireAction, toWireResults, computeClaims,
+  encodeCompactActions, encodeCompactLog,
+} from "./game/settle.js";
+import { LoggedAction } from "./game/session.js";
 import { CoopRunner, ProxyRelayTransport } from "./net/coop.js";
 import { PlayerStats } from "./game/combat.js";
 import { Camera } from "./render/camera.js";
@@ -29,7 +33,24 @@ import { drawDungeonMap } from "./render/dungeonmap.js";
 import {
   DEFAULT_GSP_URL, DEFAULT_PROXY_URL, isHostedOrigin,
   ABANDON_WINDOW_BLOCKS, COOP_CHECKPOINT_ACTIONS, COOP_HEARTBEAT_MS,
+  COMPACT_ACTIONS,
 } from "./config.js";
+
+/** A solo action proof for xc / gw: compact string or the JSON array. */
+function soloProof(actions: GameAction[]): object[] | string {
+  if (COMPACT_ACTIONS) return encodeCompactActions(actions);
+  return actions.map(a => {
+    if (a.type === "use") return { type: "use", item: a.itemId };
+    if (a.type === "equip") return { type: "equip", rowid: a.rowid, slot: a.slot };
+    if (a.type === "unequip") return { type: "unequip", rowid: a.rowid };
+    return a;
+  });
+}
+
+/** A merged-log proof for the multiplayer `s` move. */
+function mergedProof(log: LoggedAction[]): object[] | string {
+  return COMPACT_ACTIONS ? encodeCompactLog(log, true) : log.map(toWireAction);
+}
 import {
   ValidatorContext, ValidationResult,
   validateDiscover, validateTravel, validateEnterChannel,
@@ -1294,7 +1315,7 @@ async function coopSoloSettle(): Promise<void> {
   try {
     s.addMessage("Run over. Settling alone on-chain...", "info");
     await moves.settle(myName, solo.visitId, toWireResults(s, solo.names),
-                       s.mergedLog.map(toWireAction), solo.from);
+                       mergedProof(s.mergedLog), solo.from);
     const ok = await waitForVisitStatus(solo.visitId, st => st !== "active", 60000);
     if (!ok) throw new Error("The GSP did not settle the run in time. Retry the settlement.");
     busy = false;
@@ -1342,7 +1363,7 @@ async function coopSettle(): Promise<void> {
 
   const hash = settleLogHash(visitId, s.mergedLog);
   const results = toWireResults(s, runner.names);
-  const actions = s.mergedLog.map(toWireAction);
+  const actions = mergedProof(s.mergedLog);
   const others = runner.names.filter(n => n !== myName);
 
   busy = true;
@@ -1782,14 +1803,7 @@ async function doExitChannel(): Promise<void> {
       kills: me().totalKills,
     };
 
-    // Convert TS actionLog to C++ format: "itemId" -> "item"; equip/unequip
-    // pass through carrying their rowid/slot (same shape the GSP replays).
-    const actions = session.actionLog.map(a => {
-      if (a.type === "use") return { type: "use", item: a.itemId };
-      if (a.type === "equip") return { type: "equip", rowid: a.rowid, slot: a.slot };
-      if (a.type === "unequip") return { type: "unequip", rowid: a.rowid };
-      return a;
-    });
+    const actions = soloProof(session.actionLog);
 
     const beforeVisit = channelVisitId;
     await moves.exitChannel(connState.playerName, channelVisitId, results, actions);
@@ -2170,7 +2184,7 @@ async function doGateWalk(dir: string): Promise<void> {
   const curConfirmed = !!ctx.segments.get(segKey(ctx.player.segment))?.confirmed;
   let settlement: undefined | {
     results: { survived: boolean; xp: number; gold: number; kills: number };
-    actions: object[];
+    actions: object[] | string;
   };
   let transit = false;
   if (channelSession && session) {
@@ -2191,13 +2205,7 @@ async function doGateWalk(dir: string): Promise<void> {
     if (curConfirmed && !earnedRewards) {
       transit = true;
     } else {
-      const actions: object[] = session.actionLog.map(a => {
-        if (a.type === "use") return { type: "use", item: a.itemId };
-        if (a.type === "equip") return { type: "equip", rowid: a.rowid, slot: a.slot };
-        if (a.type === "unequip") return { type: "unequip", rowid: a.rowid };
-        return a;
-      });
-      actions.push({ type: "gate" });
+      const actions = soloProof([...session.actionLog, { type: "gate" }]);
       settlement = {
         results: {
           survived: true,
