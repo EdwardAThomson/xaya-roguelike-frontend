@@ -1,6 +1,6 @@
 # Frontend Parity & Error-Handling Plan
 
-Audit date: 2026-04-14 (original), last reconciled 2026-09-01
+Audit date: 2026-04-14 (original), last reconciled 2026-09-06
 Backend reference: `~/Projects/xayaroguelike` at commit `0532b41`,
 re-checked against `32e635b`
 Frontend reference: `~/Projects/xaya-roguelike-frontend` (this repo)
@@ -19,8 +19,10 @@ All three implementation passes below have since shipped:
 pre-validation and [src/net/pending.ts](../src/net/pending.ts) the
 post-submission watch. The multiplayer engine and settlement helpers
 (`session.ts`, `settle.ts`) mirror the backend's co-op spec and are
-pinned by the parity vectors in `npm test`; the co-op runtime, lobby and
-settle flow (`net/coop.ts`, `main.ts`) are covered by `npm run coop`.
+pinned by the parity vectors in `npm test` (including the absent-partner
+vector for the backend's abandonment rule); the co-op runtime, lobby,
+checkpoint confirms, continue-alone and settle flow (`net/coop.ts`,
+`main.ts`) are covered by the two scenarios of `npm run coop`.
 
 The on-chain stat-fabrication attack vector documented in
 `~/Projects/xayaroguelike/docs/SECURITY_Attack_and_Mitigations.md`
@@ -38,7 +40,9 @@ state.
   `seed + ":game:" + depth` matches `dungeon.cpp`
 - [src/game/session.ts](../src/game/session.ts) — `actionLog[]` is
   recorded per turn and sent in the `xc` settlement move for replay
-  verification
+  verification; with `COMPACT_ACTIONS` on it goes out as the compact
+  string from `settle.ts` `encodeCompactLog`, pinned against the
+  backend's `ParseCompactActions` tests in `npm test`
 - Monster database: 12 monsters, stats and depth-scaling identical
   to backend `monsters.cpp`
 - Item database: 31 items, ids identical to backend `items.cpp`

@@ -19,7 +19,7 @@ Browser-based frontend for the [Xaya Roguelike](https://github.com/EdwardAThomso
 - **Character sheet**: Tabbed in-game panel (Character, Inventory, Players, Help) with base and effective stats, XP progress, and mid-run equip of banked gear
 - **Crash-safe runs**: In-progress dungeon runs persist locally and deterministically resume on reload, and explored maps (fog of war) survive reloads too; server-side timeouts and death knock-backs auto-recover
 - **Multiplayer presence**: Other players shown as tokens on the overworld map and listed (active first) in a Players tab
-- **Two-player co-op**: Host or join a visit from the Map sidebar, then play one shared dungeon in rounds of one action each; your partner is drawn in the dungeon and on the minimap, kill rewards split by damage dealt, and the run settles on-chain by mutual consent (`sc` confirm + `s` settle)
+- **Two-player co-op**: Host or join a visit from the Map sidebar, then play one shared dungeon in rounds of one action each; your partner is drawn in the dungeon and on the minimap, kill rewards split by damage dealt, and the run settles on-chain by mutual consent (`sc` confirm + `s` settle). Checkpoint confirms go out during the run, so if a partner vanishes the sidebar offers **Continue alone from their checkpoint** once their last checkpoint is old enough, and the survivor finishes solo and settles with `solo_from`
 - **Account picker**: On a hosted deploy, Play opens a character chooser listing the characters this browser has already claimed, plus a "new character" form that registers on-chain; local dev keeps the name + Connect controls in the topbar
 - **Channel integration**: Enter dungeons using real on-chain player stats, exit with cryptographic replay proof
 - **Deterministic**: Dungeon generation and RNG verified identical to C++ backend (SHA-256 + MT19937)
@@ -78,6 +78,7 @@ Connect two different player names to the same devnet, then in the Map view:
 2. Player B clicks the **Join #N at ...** button for that visit (**Leave visit** backs out again)
 3. The run starts automatically once the visit is full; both clients play the same dungeon in rounds of one action per player, with the partner drawn in teal
 4. When the run is over, settlement is automatic: the joiner sends an `sc` confirm of the merged action log, and the host sends the `s` settle once that confirm is on chain
+5. During the run each client also sends periodic `sc` checkpoint confirms (every `COOP_CHECKPOINT_ACTIONS` applied actions, and at least every `COOP_HEARTBEAT_MS` as a heartbeat). The sidebar shows the partner's last checkpoint and its age; once it is `ABANDON_WINDOW_BLOCKS` old, **Continue alone from their checkpoint** rebuilds the run at that checkpoint, marks the partner absent, and lets the survivor play out and settle solo (`s` with `solo_from`). All three constants live in `src/config.ts`
 
 `npm run coop` drives this flow end to end in two headless browsers (see `tests/e2e/README.md`).
 
@@ -94,7 +95,7 @@ src/
   game/
     dungeon.ts              Procedural dungeon generation (80x40 grid)
     session.ts              Turn-based dungeon session engine (N participants; solo is participant 0)
-    settle.ts               Multiplayer settlement: canonical action lines, consent hash, pool split, claims
+    settle.ts               Multiplayer settlement: canonical action lines, consent hash, pool split, claims, compact proof encoding
     parity_test.ts          Cross-language parity vectors pinned against the backend (`npm test`)
     hash_test.ts            SHA-256 test vectors (`runHashTests()` from the browser console)
     combat.ts               Attack/defense/crit/dodge math
@@ -157,7 +158,7 @@ two clients converge on one merged action log.
 
 **Overworld mode**: Fetches player info, segments, and visits from the GSP. Renders the segment graph centered on the player's current position. Sidebar shows stats, inventory, and action buttons (discover, enter dungeon, host/join a co-op visit).
 
-**Dungeon mode**: Runs a `DungeonSession` locally. In channel mode, uses the real segment seed and player stats from the GSP. On exit, submits the action replay proof on-chain for verification. In co-op the same session runs with two participants and the merged log is settled by mutual consent (`sc` confirm, then `s` settle from the host).
+**Dungeon mode**: Runs a `DungeonSession` locally. In channel mode, uses the real segment seed and player stats from the GSP. On exit, submits the action replay proof on-chain for verification; with `COMPACT_ACTIONS` on (the default) every settlement move (`xc`, the `gw` settlement, `s`) sends the proof as the GSP's compact string encoding (`settle.ts` `encodeCompactLog`, about a quarter of the JSON array's calldata) rather than the JSON array. In co-op the same session runs with two participants and the merged log is settled by mutual consent (`sc` confirm, then `s` settle from the host); if a partner goes stale the survivor can continue alone from their last checkpoint and settle with `solo_from`.
 
 ## Determinism
 
@@ -168,7 +169,7 @@ All game-critical algorithms are verified to produce identical output in TypeScr
 | SHA-256 | `game/hash.ts` | `hash.hpp` | byte-for-byte |
 | MT19937 RNG | `game/rng.ts` | `std::mt19937` | output sequence |
 | Dungeon gen | `game/dungeon.ts` | `dungeon.cpp` | 3200/3200 tiles |
-| Co-op session + settlement | `game/session.ts`, `game/settle.ts` | `dungeongame.cpp`, `moveprocessor.cpp` | pinned 2-player vectors (`npm test`) |
+| Co-op session + settlement | `game/session.ts`, `game/settle.ts` | `dungeongame.cpp`, `moveprocessor.cpp` | pinned 2-player vectors incl. absent partner and compact proof form (`npm test`) |
 
 This ensures the browser can generate dungeons and record action logs that the GSP will accept during on-chain verification.
 
@@ -177,7 +178,7 @@ This ensures the browser can generate dungeons and record action logs that the G
 - **Zero npm runtime deps**: No supply chain attack surface in production
 - **No wallet keys in code**: Signing via `window.ethereum` (MetaMask) in production
 - **Local dungeon play**: No private data leaves the browser during gameplay
-- **Replay proofs**: Full action log submitted for on-chain deterministic verification
+- **Replay proofs**: Full action log submitted (in the compact string encoding) for on-chain deterministic verification
 - **Readable source**: Players can inspect the TypeScript source for trust
 
 ## What's next
