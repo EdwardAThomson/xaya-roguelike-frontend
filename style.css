@@ -831,3 +831,35 @@ body {
   font-size: 10px; color: #c9b24a; text-transform: none;
   letter-spacing: normal; margin-left: 6px;
 }
+
+/* Multi-choice modal (showChoiceModal): actions stack so each can carry a
+   second explanatory line, e.g. the gate dialog offering a solo walk, a
+   co-op host and a join. */
+.modal-actions-stacked {
+  flex-direction: column-reverse;
+  align-items: stretch;
+  gap: 6px;
+}
+.modal-choice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+  padding: 8px 10px;
+}
+.modal-choice-detail {
+  font-size: 11px;
+  color: #999;
+  font-weight: normal;
+}
+
+/* Co-op tab: one panel per run you can start or join from where you stand. */
+.coop-panel {
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin: 6px 0;
+  background: #1a1a1a;
+}
+.coop-dim { font-size: 11px; color: #888; margin: 2px 0 6px; }

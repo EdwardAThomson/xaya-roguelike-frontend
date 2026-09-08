@@ -139,6 +139,12 @@ export interface VisitInfo {
   /** In join order (NOT canonical order; sort by name for that). */
   participants: string[];
   /**
+   * The gate each participant walks in through, by name.  Players meet by
+   * converging on the segment from their own sides, so each has their own
+   * entry gate and spawns at it ("" = the centre/ring spawn).
+   */
+  entry_directions: Record<string, string>;
+  /**
    * Settlement confirms on file: participant name -> the hash of the
    * first `n` merged-log actions and the block height it was recorded at
    * (a checkpoint, or the whole log at the end).

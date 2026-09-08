@@ -8,6 +8,11 @@
  * same log hash at the end, the visit completed on-chain with a result
  * row per player, and both players' visits_completed advanced.
  *
+ * Both players host and join from the hub, walking east into the segment
+ * through its west gate (co-op is local: you meet by converging on a
+ * segment from your own sides, backend spec section 8a), and steer their
+ * exits back west so they end up at the hub again for the next scenario.
+ *
  * Scenario 2 (abandonment, backend spec section 11): a second visit on the
  * same segment; a few rounds in, Bob's browser closes.  Alice's client
  * sees Bob's last checkpoint go stale (the test mines the window), takes
@@ -24,6 +29,7 @@ import { chromium } from "playwright";
 import { bfsStep, navigateOut, sleep } from "./agentcore.mjs";
 
 const URL = `${process.env.ROG_URL || "http://localhost:8000"}/?e2e=1`;
+const OPPOSITE = { north: "south", south: "north", east: "west", west: "east" };
 const PROXY = process.env.ROG_PROXY || "http://localhost:18380";
 const STAMP = Date.now().toString(36).slice(-5);
 const findings = [];
@@ -92,7 +98,7 @@ function driver(page, name) {
  * pools have something to split), then heads for the nearest gate and
  * exits.  Uses the same keyboard path as a human (the `input` hook).
  */
-async function coopTick(d, walls, huntTurns) {
+async function coopTick(d, walls, huntTurns, exitDir = null) {
   const s = await d.state();
   if (s.modal) {
     const c = await d.page.$(".modal-confirm");
@@ -132,9 +138,13 @@ async function coopTick(d, walls, huntTurns) {
       .sort((a, b) => a.dist - b.dist)[0].m;
   }
   if (!target) {
+    const wanted = exitDir ? sess.gates.find(g => g.direction === exitDir) : null;
     const onGate = sess.gates.find(g => g.x === meP.x && g.y === meP.y);
-    if (onGate) { await d.call("coopExit"); return "exit"; }
-    target = sess.gates
+    if (onGate && (!wanted || onGate.direction === exitDir)) {
+      await d.call("coopExit");
+      return "exit";
+    }
+    target = wanted ?? sess.gates
       .map(g => ({ g, dist: Math.abs(g.x - meP.x) + Math.abs(g.y - meP.y) }))
       .sort((a, b) => a.dist - b.dist)[0].g;
   }
@@ -144,11 +154,11 @@ async function coopTick(d, walls, huntTurns) {
   return "move";
 }
 
-async function playCoop(d, walls, label) {
+async function playCoop(d, walls, label, exitDir = null) {
   let lastHash = null, ticks = 0, lastTurns = -1, idle = 0;
   const t0 = Date.now();
   while (Date.now() - t0 < 240000) {
-    const r = await coopTick(d, walls, 30);
+    const r = await coopTick(d, walls, 30, exitDir);
     ticks++;
     const s = await d.state();
     if (s.coop) {
@@ -195,10 +205,15 @@ try {
     s = await A.until(st => st.segments.some(g => g.x === segCoord.x && g.y === segCoord.y && g.confirmed),
                       30000, "segment confirmed");
   } else {
-    // World already full around the hub: use any confirmed neighbour.
+    // World already full around the hub: use any confirmed neighbour, and
+    // remember which of the hub's gates leads to it (co-op is by direction).
     const conf = s.segments.find(g => g.confirmed && Math.abs(g.x) + Math.abs(g.y) === 1);
-    if (conf) segCoord = { x: conf.x, y: conf.y };
+    if (conf) {
+      segCoord = { x: conf.x, y: conf.y };
+      dir = Object.keys(dirs).find(k => dirs[k][0] === conf.x && dirs[k][1] === conf.y);
+    }
   }
+  if (!dir) { fail("no hub direction leads to a confirmed segment"); throw new Error("setup"); }
   if (!segCoord) { fail("no confirmed segment available to host on"); throw new Error("setup"); }
   s = await A.state();
   if (!s.segments.some(g => g.x === segCoord.x && g.y === segCoord.y && g.confirmed))
@@ -206,13 +221,25 @@ try {
   else ok(`segment (${segCoord.x},${segCoord.y}) confirmed`);
   if (s.player.in_channel) fail("alice still in a channel after confirming");
 
-  console.log("3. alice hosts, bob joins");
-  await A.call("coopHost", segCoord.x, segCoord.y);
+  console.log(`3. alice hosts through the hub's ${dir} gate, bob joins from his side`);
+  // Co-op is local: both are standing at the hub, so both walk east into
+  // the confirmed segment through its west gate.
+  s = await A.until(st => (st.coopTargets ?? []).some(t => t.dir === dir), 20000,
+                    "the confirmed segment to show up in alice's lobby");
+  if (!s.coopTargets?.some(t => t.dir === dir))
+    fail(`alice cannot host ${dir} from the hub: ${JSON.stringify(s.coopTargets)}`);
+  await A.call("coopHost", dir);
   s = await A.until(st => !!st.player?.active_visit, 30000, "host visit");
   const visitId = s.player?.active_visit?.visit_id;
   if (!visitId) { fail("no visit id after hosting"); throw new Error("host"); }
   ok(`visit #${visitId} open`);
-  await B.call("coopJoin", visitId);
+  // Bob's client has to see the open run in his own lobby before he can
+  // walk into it; his state poll is a couple of seconds behind the chain.
+  const bLobby = await B.until(st => (st.joinable ?? []).some(j => j.visit.id === visitId),
+                               20000, "the run to appear in bob's lobby");
+  if (!bLobby.joinable?.some(j => j.visit.id === visitId))
+    fail(`bob cannot reach visit ${visitId}: ${JSON.stringify(bLobby.joinable)}`);
+  await B.call("coopJoin", visitId, dir);
   await B.until(st => st.player?.active_visit?.visit_id === visitId, 30000, "join visit");
   const vinfo = await gsp("getvisitinfo", [visitId]);
   if (vinfo?.status !== "active") fail(`visit status after join: ${vinfo?.status}`);
@@ -231,7 +258,11 @@ try {
   const walls = (await A.map()).walls;
 
   console.log("5. play (shared run over the relay)");
-  const [hashA, hashB] = await Promise.all([playCoop(A, walls, "alice"), playCoop(B, walls, "bob")]);
+  const homeDir = OPPOSITE[dir];
+  const [hashA, hashB] = await Promise.all([
+    playCoop(A, walls, "alice", homeDir),
+    playCoop(B, walls, "bob", homeDir),
+  ]);
   console.log(`   final hashes: alice=${hashA?.slice(0, 16)} bob=${hashB?.slice(0, 16)}`);
   if (!hashA || !hashB || hashA !== hashB) fail("clients ended with different merged logs");
   else ok("both clients hold the same merged log");
@@ -270,11 +301,11 @@ try {
     const st = await d.state();
     if (st.modal) await d.call("dismissModal");
   }
-  await A.call("coopHost", segCoord.x, segCoord.y);
+  await A.call("coopHost", dir);
   s = await A.until(st => !!st.player?.active_visit, 30000, "host visit 2");
   const visit2 = s.player?.active_visit?.visit_id;
   if (!visit2) { fail("no second visit id"); throw new Error("host2"); }
-  await B.call("coopJoin", visit2);
+  await B.call("coopJoin", visit2, dir);
   await Promise.all([
     A.until(st => !!st.coop, 30000, "alice coop runner (2)"),
     B.until(st => !!st.coop, 30000, "bob coop runner (2)"),
@@ -285,7 +316,7 @@ try {
   const walls2 = (await A.map()).walls;
   const t1 = Date.now();
   while (Date.now() - t1 < 20000) {
-    const [ra, rb] = await Promise.all([coopTick(A, walls2, 400), coopTick(B, walls2, 400)]);
+    const [ra, rb] = await Promise.all([coopTick(A, walls2, 400, null), coopTick(B, walls2, 400, null)]);
     const sa2 = await A.state();
     if (!sa2.coop || sa2.coop.turns >= 24 || ra === "done" || rb === "done") break;
     await sleep(80);

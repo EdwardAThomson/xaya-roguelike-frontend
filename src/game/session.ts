@@ -306,43 +306,54 @@ export class DungeonSession {
   private placePlayer(i: number, entryDir: string): void {
     const p = this.players[i];
 
-    if (entryDir) {
-      const gate = this.dungeon.gates.find(g => g.direction === entryDir);
-      if (gate) {
-        p.x = gate.x;
-        p.y = gate.y;
-        if (entryDir === "north") p.y += 1;
-        else if (entryDir === "south") p.y -= 1;
-        else if (entryDir === "east") p.x -= 1;
-        else if (entryDir === "west") p.x += 1;
-        return;
-      }
-    }
-
-    let cx: number, cy: number;
-    if (this.dungeon.rooms.length > 0) {
-      const r = this.dungeon.rooms[0];
-      cx = r.x + Math.floor(r.width / 2);
-      cy = r.y + Math.floor(r.height / 2);
-    } else {
-      cx = Math.floor(WIDTH / 2);
-      cy = Math.floor(HEIGHT / 2);
-    }
-
     const taken = (x: number, y: number): boolean => {
       for (let j = 0; j < i; j++)
         if (this.players[j].x === x && this.players[j].y === y) return true;
       return false;
     };
 
+    // Gate entry: the tile one step inward from that gate.
+    let cx = 0, cy = 0;
+    let fromGate = false;
+    if (entryDir) {
+      const gate = this.dungeon.gates.find(g => g.direction === entryDir);
+      if (gate) {
+        cx = gate.x;
+        cy = gate.y;
+        if (entryDir === "north") cy += 1;
+        else if (entryDir === "south") cy -= 1;
+        else if (entryDir === "east") cx -= 1;
+        else if (entryDir === "west") cx += 1;
+        fromGate = true;
+      }
+    }
+
+    if (!fromGate) {
+      if (this.dungeon.rooms.length > 0) {
+        const r = this.dungeon.rooms[0];
+        cx = r.x + Math.floor(r.width / 2);
+        cy = r.y + Math.floor(r.height / 2);
+      } else {
+        cx = Math.floor(WIDTH / 2);
+        cy = Math.floor(HEIGHT / 2);
+      }
+    }
+
+    // The first participant to claim this spot takes it: for a gate entry
+    // that is the gate mouth (solo behaviour, byte-identical, deliberately
+    // without a wall check so an existing settled run cannot change its
+    // spawn), for a centre entry the room centre.
     if (!taken(cx, cy)) {
       p.x = cx;
       p.y = cy;
       return;
     }
 
-    // Ring scan: radius 1, 2, ... with dy-major, dx-minor iteration; first
-    // in-bounds non-wall tile not occupied by an earlier participant.
+    // Contested: a later participant scans outward in a deterministic ring
+    // order (spec section 2a): radius 1, 2, ... with dy-major, dx-minor
+    // iteration, first in-bounds non-wall tile not already occupied.  Draws
+    // no RNG.  Two participants who entered through the SAME gate land here,
+    // as do later participants sharing the room centre.
     for (let r = 1; r < Math.max(WIDTH, HEIGHT); r++) {
       for (let dy = -r; dy <= r; dy++) {
         for (let dx = -r; dx <= r; dx++) {
@@ -359,7 +370,7 @@ export class DungeonSession {
       }
     }
 
-    // Unreachable in practice; keep the centre as a last resort.
+    // Unreachable in practice; keep the anchor as a last resort.
     p.x = cx;
     p.y = cy;
   }

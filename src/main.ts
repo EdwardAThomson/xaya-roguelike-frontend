@@ -23,10 +23,10 @@ import { drawMonsters, drawGroundItems, drawPlayer, drawPartner } from "./render
 import { InputHandler, Direction, isEditableTarget } from "./game/input.js";
 import { FovMap } from "./render/fov.js";
 import { Connection, ConnectionState } from "./net/connection.js";
-import { PlayerInfo, SegmentInfo, SegmentRef, VisitInfo, segKey, sameSeg, isHub, HUB }
-  from "./net/rpc.js";
+import { PlayerInfo, SegmentInfo, SegmentRef, VisitInfo, VisitSummary,
+  segKey, sameSeg, isHub, HUB } from "./net/rpc.js";
 import { Gate } from "./game/dungeon.js";
-import { MoveClient, createMoveClient } from "./net/moves.js";
+import { MoveClient, createMoveClient, Settlement } from "./net/moves.js";
 import { layoutSegments, SegmentNode, hitTestSegment } from "./game/overworld.js";
 import { drawOverworld, NODE_SIZE, CELL, PlayerMarker, OverworldView } from "./render/overworld.js";
 import { drawDungeonMap } from "./render/dungeonmap.js";
@@ -60,7 +60,7 @@ import {
   discoveryCooldownRemaining, neighbour, segName,
 } from "./net/validator.js";
 import { waitForMove, MoveOutcome } from "./net/pending.js";
-import { showErrorModal, showModal, showConfirmModal } from "./ui/modal.js";
+import { showErrorModal, showModal, showConfirmModal, showChoiceModal } from "./ui/modal.js";
 import { showOverlay, hideOverlay } from "./ui/overlay.js";
 import { lookupItem } from "./game/items.js";
 
@@ -1028,6 +1028,64 @@ function startChannelDungeon(
 // once every other participant's `sc` (consent to the exact merged log) is
 // on chain.
 
+/**
+ * The gates where the player stands that open onto a confirmed segment: the
+ * co-op runs they could start or join from here (backend spec section 8a).
+ * The hub has all four gates and no segments row of its own.
+ */
+interface CoopTarget { dir: string; seg: SegmentRef; }
+function coopTargets(from: SegmentRef): CoopTarget[] {
+  const dirs = isHub(from)
+    ? ["north", "east", "south", "west"]
+    : Object.keys(connState?.segments.get(segKey(from))?.gates ?? {});
+  const out: CoopTarget[] = [];
+  for (const dir of dirs) {
+    const seg = neighbour(from, dir);
+    if (isHub(seg)) continue;                 // the hub is not a dungeon
+    if (!connState?.segments.get(segKey(seg))?.confirmed) continue;
+    out.push({ dir, seg });
+  }
+  return out;
+}
+
+/** Open visits the player could walk into from where they stand. */
+interface JoinableVisit { visit: VisitSummary; dir: string; }
+function joinableVisits(from: SegmentRef): JoinableVisit[] {
+  const myName = connState?.playerName ?? "";
+  const targets = coopTargets(from);
+  const out: JoinableVisit[] = [];
+  for (const v of connState?.fullState?.visits ?? []) {
+    if (v.status !== "open") continue;
+    if (v.initiator === myName) continue;
+    if (v.players >= v.max_players) continue;
+    const t = targets.find(t => sameSeg(t.seg, v.segment));
+    if (t) out.push({ visit: v, dir: t.dir });
+  }
+  return out;
+}
+
+/**
+ * The settlement for walking out of the current run through `dir`: the
+ * claimed outcome plus the replay proof, with the gate action appended.
+ * Shared by the plain gate-walk and by hosting or joining a co-op run,
+ * which are gate-walks that wait.  Null when there is no run to settle or
+ * the player is not standing on that gate.
+ */
+function buildExitSettlement(dir: string): Settlement | null {
+  if (!session || !channelSession || coop || coopSolo) return null;
+  const g = gateAtPlayer();
+  if (!g || g.direction !== dir) return null;
+  return {
+    results: {
+      survived: true,
+      xp: me().totalXp,
+      gold: me().totalGold,
+      kills: me().totalKills,
+    },
+    actions: soloProof([...session.actionLog, { type: "gate" }]),
+  };
+}
+
 /** Canonical participant order: ascending UTF-8 byte order (spec section 1). */
 function canonicalNames(names: string[]): string[] {
   const enc = new TextEncoder();
@@ -1115,13 +1173,14 @@ async function startCoopRun(v: VisitInfo): Promise<void> {
   const segInfo = connState.segments.get(segKey(v.segment));
   if (!segInfo) return;  // segment cache not populated yet; next poll retries
 
-  // Every participant's setup, in canonical order.  Multiplayer visits have
-  // no entry gate: everyone uses the centre/ring spawn (spec section 2a).
+  // Every participant's setup, in canonical order.  Each walked in through
+  // their own gate, so each spawns there (spec sections 2a and 8a); the GSP
+  // replays from exactly these entry directions.
   const setups: PlayerSetup[] = [];
   for (const n of names) {
     const info = n === myName ? connState.player : await connection.rpc.getplayerinfo(n);
     if (!info) return;
-    setups.push(setupFromPlayer(info));
+    setups.push(setupFromPlayer(info, v.entry_directions?.[n] ?? ""));
   }
 
   const constraints = constraintsFor(segInfo);
@@ -1478,32 +1537,46 @@ function inCoopLobby(): boolean {
   return true;
 }
 
-/** Host a co-op visit on a confirmed segment (`v`). */
-async function doCoopHost(seg: SegmentRef): Promise<void> {
+/**
+ * Open a co-op run through the gate `dir` where the player stands (`v`).
+ * From inside a run this is a gate-walk that waits: it settles the run and
+ * leaves the player standing here with the door open.  From the hub, or a
+ * segment they are standing in, there is nothing to settle.
+ */
+async function doCoopHost(dir: string): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
   const p = connState.player;
   if (!p) return;
-  if (p.in_channel || p.active_visit) {
-    showErrorModal("Already in a run", "Finish or leave your current visit first.");
+  if (p.active_visit) {
+    showErrorModal("Already in a run",
+      "Finish or leave your current visit before starting another.");
     return;
   }
-  const segInfo = connState.segments.get(segKey(seg));
-  if (!segInfo?.confirmed || isHub(seg)) {
-    showErrorModal("Segment not confirmed", "Co-op runs can only be hosted on confirmed segments.");
+  const target = neighbour(p.segment, dir);
+  if (isHub(target) || !connState.segments.get(segKey(target))?.confirmed) {
+    showErrorModal("Nothing to meet in",
+      `There is no confirmed dungeon through the ${dir} gate. Co-op runs need a segment someone has already cleared.`);
     return;
   }
+  const settlement = p.in_channel ? buildExitSettlement(dir) : null;
+  if (p.in_channel && !settlement) {
+    showErrorModal("Not on that gate",
+      `You have to be standing on the ${dir} gate to open a co-op run through it.`);
+    return;
+  }
+
   busy = true;
   updateSidebar();
   try {
-    await moves.visit(connState.playerName, seg);
+    await moves.visit(connState.playerName, dir, settlement ?? undefined);
     const outcome = await waitForMove(connection, ({ player }) =>
-      !!player?.active_visit && sameSeg(player.active_visit.segment, seg));
+      !!player?.active_visit && sameSeg(player.active_visit.segment, target));
     if (outcome === "applied") {
-      addOverworldMessage(`Hosting a co-op run at ${segName(seg)}. Waiting for a partner to join...`, "info");
+      if (settlement) teardownRunAfterExit();
+      addOverworldMessage(
+        `Waiting at the ${dir} gate for a partner to join you in ${segName(target)}.`, "info");
     } else {
-      showErrorModal(
-        "Host rejected",
-        "The GSP did not open the visit. The segment may already have an open or active visit, or you may already be in one.");
+      diagnoseCoopRejection("open a co-op run", dir, target);
     }
   } catch (e) {
     showErrorModal("Host failed", e instanceof Error ? e.message : String(e));
@@ -1513,25 +1586,40 @@ async function doCoopHost(seg: SegmentRef): Promise<void> {
   void syncCoopFromChain();
 }
 
-/** Join an open co-op visit (`j`); the run starts when the visit is full. */
-async function doCoopJoin(visitId: number): Promise<void> {
+/**
+ * Join an open co-op run through the gate `dir` where the player stands
+ * (`j`); the run starts as soon as the visit is full.  Same settlement
+ * rules as hosting.
+ */
+async function doCoopJoin(visitId: number, dir: string): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
   const p = connState.player;
   if (!p) return;
-  if (p.in_channel || p.active_visit) {
-    showErrorModal("Already in a run", "Finish or leave your current visit first.");
+  if (p.active_visit) {
+    showErrorModal("Already in a run",
+      "Finish or leave your current visit before joining another.");
     return;
   }
+  const target = neighbour(p.segment, dir);
+  const settlement = p.in_channel ? buildExitSettlement(dir) : null;
+  if (p.in_channel && !settlement) {
+    showErrorModal("Not on that gate",
+      `You have to be standing on the ${dir} gate to walk into that run.`);
+    return;
+  }
+
   busy = true;
   updateSidebar();
   try {
-    await moves.join(connState.playerName, visitId);
+    await moves.join(connState.playerName, visitId, dir, settlement ?? undefined);
     const outcome = await waitForMove(connection, ({ player }) =>
       player?.active_visit?.visit_id === visitId);
     if (outcome === "applied") {
-      addOverworldMessage(`Joined visit #${visitId}. The run starts as soon as the visit is full.`, "info");
+      if (settlement) teardownRunAfterExit();
+      addOverworldMessage(
+        `Joined the run in ${segName(target)}. It starts as soon as the party is full.`, "info");
     } else {
-      showErrorModal("Join rejected", "The GSP did not add you to the visit. It may be full or no longer open.");
+      diagnoseCoopRejection("join that run", dir, target);
     }
   } catch (e) {
     showErrorModal("Join failed", e instanceof Error ? e.message : String(e));
@@ -1539,6 +1627,36 @@ async function doCoopJoin(visitId: number): Promise<void> {
   busy = false;
   updateSidebar();
   void syncCoopFromChain();
+}
+
+/**
+ * Drops the finished solo run after its settlement rode out on a `v`/`j`.
+ * The player is now standing at their segment, out of any run, waiting.
+ */
+function teardownRunAfterExit(): void {
+  channelSession = false;
+  session = null;
+  fov = null;
+  hubBuiltAtHub = false;
+  clearPersistedRun();
+  setMode("overworld");
+}
+
+/** Explains a rejected co-op move using the rules the GSP applies. */
+function diagnoseCoopRejection(what: string, dir: string, target: SegmentRef): void {
+  const p = connState?.player;
+  const info = connState?.segments.get(segKey(target));
+  let why: string;
+  if (!info) {
+    why = `${segName(target)} has not been discovered yet. The frontier is explored solo.`;
+  } else if (!info.confirmed) {
+    why = `${segName(target)} is provisional: whoever discovered it has to complete a run there before anyone can meet in it.`;
+  } else if (p?.active_visit) {
+    why = "You are already in a visit.";
+  } else {
+    why = `The chain did not accept it. You may not have a ${dir} gate here, or the run filled up first.`;
+  }
+  showErrorModal(`Could not ${what}`, why);
 }
 
 /** Leave an open visit (`lv`); the host leaving cancels it for everyone. */
@@ -2468,6 +2586,11 @@ function renderDungeon(): void {
     } else if (!connState.player) {
       line1 = `Player "${connState.playerName}" doesn't exist on-chain yet.`;
       line2 = "Click “Register Player” in the right-hand sidebar →";
+    } else if (!connState.player.in_channel && !isHub(connState.player.segment)) {
+      // Standing at a segment, out of any run: where a co-op survivor is
+      // left, and where a host waits for a partner.
+      line1 = `You are standing at ${segName(connState.player.segment)}.`;
+      line2 = "Press M for the map, or open Co-op to start a run here.";
     } else {
       line1 = "Loading hub...";
       line2 = "";
@@ -2637,16 +2760,53 @@ function confirmGateWalk(dir: string): void {
     detail = `Enters ${segName(target)} (${status}).`;
   }
 
-  showConfirmModal({
-    title: `Walk through the ${dir} gate?`,
-    message: detail,
-    confirmLabel: "Walk",
-    onConfirm: () => {
-      // doGateWalk validates first, then ends the in-session run itself
-      // (appending the gate action to the log for replay).  We don't
-      // touch the session here so a rejected gw leaves it playable.
-      doGateWalk(dir);
+  // Co-op happens at a gate: the segment on the other side is where you
+  // would meet someone, and it has to be one somebody has already cleared
+  // (the frontier stays solo).  Walking through alone is always an option.
+  const coopOk = !!moves && !isHub(target) && !!targetInfo?.confirmed
+    && !p.active_visit;
+  const joins = coopOk
+    ? joinableVisits(curSeg).filter(j => sameSeg(j.visit.segment, target))
+    : [];
+
+  if (!coopOk) {
+    showConfirmModal({
+      title: `Walk through the ${dir} gate?`,
+      message: detail,
+      confirmLabel: "Walk",
+      onConfirm: () => {
+        // doGateWalk validates first, then ends the in-session run itself
+        // (appending the gate action to the log for replay).  We don't
+        // touch the session here so a rejected gw leaves it playable.
+        doGateWalk(dir);
+      },
+    });
+    return;
+  }
+
+  const choices = [
+    {
+      label: "Go through alone",
+      detail,
+      onPick: () => doGateWalk(dir),
     },
+    ...joins.map(j => ({
+      label: `Join ${j.visit.initiator}'s run`,
+      detail: `${j.visit.players} of ${j.visit.max_players} waiting to go into ${segName(target)}.`,
+      onPick: () => { void doCoopJoin(j.visit.id, dir); },
+    })),
+    {
+      label: "Wait here for a partner",
+      detail: `Opens a co-op run in ${segName(target)}. Anyone standing next to it can walk in and join you.`,
+      onPick: () => { void doCoopHost(dir); },
+    },
+  ];
+
+  showChoiceModal({
+    title: `The ${dir} gate`,
+    message: `${segName(target)} is on the other side.`,
+    choices,
+    cancelLabel: "Stay",
   });
 }
 
@@ -2722,14 +2882,10 @@ document.addEventListener("click", (e) => {
       doExitChannel();
       break;
     case "coop-host":
-      {
-        const bx = Number(target.dataset.segX);
-        const by = Number(target.dataset.segY);
-        if (Number.isInteger(bx) && Number.isInteger(by)) doCoopHost({ x: bx, y: by });
-      }
+      doCoopHost(target.dataset.dir!);
       break;
     case "coop-join":
-      doCoopJoin(Number(target.dataset.visit));
+      doCoopJoin(Number(target.dataset.visit), target.dataset.dir!);
       break;
     case "coop-leave":
       doCoopLeave(Number(target.dataset.visit));
@@ -2827,7 +2983,7 @@ const EQUIP_SLOTS: Array<{ slot: string; label: string; icon: string }> = [
 // means closed; otherwise the value is the active tab.  A topbar button
 // (or key) opens it on a specific tab; the tab bar switches between them
 // without closing.
-type ModalTab = "inventory" | "character" | "players" | "help";
+type ModalTab = "inventory" | "character" | "players" | "coop" | "help";
 let activeModalTab: ModalTab | null = null;
 // The in-game modal carries a Help tab (alongside Inventory / Players).
 // Separately, the title screen has its OWN standalone help overlay
@@ -3111,6 +3267,97 @@ function renderPlayersTabBody(): string {
   </div>`;
 }
 
+// --- Co-op tab ---
+
+/**
+ * The co-op lobby.  Co-op is local: you meet someone by walking into the
+ * same segment through your own gates, so this only ever lists the runs
+ * reachable from where you are standing (backend spec section 8a).
+ */
+function renderCoopTabBody(): string {
+  const p = connState?.player;
+  if (!p) {
+    return `<div class="players-wrap"><div class="inv-empty">Connect to see co-op runs.</div></div>`;
+  }
+  const intro =
+    `<div class="players-subtitle">Two players, one dungeon: each round is one action each, then the monsters move. ` +
+    `Kill rewards are split by the damage each of you dealt. You meet by walking into the same segment ` +
+    `through your own gates, so you have to be standing next to it.</div>`;
+
+  // Already in a visit: waiting, or playing.
+  if (p.active_visit) {
+    const v = coopVisit;
+    const vid = p.active_visit.visit_id;
+    const where = segName(p.active_visit.segment);
+    if (!v || v.status === "open") {
+      const count = v ? v.participants.length : 1;
+      const max = connState?.segments.get(segKey(p.active_visit.segment))?.max_players ?? 2;
+      const isHost = !v || v.initiator === p.name;
+      const who = v && v.participants.length > 0 ? v.participants.join(", ") : p.name;
+      return `<div class="players-wrap">
+        ${intro}
+        <div class="players-section-title">Waiting in ${where}</div>
+        <div class="coop-panel">
+          <div>Run #${vid}, ${count} of ${max} players: ${who}</div>
+          <div class="coop-dim">It starts by itself as soon as the party is full. Anyone standing next to ${where} can walk in.</div>
+          <button data-action="coop-leave" data-visit="${vid}" class="action-btn" ${busy ? "disabled" : ""}>${isHost ? "Cancel run" : "Leave run"}</button>
+        </div>
+      </div>`;
+    }
+    return `<div class="players-wrap">
+      ${intro}
+      <div class="players-section-title">Running ${where}</div>
+      <div class="coop-panel">
+        <div>Run #${vid} is under way with ${v.participants.join(", ")}.</div>
+        <div class="coop-dim">${coop ? "Close this and press M to get back to the dungeon." : "Starting..."}</div>
+      </div>
+    </div>`;
+  }
+
+  const here = isHub(p.segment) ? "the hub" : segName(p.segment);
+  const targets = coopTargets(p.segment);
+  const joins = joinableVisits(p.segment);
+  const onGate = p.in_channel ? gateAtPlayer()?.direction ?? null : null;
+
+  let joinHtml = "";
+  if (joins.length > 0) {
+    joinHtml = `<div class="players-section-title">Runs you can walk into (${joins.length})</div>` +
+      joins.map(j => {
+        const blocked = p.in_channel && onGate !== j.dir;
+        return `<div class="coop-panel">
+          <div><strong>${j.visit.initiator}</strong> is waiting in ${segName(j.visit.segment)} (${j.visit.players}/${j.visit.max_players})</div>
+          <div class="coop-dim">Through your ${j.dir} gate.${blocked ? ` Walk onto that gate first.` : ""}</div>
+          <button data-action="coop-join" data-visit="${j.visit.id}" data-dir="${j.dir}"
+            class="action-btn action-enter" ${busy || blocked ? "disabled" : ""}>Join ${j.visit.initiator}</button>
+        </div>`;
+      }).join("");
+  }
+
+  let hostHtml = "";
+  if (targets.length > 0) {
+    hostHtml = `<div class="players-section-title">Start a run (${targets.length})</div>` +
+      targets.map(t => {
+        const blocked = p.in_channel && onGate !== t.dir;
+        return `<div class="coop-panel">
+          <div><strong>${segName(t.seg)}</strong> through your ${t.dir} gate</div>
+          <div class="coop-dim">${blocked ? "Walk onto that gate first." : "Opens a run and waits there for someone to join you."}</div>
+          <button data-action="coop-host" data-dir="${t.dir}"
+            class="action-btn action-enter" ${busy || blocked ? "disabled" : ""}>Wait at the ${t.dir} gate</button>
+        </div>`;
+      }).join("");
+  }
+
+  const empty = (!joinHtml && !hostHtml)
+    ? `<div class="inv-empty">No confirmed dungeon borders ${here}. Explore and clear a neighbouring segment first, then come back.</div>`
+    : "";
+
+  return `<div class="players-wrap">
+    ${intro}
+    <div class="players-header">You are at ${here}${p.in_channel ? " (in a run)" : ""}.</div>
+    ${empty}${joinHtml}${hostHtml}
+  </div>`;
+}
+
 // --- Character tab ---
 
 /**
@@ -3269,6 +3516,15 @@ function renderHelpBody(): string {
           <div class="help-row"><span class="help-keys"><kbd>Enter</kbd></span><span>Step through a gate</span></div>
           <div class="help-row"><span class="help-keys"><kbd>N</kbd></span><span>New dungeon (standalone mode)</span></div>
         </div>
+        <div class="help-section">
+          <div class="help-section-title">Co-op</div>
+          <div class="help-row"><span class="help-keys"><span class="help-key-text">Where</span></span><span>Only in a dungeon someone has already cleared, next to where you stand</span></div>
+          <div class="help-row"><span class="help-keys"><span class="help-key-text">Start</span></span><span>Walk onto a gate and choose "Wait here for a partner", or use the Co-op tab</span></div>
+          <div class="help-row"><span class="help-keys"><span class="help-key-text">Join</span></span><span>Walk onto the gate facing their run and choose Join, from your own side</span></div>
+          <div class="help-row"><span class="help-keys"><span class="help-key-text">Turns</span></span><span>Each round is one action each, then the monsters move</span></div>
+          <div class="help-row"><span class="help-keys"><span class="help-key-text">Rewards</span></span><span>Kill XP and gold are pooled and split by the damage each of you dealt</span></div>
+          <div class="help-row"><span class="help-keys"><span class="help-key-text">Leaving</span></span><span>Exit through any gate; the run keeps going for your partner until they leave or die</span></div>
+        </div>
         <div class="help-note">
           Goal: explore segments and survive to a gate to confirm newly discovered ones.
           If you die in a dungeon you forfeit any loot picked up on that run.
@@ -3339,6 +3595,7 @@ function renderGameModal(): void {
     { id: "inventory", label: "Inventory" },
     { id: "character", label: "Character" },
     { id: "players",   label: "Players" },
+    { id: "coop",      label: "Co-op" },
     { id: "help",      label: "Help" },
   ];
   const tabBar = tabs.map(t =>
@@ -3359,6 +3616,9 @@ function renderGameModal(): void {
   } else if (activeModalTab === "players") {
     title = "Players";
     body = renderPlayersTabBody();
+  } else if (activeModalTab === "coop") {
+    title = "Co-op";
+    body = renderCoopTabBody();
   } else {
     title = "Help &amp; Controls";
     body = renderHelpBody();
@@ -3465,56 +3725,35 @@ function updateOverworldStats(): void {
     : `Segment ${segName(locSeg)} - Depth ${Math.abs(locSeg.x) + Math.abs(locSeg.y)}`;
   const locLabel = `${locName}${p.in_channel ? " · in dungeon" : ""}`;
 
-  // Co-op lobby: our pending visit, or ways to host / join one.
+  // Co-op: a compact status line in the sidebar; the lobby itself lives in
+  // the Co-op tab of the game modal, which lists only the runs reachable
+  // from where the player is standing.
   let coopLobby = "";
-  if (hasProxy && !p.in_channel) {
+  if (hasProxy) {
     if (p.active_visit) {
       const v = coopVisit;
       const vid = p.active_visit.visit_id;
       const where = segName(p.active_visit.segment);
-      if (!v || v.status === "open") {
-        const count = v ? v.participants.length : 1;
-        const max = v ? (connState?.segments.get(segKey(p.active_visit.segment))?.max_players ?? 2) : 2;
-        const isHost = !v || v.initiator === p.name;
-        coopLobby = `
-          <div style="margin-top:8px;border-top:1px solid #333;padding-top:8px">
-            <div style="color:#8cc;font-weight:bold">Co-op visit #${vid} at ${where}</div>
-            <div style="font-size:11px;color:#aaa">Waiting for players: ${count}/${max}. The run starts automatically when the visit is full.</div>
-            <button data-action="coop-leave" data-visit="${vid}" class="action-btn" ${busy ? "disabled" : ""}>${isHost ? "Cancel visit" : "Leave visit"}</button>
-          </div>`;
-      } else if (v.status === "active") {
-        coopLobby = `
-          <div style="margin-top:8px;border-top:1px solid #333;padding-top:8px">
-            <div style="color:#8cc;font-weight:bold">Co-op visit #${vid} at ${where} is active</div>
-            <div style="font-size:11px;color:#aaa">${coop ? "Switch to the World view to play." : "Starting the run..."}</div>
-          </div>`;
-      }
+      const waiting = !v || v.status === "open";
+      coopLobby = `
+        <div style="margin-top:8px;border-top:1px solid #333;padding-top:8px">
+          <div style="color:#8cc;font-weight:bold">Co-op run #${vid} \u00b7 ${where}</div>
+          <div style="font-size:11px;color:#aaa">${waiting
+            ? `Waiting for a partner (${v ? v.participants.length : 1}/${connState?.segments.get(segKey(p.active_visit.segment))?.max_players ?? 2}).`
+            : (coop ? "Under way." : "Starting...")}</div>
+          <button data-action="switch-tab" data-tab="coop" class="action-btn">Open co-op</button>
+        </div>`;
     } else {
-      const open = (connState?.fullState?.visits ?? []).filter(v =>
-        v.status === "open" && v.initiator !== p.name && v.players < v.max_players);
-      let joinBtns = "";
-      if (open.length > 0) {
-        joinBtns = open.map(v =>
-          `<button data-action="coop-join" data-visit="${v.id}" class="action-btn action-enter" ${busy ? "disabled" : ""}>` +
-          `Join #${v.id} at ${segName(v.segment)} (${v.initiator}, ${v.players}/${v.max_players})</button>`).join(" ");
-      }
-      let hostBtn = "";
-      if (selectedSegment !== null && !isHub(selectedSegment)) {
-        const selInfo = connState?.segments.get(segKey(selectedSegment));
-        const taken = (connState?.fullState?.visits ?? []).some(v =>
-          sameSeg(v.segment, selectedSegment!) && (v.status === "open" || v.status === "active"));
-        if (selInfo?.confirmed && !taken) {
-          hostBtn = `<button data-action="coop-host" data-seg-x="${selectedSegment.x}" data-seg-y="${selectedSegment.y}"
-            class="action-btn action-enter" ${busy ? "disabled" : ""}>Host co-op run at ${segName(selectedSegment)}</button>`;
-        }
-      }
-      if (joinBtns || hostBtn) {
+      const n = joinableVisits(p.segment).length;
+      const t = coopTargets(p.segment).length;
+      if (n > 0 || t > 0) {
         coopLobby = `
           <div style="margin-top:8px;border-top:1px solid #333;padding-top:8px">
             <div style="color:#8cc;font-weight:bold">Co-op</div>
-            <div style="font-size:11px;color:#888">Two players, one dungeon: rounds of one action each. Kill rewards split by damage dealt.</div>
-            ${hostBtn}
-            ${joinBtns}
+            <div style="font-size:11px;color:#888">${n > 0
+              ? `${n} run${n === 1 ? "" : "s"} you can walk into from here.`
+              : `${t} neighbouring dungeon${t === 1 ? "" : "s"} you could start a run in.`}</div>
+            <button data-action="switch-tab" data-tab="coop" class="action-btn action-enter">Open co-op</button>
           </div>`;
       }
     }
@@ -3957,6 +4196,10 @@ if (typeof location !== "undefined"
       } : null,
       coopVisit,
       coopSolo,
+      // The co-op lobby as the player sees it: what is reachable from
+      // where they stand right now.
+      coopTargets: connState?.player ? coopTargets(connState.player.segment) : [],
+      joinable: connState?.player ? joinableVisits(connState.player.segment) : [],
       partnerCheckpoint: (coop || coopSolo) ? partnerCheckpoint() : null,
     }),
     // Static wall grid for pathfinding (call once per session).
@@ -3984,8 +4227,10 @@ if (typeof location !== "undefined"
     gateWalk: (dir: string) => doGateWalk(dir),
     forfeit: (visitId: number) => doForfeitVisit(visitId),
     // Co-op lobby / run control.
-    coopHost: (x: number, y: number) => doCoopHost({ x, y }),
-    coopJoin: (visitId: number) => doCoopJoin(visitId),
+    coopHost: (dir: string) => doCoopHost(dir),
+    coopJoin: (visitId: number, dir: string) => doCoopJoin(visitId, dir),
+    coopTargets: () => connState?.player ? coopTargets(connState.player.segment) : [],
+    joinable: () => connState?.player ? joinableVisits(connState.player.segment) : [],
     coopLeave: (visitId: number) => doCoopLeave(visitId),
     coopExit: () => { coop?.submitLocal({ type: "gate" }); },
     coopSync: () => syncCoopFromChain(),

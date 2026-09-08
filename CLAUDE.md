@@ -88,8 +88,13 @@ Layers under `src/`:
     next action whenever the engine says it is i's turn. Each client sends
     only its own actions; waits are self-authored after a grace window; an
     action that is invalid by the time its turn comes is replaced by a wait
-    on both clients identically. `main.ts` hosts/joins visits from the Map
-    sidebar, starts the run when the visit turns active, sends checkpoint
+    on both clients identically. Co-op is LOCAL: you host or join through a
+    gate where you stand, into the confirmed segment on its other side, so
+    the lobby (the Co-op tab of the game modal, plus the choices offered
+    when you step onto a gate) only ever lists runs reachable from your
+    current segment. `main.ts` hosts/joins by direction, carrying the
+    settlement for the run you walk out of, starts the run when the visit
+    turns active, sends checkpoint
     confirms (`sc` with `n`) every few actions and as a heartbeat, and
     settles it (participant 0 sends `s` once the others' `sc` confirms are
     on chain). If a partner's checkpoint goes stale (`ABANDON_WINDOW_BLOCKS`

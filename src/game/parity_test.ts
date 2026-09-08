@@ -325,6 +325,40 @@ export function runCompactEncodingVector(): boolean {
   return ok;
 }
 
+/**
+ * Same-gate and mixed-entry spawns (backend CoopParityTests
+ * SameGateSpawnVector / MixedEntrySpawnVector).  Two participants who walk
+ * in through the SAME gate cannot share the mouth tile: the first takes it
+ * (solo behaviour), the second falls through to the ring scan.
+ */
+export function runSpawnParityVectors(): boolean {
+  const gateSetups = coopFixtureSetups();
+  gateSetups[0].entryDir = "south";
+  gateSetups[1].entryDir = "south";
+  const same = DungeonSession.createMulti("parity-equip", 3, gateSetups);
+  const solo = DungeonSession.createMulti("parity-equip", 3, [gateSetups[0]]);
+
+  const mixedSetups = coopFixtureSetups();
+  mixedSetups[0].entryDir = "south";
+  mixedSetups[1].entryDir = "";
+  const mixed = DungeonSession.createMulti("parity-equip", 3, mixedSetups);
+
+  const line1 = `PARITY-SAMEGATE p0[${same.players[0].x},${same.players[0].y}]` +
+                ` p1[${same.players[1].x},${same.players[1].y}]`;
+  const line2 = `PARITY-MIXEDGATE p0[${mixed.players[0].x},${mixed.players[0].y}]` +
+                ` p1[${mixed.players[1].x},${mixed.players[1].y}]`;
+  console.log(line1);
+  console.log(line2);
+
+  const soloSame = same.players[0].x === solo.players[0].x
+    && same.players[0].y === solo.players[0].y;
+  const ok = line1 === "PARITY-SAMEGATE p0[14,38] p1[13,37]"
+    && line2 === "PARITY-MIXEDGATE p0[14,38] p1[65,29]"
+    && soloSame;
+  console.log(`[spawn-parity] ${ok ? "✓ OK" : "✗ FAIL — C++/TS spawn placement diverged"}`);
+  return ok;
+}
+
 export function runSettleHashVector(): boolean {
   // One entry of every action type, so the whole canonical encoding is
   // locked (pinned in coop_parity_tests.cpp as well).
@@ -380,6 +414,7 @@ const results = [
   runCoopParityVector(),
   runAbsentParityVector(),
   runCompactEncodingVector(),
+  runSpawnParityVectors(),
 ];
 runEquipParityVector();
 // A thrown error makes `node dist/game/parity_test.js` exit non-zero.

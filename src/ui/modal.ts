@@ -150,3 +150,65 @@ export function showConfirmModal(opts: ConfirmModalOptions): void {
   document.body.appendChild(root);
   (root.querySelector(".modal-confirm") as HTMLButtonElement).focus();
 }
+
+export interface ChoiceModalOptions {
+  title: string;
+  message: string;
+  /**
+   * The actions offered, in order.  The last one gets focus, matching the
+   * confirm modal.  `detail` is a dimmer second line under the label.
+   */
+  choices: Array<{ label: string; detail?: string; onPick: () => void }>;
+  cancelLabel?: string;
+  onCancel?: () => void;
+}
+
+/**
+ * A modal offering several actions rather than a yes/no.  Used where a
+ * single step has genuinely different outcomes, such as standing on a gate
+ * with a co-op run waiting on the other side of it.  Escape and the
+ * backdrop cancel.
+ */
+export function showChoiceModal(opts: ChoiceModalOptions): void {
+  document.getElementById("modal-root")?.remove();
+
+  const root = document.createElement("div");
+  root.id = "modal-root";
+  root.className = "modal-overlay";
+  const buttons = opts.choices.map((c, i) =>
+    `<button class="modal-choice" data-choice="${i}">${escapeHtml(c.label)}${
+      c.detail ? `<span class="modal-choice-detail">${escapeHtml(c.detail)}</span>` : ""
+    }</button>`).join("");
+  root.innerHTML = `
+    <div class="modal modal-info" role="alertdialog" aria-modal="true">
+      <div class="modal-title">${escapeHtml(opts.title)}</div>
+      <div class="modal-body">${escapeHtml(opts.message)}</div>
+      <div class="modal-actions modal-actions-stacked">
+        <button class="modal-cancel">${escapeHtml(opts.cancelLabel ?? "Cancel")}</button>
+        ${buttons}
+      </div>
+    </div>
+  `;
+
+  const close = (pick: number | null) => {
+    root.remove();
+    document.removeEventListener("keydown", onKey);
+    if (pick === null) opts.onCancel?.();
+    else opts.choices[pick].onPick();
+  };
+
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape") { e.preventDefault(); close(null); }
+  };
+
+  root.addEventListener("click", (e) => { if (e.target === root) close(null); });
+  root.querySelector(".modal-cancel")!.addEventListener("click", () => close(null));
+  root.querySelectorAll<HTMLButtonElement>(".modal-choice").forEach(btn => {
+    btn.addEventListener("click", () => close(Number(btn.dataset.choice)));
+  });
+  document.addEventListener("keydown", onKey);
+
+  document.body.appendChild(root);
+  const last = root.querySelectorAll<HTMLButtonElement>(".modal-choice");
+  (last[last.length - 1] ?? root.querySelector(".modal-cancel") as HTMLButtonElement).focus();
+}

@@ -20,6 +20,15 @@ import { SegmentRef } from "./rpc.js";
 import { GAME_ID, MOVE_TRANSPORT } from "../config.js";
 import { WalletMoveTransport } from "./walletTransport.js";
 
+/**
+ * A settled run attached to a move that walks through a gate (`gw`, and
+ * the co-op `v`/`j`): the claimed outcome plus the replay proof.
+ */
+export interface Settlement {
+  results: { survived: boolean; xp: number; gold: number; kills: number };
+  actions: object[] | string;
+}
+
 /** The on-chain submission primitives a MoveClient is built on. */
 export interface MoveTransport {
   /** Register a Xaya name for the player. */
@@ -107,10 +116,7 @@ export class MoveClient {
   async gateWalk(
     name: string,
     dir: string,
-    settlement?: {
-      results: { survived: boolean; xp: number; gold: number; kills: number };
-      actions: object[] | string;
-    },
+    settlement?: Settlement,
     transit = false,
   ): Promise<void> {
     const op: { dir: string; settlement?: object; transit?: boolean } = { dir };
@@ -127,15 +133,29 @@ export class MoveClient {
 
   // --- Multiplayer visits (backend docs/SPEC_multiplayer_coop.md) ---
 
-  /** Open a co-op visit on a confirmed segment (the host is participant 1). */
-  async visit(name: string, seg: SegmentRef): Promise<void> {
-    await this.transport.submitMove(name, { v: { x: seg.x, y: seg.y } });
+  /**
+   * Open a co-op visit on the confirmed segment through one of your own
+   * gates: hosting is a gate-walk that waits.  From inside a run pass the
+   * settlement for that run (a survived exit through gate `dir`), which
+   * settles it and leaves you standing where you are with the door open;
+   * from the hub or a segment you are standing in, pass nothing.
+   */
+  async visit(name: string, dir: string, settlement?: Settlement): Promise<void> {
+    const op: { dir: string; settlement?: Settlement } = { dir };
+    if (settlement) op.settlement = settlement;
+    await this.transport.submitMove(name, { v: op });
     await this.transport.mine();
   }
 
-  /** Join an open visit; the visit activates when it reaches max_players. */
-  async join(name: string, visitId: number): Promise<void> {
-    await this.transport.submitMove(name, { j: { id: visitId } });
+  /**
+   * Join an open visit through one of your own gates; `dir` must lead to
+   * that visit's segment.  The visit activates when it reaches max_players.
+   */
+  async join(name: string, visitId: number, dir: string,
+             settlement?: Settlement): Promise<void> {
+    const op: { id: number; dir: string; settlement?: Settlement } = { id: visitId, dir };
+    if (settlement) op.settlement = settlement;
+    await this.transport.submitMove(name, { j: op });
     await this.transport.mine();
   }
 
