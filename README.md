@@ -16,10 +16,10 @@ Browser-based frontend for the [Xaya Roguelike](https://github.com/EdwardAThomso
 - **On-chain state**: Player stats, inventory, equipment, combat record from the GSP
 - **Dungeon play**: Full turn-based roguelike (12 monster types, 31 items, fog of war, 8-dir movement)
 - **In-dungeon map**: Fog-of-war-aware minimap of the current dungeon (the Map view's "Dungeon" tab, alongside the "World" segment graph)
-- **Character sheet**: Tabbed in-game panel (Character, Inventory, Players, Help) with base and effective stats, XP progress, and mid-run equip of banked gear
+- **Character sheet**: Tabbed in-game panel (Inventory, Character, Players, Co-op, Help) with base and effective stats, XP progress, and mid-run equip of banked gear
 - **Crash-safe runs**: In-progress dungeon runs persist locally and deterministically resume on reload, and explored maps (fog of war) survive reloads too; server-side timeouts and death knock-backs auto-recover
 - **Multiplayer presence**: Other players shown as tokens on the overworld map and listed (active first) in a Players tab
-- **Two-player co-op**: Host or join a visit from the Map sidebar, then play one shared dungeon in rounds of one action each; your partner is drawn in the dungeon and on the minimap, kill rewards split by damage dealt, and the run settles on-chain by mutual consent (`sc` confirm + `s` settle). Checkpoint confirms go out during the run, so if a partner vanishes the sidebar offers **Continue alone from their checkpoint** once their last checkpoint is old enough, and the survivor finishes solo and settles with `solo_from`
+- **Two-player co-op**: Co-op is local: you meet a partner by walking into the same confirmed segment through your own gates. Step onto a gate and pick "wait here for a partner" or "join" someone already waiting, or use the Co-op tab, which lists only the runs reachable from where you stand. Each player spawns at the gate they came in through, then you play one shared dungeon in rounds of one action each; your partner is drawn in the dungeon and on the minimap, kill rewards split by damage dealt, and the run settles on-chain by mutual consent (`sc` confirm + `s` settle). Checkpoint confirms go out during the run, so if a partner vanishes the sidebar offers **Continue alone from their checkpoint** once their last checkpoint is old enough, and the survivor finishes solo and settles with `solo_from`
 - **Account picker**: On a hosted deploy, Play opens a character chooser listing the characters this browser has already claimed, plus a "new character" form that registers on-chain; local dev keeps the name + Connect controls in the topbar
 - **Channel integration**: Enter dungeons using real on-chain player stats, exit with cryptographic replay proof
 - **Deterministic**: Dungeon generation and RNG verified identical to C++ backend (SHA-256 + MT19937)
@@ -72,12 +72,14 @@ python3 serve.py 8000
 
 ### Co-op (two browsers)
 
-Connect two different player names to the same devnet, then in the Map view:
+Connect two different player names to the same devnet. Co-op is **local**: you
+meet by walking into the same **confirmed** segment (not the hub) through your
+own gates, so both players have to be standing next to it first.
 
-1. Player A selects a **confirmed** segment (not the hub) and clicks **Host co-op run at ...**; the sidebar shows the open visit with a **Cancel visit** button
-2. Player B clicks the **Join #N at ...** button for that visit (**Leave visit** backs out again)
-3. The run starts automatically once the visit is full; both clients play the same dungeon in rounds of one action per player, with the partner drawn in teal
-4. When the run is over, settlement is automatic: the joiner sends an `sc` confirm of the merged action log, and the host sends the `s` settle once that confirm is on chain
+1. Player A steps onto the gate leading to that segment and picks **Wait here for a partner** from the gate choices (equivalently: open the game modal's **Co-op** tab and click **Wait at the *dir* gate**, which lists every run reachable from where you stand). The Co-op tab then shows the open run with a **Cancel run** button
+2. Player B walks to their own gate into the same segment and picks **Join *A*'s run**, at the gate or from the Co-op tab (**Leave run** backs out again)
+3. The run starts automatically once the visit is full; both clients play the same dungeon in rounds of one action per player, each spawning at the gate they walked in through, with the partner drawn in teal
+4. When the run is over, settlement is automatic: the other player sends an `sc` confirm of the merged action log, and participant 0 (first in canonical name order, not necessarily the host) sends the `s` settle once that confirm is on chain
 5. During the run each client also sends periodic `sc` checkpoint confirms (every `COOP_CHECKPOINT_ACTIONS` applied actions, and at least every `COOP_HEARTBEAT_MS` as a heartbeat). The sidebar shows the partner's last checkpoint and its age; once it is `ABANDON_WINDOW_BLOCKS` old, **Continue alone from their checkpoint** rebuilds the run at that checkpoint, marks the partner absent, and lets the survivor play out and settle solo (`s` with `solo_from`). All three constants live in `src/config.ts`
 
 `npm run coop` drives this flow end to end in two headless browsers (see `tests/e2e/README.md`).
@@ -156,9 +158,9 @@ In connected mode the move proxy also carries the co-op message relay
 and `net/coop.ts` applies them on both sides in the engine's turn order so the
 two clients converge on one merged action log.
 
-**Overworld mode**: Fetches player info, segments, and visits from the GSP. Renders the segment graph centered on the player's current position. Sidebar shows stats, inventory, and action buttons (discover, enter dungeon, host/join a co-op visit).
+**Overworld mode**: Fetches player info, segments, and visits from the GSP. Renders the segment graph centered on the player's current position. Sidebar shows stats, inventory, and action buttons (discover, enter dungeon, and a compact co-op status line with a shortcut into the Co-op tab, which is the lobby).
 
-**Dungeon mode**: Runs a `DungeonSession` locally. In channel mode, uses the real segment seed and player stats from the GSP. On exit, submits the action replay proof on-chain for verification; with `COMPACT_ACTIONS` on (the default) every settlement move (`xc`, the `gw` settlement, `s`) sends the proof as the GSP's compact string encoding (`settle.ts` `encodeCompactLog`, about a quarter of the JSON array's calldata) rather than the JSON array. In co-op the same session runs with two participants and the merged log is settled by mutual consent (`sc` confirm, then `s` settle from the host); if a partner goes stale the survivor can continue alone from their last checkpoint and settle with `solo_from`.
+**Dungeon mode**: Runs a `DungeonSession` locally. In channel mode, uses the real segment seed and player stats from the GSP. On exit, submits the action replay proof on-chain for verification; with `COMPACT_ACTIONS` on (the default) every settlement move (`xc`, the `gw` settlement, `s`) sends the proof as the GSP's compact string encoding (`settle.ts` `encodeCompactLog`, about a quarter of the JSON array's calldata) rather than the JSON array. In co-op the same session runs with two participants, each spawned at the gate they walked in through, and the merged log is settled by mutual consent (`sc` confirm, then `s` settle from participant 0); if a partner goes stale the survivor can continue alone from their last checkpoint and settle with `solo_from`.
 
 ## Determinism
 

@@ -1,6 +1,6 @@
 # Frontend Parity & Error-Handling Plan
 
-Audit date: 2026-04-14 (original), last reconciled 2026-09-06
+Audit date: 2026-04-14 (original), last reconciled 2026-09-09
 Backend reference: `~/Projects/xayaroguelike` at commit `0532b41`,
 re-checked against `32e635b`
 Frontend reference: `~/Projects/xaya-roguelike-frontend` (this repo)
@@ -43,6 +43,10 @@ state.
   verification; with `COMPACT_ACTIONS` on it goes out as the compact
   string from `settle.ts` `encodeCompactLog`, pinned against the
   backend's `ParseCompactActions` tests in `npm test`
+- [src/game/session.ts](../src/game/session.ts) — co-op participants
+  spawn at the gate they walked in through (`entry_directions` from
+  `getvisitinfo`), mirroring the backend's gate-mouth ring scan; the
+  same-gate and mixed-entry spawn vectors are pinned in `npm test`
 - Monster database: 12 monsters, stats and depth-scaling identical
   to backend `monsters.cpp`
 - Item database: 31 items, ids identical to backend `items.cpp`
@@ -63,12 +67,7 @@ state.
 | 6 | Segments laid out by BFS grid instead of the authoritative on-chain coordinate | [src/game/overworld.ts](../src/game/overworld.ts) places each segment at its own `(x, y)`, negating Y because the GSP uses north = +Y |
 | 7 | Item stat bonuses not exposed in `ItemDef` | [src/game/items.ts](../src/game/items.ts) — `strength`/`dexterity`/`constitution`/`intelligence`/`maxHealth` carried for the inventory UI (informational; the GSP still owns the math) |
 | 8 | Missing move type: `uq` (unequip) | [src/net/moves.ts](../src/net/moves.ts) — `unequip`, plus `discard` and `gateWalk` |
-
-### Low — out of current scope
-
-| # | Gap | File |
-|---|-----|------|
-| 9 | Multi-player visit moves: `v` (start), `j` (join), `s` (settle), `lv` (leave) — Phase 14+ | [src/net/moves.ts](../src/net/moves.ts) |
+| 9 | Multi-player visit moves: `v` (start), `j` (join), `s` (settle), `lv` (leave) | [src/net/moves.ts](../src/net/moves.ts) — `visit`, `join`, `leave`, `settleConfirm` (`sc`) and `settle`; `v`/`j` take the gate direction (and, from inside a run, the settlement for the run being left) since co-op is local |
 
 ## Error handling
 

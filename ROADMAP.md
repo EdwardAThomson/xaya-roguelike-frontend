@@ -25,9 +25,9 @@ with deterministic RNG, and submits action-replay proofs on-chain. Pairs with th
 - [x] Character sheet tab (base + effective stats, XP progress) and mid-run equip of banked gear
 - [x] Crash-safe runs — persist/resume in-progress runs, auto-recover server-side timeouts and death knock-back
 - [x] Dark monospace theme; `tsc` build with source maps
-- [x] Multiplayer engine mirror: N-participant `session.ts` (round structure, ring spawn, multi-target monster AI, damage tracking and reward pools) plus `settle.ts` (consent hash, pool split, claims), with pinned 2-player parity fixtures against the C++ backend (`npm test`)
+- [x] Multiplayer engine mirror: N-participant `session.ts` (round structure, per-participant spawn at the gate they entered through with the backend's gate-mouth ring scan, multi-target monster AI, damage tracking and reward pools) plus `settle.ts` (consent hash, pool split, claims), with pinned 2-player parity fixtures against the C++ backend (`npm test`)
 - [x] Compact settlement proofs: `xc`, `gw` and `s` send the action log as the compact string (about a quarter of the JSON size), pinned against the backend's parser
-- [x] 2-player co-op, end to end: `net/coop.ts` transport + runner over the devnet proxy relay, host/join/leave/cancel lobby in the Map sidebar, shared run with a partner sprite and projected reward shares, mutual-consent settlement (`sc` + `s`), runner convergence test and a two-browser Playwright run (`npm run coop`)
+- [x] 2-player co-op, end to end: `net/coop.ts` transport + runner over the devnet proxy relay, local host/join by direction (gate choices when you step onto a gate, plus the Co-op tab lobby listing only what is reachable from where you stand) with leave/cancel, shared run with a partner sprite and projected reward shares, mutual-consent settlement (`sc` + `s`), runner convergence test and a two-browser Playwright run (`npm run coop`)
 
 ## Next
 

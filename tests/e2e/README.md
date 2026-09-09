@@ -76,7 +76,9 @@ the frontend built (`npx tsc` → `dist/`), the xayax venv at
   global GSP state and asserts cross-player invariants (coordinate
   uniqueness, player/segment sanity). Env: `ROG_AGENTS` (default 3).
 - `npm run coop` — two-player co-op run (`coop.mjs`): one player confirms
-  a segment and hosts a visit, the other joins, both play the shared
+  a segment neighbouring the hub and hosts a run through the hub gate that
+  leads to it (co-op is local, so hosting and joining are by direction),
+  the other joins through the same gate, both play the shared
   dungeon over the proxy relay and exit; asserts identical merged-log hashes
   on both clients, an on-chain `completed` visit with a result row per
   player, and a clean teardown. A second scenario closes one browser
