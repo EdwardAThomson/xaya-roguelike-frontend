@@ -12,7 +12,8 @@
     "multi": "node tests/e2e/multi.mjs",
     "compete": "node tests/e2e/compete.mjs",
     "persist": "node tests/e2e/persist.mjs",
-    "coop": "node tests/e2e/coop.mjs"
+    "coop": "node tests/e2e/coop.mjs",
+    "coop:play": "node tests/e2e/coop_play.mjs"
   },
   "repository": {
     "type": "git",

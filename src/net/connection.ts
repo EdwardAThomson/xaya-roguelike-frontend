@@ -96,13 +96,31 @@ export class Connection {
     this.notify();
   }
 
+  /**
+   * Refreshes the cached detail for every segment the GSP currently knows,
+   * and forgets the ones it no longer does.
+   *
+   * `segs` is authoritative: it is the segment list from the state snapshot
+   * we just fetched. A segment can genuinely disappear, because a
+   * provisional one is PRUNED when its discoverer fails or abandons the run
+   * that would have confirmed it, releasing the world coordinate. Without
+   * the delete the client kept the last snapshot of it for the life of the
+   * page, so the map went on drawing a segment that no longer exists (and
+   * drew it as provisional, since that is what it was when it died).
+   * Provisional segments that really are provisional are still cached and
+   * still shown; only vanished ones are dropped.
+   */
   private async fetchSegmentDetails(segs: SegmentRef[]): Promise<void> {
     if (!this.rpc) return;
+    const live = new Set(segs.map(segKey));
     for (const seg of segs) {
       const info = await this.rpc.getsegmentinfo(seg);
       if (info) {
         this.state.segments.set(segKey(seg), info);
       }
+    }
+    for (const key of [...this.state.segments.keys()]) {
+      if (!live.has(key)) this.state.segments.delete(key);
     }
   }
 

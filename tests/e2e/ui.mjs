@@ -492,6 +492,43 @@ test("T7", "death in a dungeon respawns the player at the hub with reduced HP", 
   world.hurtAtHub = dead.player?.hp < maxHp;
 });
 
+// ---- T8: a pruned segment must leave the client's map ----
+// A provisional segment is released when the discoverer fails the run that
+// would have confirmed it. The map cache used to only ever grow, so a
+// vanished segment went on being drawn (as provisional, which is what it was
+// when it died) until the page was reloaded.
+test("T8", "a provisional segment shows on the map, and disappears when it is pruned", async (t) => {
+  const { c, check } = t;
+  await c.waitState((x) => x.player && !x.player.in_channel, "at hub", 20000);
+
+  await waitDiscoverReady(c).catch(() => {});
+  const before = await c.state();
+  const dir = await discoverFreshFrontier(c);
+  if (!dir) { t.skip("discovery unavailable, cannot open a fresh frontier to prune"); }
+
+  const after = await c.state();
+  const seg = after.segments.find((x) => !before.segments.some((b) => sameSeg(b, x)));
+  if (!seg) { t.skip("no new segment appeared to prune"); }
+  check("a provisional segment IS shown on the map", seg.confirmed === false, segStr(seg));
+
+  // Enter it (the discoverer may, to confirm it) and then forfeit, which
+  // fails the run and releases the coordinate.
+  await c.call("enterChannel", seg.x, seg.y);
+  const inRun = await c.waitState((x) => !!x.player?.active_visit, "in the provisional run", 30000);
+  const visitId = inRun.player.active_visit.visit_id;
+  await c.call("forfeit", visitId);
+
+  const gone = await c.waitState(
+    (x) => !x.segments.some((b) => sameSeg(b, seg)),
+    "the pruned segment to leave the map", 30000).catch(() => c.state());
+  check("the pruned segment is gone from the map without a reload",
+    !gone.segments.some((b) => sameSeg(b, seg)),
+    `still cached: ${JSON.stringify(gone.segments.map(segStr))}`);
+  check("the rest of the map survived the prune",
+    gone.segments.length === before.segments.length,
+    `${gone.segments.length} vs ${before.segments.length} before`);
+});
+
 // ---- T2c: drink a health potion while hurt at the hub (DOM) ----
 test("T2c", "hub inventory: drink a potion while hurt raises HP and drops the count", async (t) => {
   const { c, page, check, world } = t;
