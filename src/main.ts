@@ -158,7 +158,12 @@ let coopSettling = false;
 let coopSettleError: string | null = null;
 /** Everything needed to rebuild the shared session at a checkpoint. */
 let coopSetup: { seed: string; depth: number; constraints: Gate[];
-                 setups: PlayerSetup[]; names: string[]; me: number } | null = null;
+                 setups: PlayerSetup[]; names: string[]; me: number;
+                 /** The visit id when this run is a DUEL, null for co-op:
+                     rebuilding after an abandonment has to use the same
+                     engine, and a duel's needs the id for its
+                     commitments. */
+                 duelVisitId: number | null } | null = null;
 /**
  * Solo continuation after abandoning a partner (spec section 11): the run
  * was rebuilt at the partner's last checkpoint (`from` actions), the
@@ -236,8 +241,50 @@ let moves: MoveClient | null = null;
 
 // --- Connection ---
 
+/**
+ * The rules version this build implements (backend rules.hpp).  Bumped in
+ * lockstep with RULES_VERSION there whenever anything the REPLAY depends on
+ * changes: a draw, an action, a seed derivation, an encoding, the duel
+ * commitment preimage.
+ */
+const CLIENT_RULES_VERSION = 1;
+/** What settlement awards; see BANKING_VERSION in rules.hpp. */
+const CLIENT_BANKING_VERSION = 1;
+
+/**
+ * Null while the versions agree (or the GSP is too old to say), otherwise
+ * why this client must not start a run.  A rules mismatch means the run
+ * played here would be REJECTED at settlement -- after the player had
+ * played the whole thing, with the reason only in a GSP log line -- so it
+ * has to be caught before anyone starts one.  A banking mismatch is not
+ * grounds to block play: the engine still agrees, only the projected
+ * rewards in the HUD would be wrong.
+ */
+let rulesMismatch: string | null = null;
+let bankingMismatch = false;
+let versionWarned = false;
+
+function checkVersionHandshake(state: ConnectionState): void {
+  const v = state.fullState?.version;
+  if (!v) return;                       // GSP predates the handshake
+  rulesMismatch = v.rules === CLIENT_RULES_VERSION ? null
+    : `This client implements rules version ${CLIENT_RULES_VERSION}; the ` +
+      `server is running version ${v.rules}. A run played here would be ` +
+      `rejected when you tried to settle it, so starting one is disabled. ` +
+      `Reload to pick up a newer client.`;
+  bankingMismatch = v.banking !== CLIENT_BANKING_VERSION;
+  if (!versionWarned && (rulesMismatch || bankingMismatch)) {
+    versionWarned = true;
+    if (rulesMismatch) showErrorModal("Client out of date", rulesMismatch);
+    else addOverworldMessage(
+      "This client and the server disagree about reward rules; projected " +
+      "XP and gold may not match what you are actually awarded.", "warning");
+  }
+}
+
 const connection = new Connection((state: ConnectionState) => {
   connState = state;
+  checkVersionHandshake(state);
   updateConnectionUI();
   rebuildOverworld();
   ensureSessionFromChainState();
@@ -1184,7 +1231,14 @@ async function startCoopRun(v: VisitInfo): Promise<void> {
   }
 
   const constraints = constraintsFor(segInfo);
-  const s = DungeonSession.createMulti(segInfo.seed, segInfo.depth, setups, constraints);
+  // A duel visit must build a DUEL session: the mode is what enables the
+  // commit/reveal rounds, the per-round reseed and bump-to-attack, so
+  // getting it from the visit row rather than from anything local is what
+  // keeps both clients (and the GSP's replay) on the same engine.
+  const isDuel = v.mode === "duel";
+  const s = isDuel
+    ? DungeonSession.createDuel(segInfo.seed, segInfo.depth, setups, v.id, constraints)
+    : DungeonSession.createMulti(segInfo.seed, segInfo.depth, setups, constraints);
   session = s;
   channelSession = true;
   channelSegment = v.segment;
@@ -1192,7 +1246,8 @@ async function startCoopRun(v: VisitInfo): Promise<void> {
   coopSettling = false;
   coopSettleError = null;
   coopSolo = null;
-  coopSetup = { seed: segInfo.seed, depth: segInfo.depth, constraints, setups, names, me: meIdx };
+  coopSetup = { seed: segInfo.seed, depth: segInfo.depth, constraints, setups, names,
+                me: meIdx, duelVisitId: isDuel ? v.id : null };
   coopCheckpointN = -1;
   coopCheckpointAt = 0;
   reconnectPromptShown = false;
@@ -1306,8 +1361,15 @@ function continueAlone(): void {
   coop = null;
   if (coopCheckpointTimer) { clearInterval(coopCheckpointTimer); coopCheckpointTimer = null; }
 
-  const s = DungeonSession.replayMulti(
-    coopSetup.seed, coopSetup.depth, coopSetup.setups, prefix, coopSetup.constraints);
+  // Rebuild on the same engine the run has been using: replaying a duel's
+  // prefix through the co-op engine would reject its commit entries and
+  // silently truncate the run.
+  const s = coopSetup.duelVisitId !== null
+    ? DungeonSession.replayDuel(
+        coopSetup.seed, coopSetup.depth, coopSetup.setups, coopSetup.duelVisitId,
+        prefix, coopSetup.constraints)
+    : DungeonSession.replayMulti(
+        coopSetup.seed, coopSetup.depth, coopSetup.setups, prefix, coopSetup.constraints);
   for (let i = 0; i < coopSetup.names.length; i++)
     if (i !== coopSetup.me) s.markAbsent(i);
   session = s;
@@ -1355,7 +1417,11 @@ function handleSoloSuffixInput(action: string, dir?: Direction): void {
   else if (action === "move") {
     const g = gateAtPlayer();
     if (g) {
-      session.addMessage(`On the ${g.direction} gate. Press Enter to leave the dungeon.`, "info");
+      session.addMessage(
+        session.isDuel()
+          ? `On the ${g.direction} gate. Press Enter to CONCEDE the duel.`
+          : `On the ${g.direction} gate. Press Enter to leave the dungeon.`,
+        "info");
       updateSidebar();
     }
   }
@@ -1543,8 +1609,35 @@ function inCoopLobby(): boolean {
  * leaves the player standing here with the door open.  From the hub, or a
  * segment they are standing in, there is nothing to settle.
  */
-async function doCoopHost(dir: string): Promise<void> {
+/**
+ * Picks the stake for a duel this player is about to host.  Presets rather
+ * than a free number: the amounts a player would actually choose are few,
+ * and a preset list can be filtered to what they can afford so an
+ * unaffordable stake is never offered at all.  0 is kept deliberately --
+ * a friendly duel with nothing on it is a real thing to want.
+ */
+function showDuelStakeModal(dir: string): void {
+  const gold = connState?.player?.gold ?? 0;
+  const presets = [0, 10, 25, 50, 100].filter(v => v <= gold);
+  showChoiceModal({
+    title: "Stake the duel",
+    message: `Whatever you stake, your challenger matches. The last one ` +
+             `standing takes the pot; walking out through a gate concedes ` +
+             `it. You hold ${gold} gold.`,
+    choices: presets.map(v => ({
+      label: v === 0 ? "No stake (a friendly duel)" : `${v} gold`,
+      detail: v === 0
+        ? "Nothing changes hands. Bragging rights only."
+        : `${v} leaves your purse now and is held in escrow; the winner takes ${v * 2}.`,
+      onPick: () => { void doCoopHost(dir, v); },
+    })),
+    cancelLabel: "Never mind",
+  });
+}
+
+async function doCoopHost(dir: string, duelStake?: number): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
+  if (rulesMismatch) { showErrorModal("Client out of date", rulesMismatch); return; }
   const p = connState.player;
   if (!p) return;
   if (p.active_visit) {
@@ -1568,13 +1661,18 @@ async function doCoopHost(dir: string): Promise<void> {
   busy = true;
   updateSidebar();
   try {
-    await moves.visit(connState.playerName, dir, settlement ?? undefined);
+    await moves.visit(connState.playerName, dir, settlement ?? undefined,
+                      duelStake === undefined ? undefined : { stake: duelStake });
     const outcome = await waitForMove(connection, ({ player }) =>
       !!player?.active_visit && sameSeg(player.active_visit.segment, target));
     if (outcome === "applied") {
       if (settlement) teardownRunAfterExit();
       addOverworldMessage(
-        `Waiting at the ${dir} gate for a partner to join you in ${segName(target)}.`, "info");
+        duelStake === undefined
+          ? `Waiting at the ${dir} gate for a partner to join you in ${segName(target)}.`
+          : `Waiting at the ${dir} gate for a challenger in ${segName(target)}. ` +
+            `Your ${duelStake} gold is in escrow until the duel settles.`,
+        "info");
     } else {
       diagnoseCoopRejection("open a co-op run", dir, target);
     }
@@ -1592,6 +1690,7 @@ async function doCoopHost(dir: string): Promise<void> {
  * rules as hosting.
  */
 async function doCoopJoin(visitId: number, dir: string): Promise<void> {
+  if (rulesMismatch) { showErrorModal("Client out of date", rulesMismatch); return; }
   if (busy || !moves || !connState?.playerName) return;
   const p = connState.player;
   if (!p) return;
@@ -1720,8 +1819,27 @@ function handleCoopInput(action: string, dir?: Direction): void {
   }
 }
 
-/** Confirmation before exiting a co-op run through a gate. */
+/** Confirmation before exiting a co-op run -- or conceding a duel -- through
+ *  a gate.  In a duel the gate is not an exit at all: it is a forfeit, so
+ *  the wording has to say so before the player walks into it expecting to
+ *  keep what they found (pvp spec section 5). */
 function confirmCoopExit(dir: string): void {
+  if (session?.isDuel()) {
+    const stake = coopVisit?.stake ?? 0;
+    showConfirmModal({
+      title: `Concede through the ${dir} gate?`,
+      message:
+        "Walking out of a duel is a forfeit, not an escape. Your opponent " +
+        "wins on the spot" + (stake > 0 ? ` and takes the ${stake * 2} gold pot` : "") +
+        ", and you take the ordinary death outcome: half HP, a knock-back, " +
+        "and anything you picked up in here is lost.",
+      confirmLabel: "Concede",
+      cancelLabel: "Keep fighting",
+      onConfirm: () => { coop?.submitLocal({ type: "gate" }); },
+      onCancel: () => {},
+    });
+    return;
+  }
   showConfirmModal({
     title: `Leave through the ${dir} gate?`,
     message:
@@ -2790,15 +2908,38 @@ function confirmGateWalk(dir: string): void {
       detail,
       onPick: () => doGateWalk(dir),
     },
-    ...joins.map(j => ({
-      label: `Join ${j.visit.initiator}'s run`,
-      detail: `${j.visit.players} of ${j.visit.max_players} waiting to go into ${segName(target)}.`,
-      onPick: () => { void doCoopJoin(j.visit.id, dir); },
-    })),
+    ...joins.map(j => {
+      const stake = j.visit.stake ?? 0;
+      const duel = j.visit.mode === "duel";
+      const gold = connState?.player?.gold ?? 0;
+      const affordable = !duel || gold >= stake;
+      return {
+        label: duel
+          ? `Duel ${j.visit.initiator} for ${stake} gold`
+          : `Join ${j.visit.initiator}'s run`,
+        // The joiner sees the mode and the stake BEFORE joining, and is
+        // told when they cannot cover it rather than having the move
+        // silently rejected on chain (spec section 9).
+        detail: duel
+          ? (affordable
+              ? `A fight, not a run: last one standing takes the ${stake * 2} gold pot. ` +
+                `Walking out through a gate concedes. You hold ${gold} gold.`
+              : `You need ${stake} gold to match this stake and hold ${gold}.`)
+          : `${j.visit.players} of ${j.visit.max_players} waiting to go into ${segName(target)}.`,
+        disabled: !affordable,
+        onPick: () => { void doCoopJoin(j.visit.id, dir); },
+      };
+    }),
     {
       label: "Wait here for a partner",
       detail: `Opens a co-op run in ${segName(target)}. Anyone standing next to it can walk in and join you.`,
       onPick: () => { void doCoopHost(dir); },
+    },
+    {
+      label: "Wait here for a duel",
+      detail: `Opens a 1v1 duel in ${segName(target)}. You stake gold, the ` +
+              `challenger matches it, and the last one standing takes the pot.`,
+      onPick: () => { showDuelStakeModal(dir); },
     },
   ];
 
@@ -3982,6 +4123,24 @@ function updateDungeonStats(): void {
     ? `Gold: ${bankedGold} banked (+${me().totalGold} this run, settles on exit)`
     : `Gold: ${me().totalGold} (this run)`;
 
+/**
+ * How a finished duel reads.  The winner is whoever is left when at most
+ * one participant is active, which is NOT the same as "survived": a
+ * conceder walked out through a gate and still lost, so this reads the
+ * engine's latched winner rather than anyone's exit state.
+ */
+function duelOutcomeLine(): string {
+  if (!session || !coop) return "Duel over.";
+  const w = session.duelWinner;
+  if (w < 0) return "Duel over.";
+  const won = w === coop.me;
+  const loser = session.players[w === 0 ? 1 : 0];
+  const how = loser.exited ? "conceded" : "fell";
+  return won
+    ? `You win \u2014 ${coop.names[w === 0 ? 1 : 0]} ${how}. Settle to take the pot.`
+    : `You ${how === "conceded" ? "conceded" : "lost"} \u2014 ${coop.names[w]} takes the pot.`;
+}
+
   // Co-op: partner, turn state, projected reward shares, relay health.
   let coopBlock = "";
   if (coop) {
@@ -3989,14 +4148,37 @@ function updateDungeonStats(): void {
     const rows = coop.names.map((n, i) => {
       const q = session!.players[i];
       const c = claims[i];
-      const state = q.dead ? "dead" : q.exited ? `exited ${q.exitGate}` : `HP ${q.hp}/${q.maxHp}`;
       const you = i === coop!.me ? " (you)" : "";
+      if (session!.isDuel()) {
+        // Both HP bars, because in a duel the opponent's health IS the
+        // scoreboard -- there is no shared objective to report instead.
+        const frac = q.maxHp > 0 ? Math.max(0, q.hp) / q.maxHp : 0;
+        const state = q.dead ? "dead" : q.exited ? "conceded" : `${q.hp}/${q.maxHp}`;
+        const colour = i === coop!.me ? "#6c6" : "#c66";
+        return `<div class="stat-row"><span class="stat-label">${n}${you}</span>` +
+               `<span class="stat-value">${state}</span></div>` +
+               `<div style="height:4px;background:#222;margin:1px 0 3px">` +
+               `<div style="height:4px;width:${(frac * 100).toFixed(0)}%;background:${colour}"></div></div>`;
+      }
+      const state = q.dead ? "dead" : q.exited ? `exited ${q.exitGate}` : `HP ${q.hp}/${q.maxHp}`;
       return `<div class="stat-row"><span class="stat-label">${n}${you}</span>` +
              `<span class="stat-value">${state} \u00b7 ${c.kills}K \u00b7 ~${c.xp}xp ~${c.gold}g</span></div>`;
     }).join("");
+    const duel = session.isDuel();
     let turnLine: string;
-    if (session.gameOver) turnLine = "Run over.";
+    if (session.gameOver) turnLine = duel ? duelOutcomeLine() : "Run over.";
     else if (me().dead || me().exited) turnLine = "Spectating until the run ends.";
+    else if (duel) {
+      // A duel round asks for one choice and then runs itself, so the
+      // phase is what the player needs to see -- "your move" would be a
+      // lie during the reveal, when nothing is being asked of them.
+      switch (coop.phaseLabel) {
+        case "choose": turnLine = "Choose your move \u2014 both are sealed until revealed."; break;
+        case "waiting for opponent": turnLine = "Sealed. Waiting for your opponent..."; break;
+        case "revealing": turnLine = "Revealing..."; break;
+        default: turnLine = "";
+      }
+    }
     else if (coop.hasPendingOwn) turnLine = `Action sent; waiting for ${coop.waitingOn}...`;
     else if (coop.myTurn) turnLine = "Your move.";
     else turnLine = `Waiting for ${coop.waitingOn}...`;
@@ -4013,12 +4195,20 @@ function updateDungeonStats(): void {
         cpLine = `<div style="color:#666;font-size:10px">${cp.name}'s checkpoint: ${cp.n} actions, ${cp.age} block${cp.age === 1 ? "" : "s"} ago (abandon after ${ABANDON_WINDOW_BLOCKS}).</div>`;
       }
     }
+    const pot = coopVisit?.pot ?? 0;
+    const header = duel
+      ? `<div style="color:#c88;font-size:11px;font-weight:bold">Duel \u00b7 visit #${channelVisitId}` +
+        (pot > 0 ? ` \u00b7 ${pot} gold pot` : " \u00b7 no stake") + `</div>`
+      : `<div style="color:#8cc;font-size:11px;font-weight:bold">Co-op run \u00b7 visit #${channelVisitId}</div>`;
+    const footnote = duel
+      ? `<div style="color:#666;font-size:10px">Bump your opponent to attack. Leaving through a gate concedes the duel and the pot.</div>`
+      : `<div style="color:#666;font-size:10px">Shares (~) are projected: kill XP and gold pools split by damage dealt, final at settlement.</div>`;
     coopBlock = `
       <div style="margin-top:6px;border-top:1px solid #333;padding-top:6px">
-        <div style="color:#8cc;font-size:11px;font-weight:bold">Co-op run \u00b7 visit #${channelVisitId}</div>
+        ${header}
         ${rows}
         <div style="color:#aaa;font-size:11px">${turnLine}</div>
-        <div style="color:#666;font-size:10px">Shares (~) are projected: kill XP and gold pools split by damage dealt, final at settlement.</div>
+        ${footnote}
         ${cpLine}
         ${relay}
       </div>`;

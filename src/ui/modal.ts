@@ -157,8 +157,14 @@ export interface ChoiceModalOptions {
   /**
    * The actions offered, in order.  The last one gets focus, matching the
    * confirm modal.  `detail` is a dimmer second line under the label.
+   * A `disabled` choice is shown but cannot be picked -- use it when the
+   * option genuinely exists and the reason it is unavailable belongs in
+   * `detail` (an unaffordable duel stake, say); hide it instead when its
+   * existence is not worth explaining.
    */
-  choices: Array<{ label: string; detail?: string; onPick: () => void }>;
+  choices: Array<{
+    label: string; detail?: string; disabled?: boolean; onPick: () => void;
+  }>;
   cancelLabel?: string;
   onCancel?: () => void;
 }
@@ -176,7 +182,8 @@ export function showChoiceModal(opts: ChoiceModalOptions): void {
   root.id = "modal-root";
   root.className = "modal-overlay";
   const buttons = opts.choices.map((c, i) =>
-    `<button class="modal-choice" data-choice="${i}">${escapeHtml(c.label)}${
+    `<button class="modal-choice" data-choice="${i}"${c.disabled ? " disabled" : ""}>${
+      escapeHtml(c.label)}${
       c.detail ? `<span class="modal-choice-detail">${escapeHtml(c.detail)}</span>` : ""
     }</button>`).join("");
   root.innerHTML = `
@@ -204,11 +211,14 @@ export function showChoiceModal(opts: ChoiceModalOptions): void {
   root.addEventListener("click", (e) => { if (e.target === root) close(null); });
   root.querySelector(".modal-cancel")!.addEventListener("click", () => close(null));
   root.querySelectorAll<HTMLButtonElement>(".modal-choice").forEach(btn => {
+    if (btn.disabled) return;
     btn.addEventListener("click", () => close(Number(btn.dataset.choice)));
   });
   document.addEventListener("keydown", onKey);
 
   document.body.appendChild(root);
-  const last = root.querySelectorAll<HTMLButtonElement>(".modal-choice");
-  (last[last.length - 1] ?? root.querySelector(".modal-cancel") as HTMLButtonElement).focus();
+  const pickable = Array.from(
+    root.querySelectorAll<HTMLButtonElement>(".modal-choice")).filter(b => !b.disabled);
+  (pickable[pickable.length - 1]
+    ?? root.querySelector(".modal-cancel") as HTMLButtonElement).focus();
 }

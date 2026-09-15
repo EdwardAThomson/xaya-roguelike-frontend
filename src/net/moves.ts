@@ -140,9 +140,14 @@ export class MoveClient {
    * settles it and leaves you standing where you are with the door open;
    * from the hub or a segment you are standing in, pass nothing.
    */
-  async visit(name: string, dir: string, settlement?: Settlement): Promise<void> {
-    const op: { dir: string; settlement?: Settlement } = { dir };
+  async visit(name: string, dir: string, settlement?: Settlement,
+              duel?: { stake: number }): Promise<void> {
+    const op: { dir: string; settlement?: Settlement; mode?: string; stake?: number } = { dir };
     if (settlement) op.settlement = settlement;
+    // Absent `mode` is a co-op run, exactly as before duels existed; the
+    // GSP rejects a stake outside a duel, so both travel together or
+    // neither does.
+    if (duel) { op.mode = "duel"; op.stake = duel.stake; }
     await this.transport.submitMove(name, { v: op });
     await this.transport.mine();
   }
