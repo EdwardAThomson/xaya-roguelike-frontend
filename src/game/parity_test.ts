@@ -17,7 +17,7 @@ import { DungeonSession, GameAction, EntryInvItem, PlayerSetup,
 import { PlayerStats } from "./combat.js";
 import {
   canonicalActionLine, computeClaims, parseCanonicalLog, settleLogHash,
-  splitPool, encodeCompactLog, decodeCompactLog,
+  splitPool, encodeCompactLog, decodeCompactLog, DUEL_XP_BASE,
 } from "./settle.js";
 
 /**
@@ -357,6 +357,71 @@ export function runSpawnParityVectors(): boolean {
     && line2 === "PARITY-MIXEDGATE p0[14,38] p1[65,29]"
     && soloSame;
   console.log(`[spawn-parity] ${ok ? "✓ OK" : "✗ FAIL — C++/TS spawn placement diverged"}`);
+  return ok;
+}
+
+/**
+ * Duel claim shape (frontend-only; the cross-language vectors cover the
+ * engine).  A duel banks on the fight, not on reaching a gate, so the
+ * winner claims survived with the pot and the XP bonus while never having
+ * exited.  Getting this wrong does not diverge the engines, it just gets
+ * every duel rejected at settlement with "claims duel= but the replay
+ * says ...", which is exactly what shipped once.
+ */
+export function runDuelClaimVector(): boolean {
+  const stats = {
+    level: 3, strength: 10, dexterity: 10, constitution: 10,
+    intelligence: 10, equipAttack: 5, equipDefense: 2,
+  };
+  const setups: PlayerSetup[] = [
+    { name: "a", stats: { ...stats }, hp: 100, maxHp: 100, potions: [], inventory: [] },
+    { name: "b", stats: { ...stats }, hp: 100, maxHp: 100, potions: [], inventory: [] },
+  ];
+  const s = DungeonSession.createDuel("duel-claims", 1, setups, 7);
+  const salt = (i: number, r: number) =>
+    (i.toString(16) + r.toString(16)).padStart(32, "0");
+
+  // Walk them into each other until one falls.  Fixed salts, so the whole
+  // run is reproducible.
+  for (let round = 0; round < 400 && !s.gameOver; round++) {
+    const r = s.roundIndex;
+    const acts: GameAction[] = [0, 1].map(i => {
+      const me = s.players[i], foe = s.players[1 - i];
+      const dx = Math.sign(foe.x - me.x), dy = Math.sign(foe.y - me.y);
+      return (dx || dy) ? { type: "move", dx, dy } : { type: "wait" };
+    });
+    for (const i of [0, 1])
+      if (s.isPlayerActive(i))
+        s.processActionBy(i, { type: "commit", hex: duelCommitHash(7, r, i, acts[i], salt(i, r)) });
+    for (const i of [0, 1])
+      if (s.isPlayerActive(i)) s.processActionBy(i, { type: "reveal", hex: salt(i, r) });
+    for (const i of [0, 1])
+      if (s.isPlayerActive(i)) s.processActionBy(i, acts[i]);
+  }
+
+  const POT = 20;
+  const claims = computeClaims(s, POT);
+  const w = s.duelWinner;
+  const l = w === 0 ? 1 : 0;
+  const problems: string[] = [];
+  if (!s.gameOver || w < 0) problems.push("the duel never resolved");
+  if (claims[w]?.duel !== "won") problems.push(`winner claims duel=${claims[w]?.duel}`);
+  if (claims[l]?.duel !== "lost") problems.push(`loser claims duel=${claims[l]?.duel}`);
+  // The winner is banked as survived WITHOUT having exited through a gate.
+  if (claims[w]?.survived !== true) problems.push("winner does not claim survived");
+  if (s.players[w]?.exited) problems.push("winner exited, so this vector proves nothing");
+  if (claims[l]?.survived !== false) problems.push("loser claims survived");
+  if (claims[w]?.gold !== s.players[w].totalGold + POT)
+    problems.push(`winner gold ${claims[w]?.gold} excludes the pot`);
+  if (claims[l]?.gold !== s.players[l].totalGold)
+    problems.push(`loser gold ${claims[l]?.gold} is not just their pickups`);
+  const expectXp = DUEL_XP_BASE * s.players[l].stats.level;
+  if (claims[w]?.xp !== expectXp) problems.push(`winner xp ${claims[w]?.xp}, expected ${expectXp}`);
+  if (claims[l]?.xp !== 0) problems.push(`loser xp ${claims[l]?.xp}, expected 0`);
+
+  const ok = problems.length === 0;
+  console.log(`[duel-claims] winner ${w}, pot ${POT}, xp ${claims[w]?.xp} ` +
+    `${ok ? "✓ OK" : "✗ FAIL — " + problems.join("; ")}`);
   return ok;
 }
 
@@ -770,6 +835,7 @@ const results = [
   runAbsentParityVector(),
   runCompactEncodingVector(),
   runSpawnParityVectors(),
+  runDuelClaimVector(),
   runDuelParityVector(),
   runDuelConcessionVector(),
   runDuelStallVector(),

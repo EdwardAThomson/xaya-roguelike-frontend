@@ -110,12 +110,24 @@ export function splitPool(pool: number, damages: number[]): number[] {
   return shares;
 }
 
+/**
+ * Duel settlement constants, mirroring moveprocessor.hpp.  Settlement-layer
+ * values outside the replay, so retuning them is a coordinated upgrade
+ * rather than a chain break; they must match the GSP's or every duel claim
+ * is rejected.
+ */
+export const DUEL_XP_BASE = 20;
+export const DUEL_RAKE_PERCENT = 0;
+
 /** One participant's claimed outcome, as the GSP verifies it. */
 export interface ParticipantClaim {
   survived: boolean;
   xp: number;
   gold: number;
   kills: number;
+  /** Duels only: the outcome, claimed explicitly so a client that disagrees
+      about who won is rejected rather than silently corrected. */
+  duel?: "won" | "lost";
 }
 
 /**
@@ -126,15 +138,41 @@ export interface ParticipantClaim {
  * whether the participant exited through a gate.  Indexed by canonical
  * participant index.
  */
-export function computeClaims(session: DungeonSession): ParticipantClaim[] {
+export function computeClaims(
+  session: DungeonSession, pot = 0,
+): ParticipantClaim[] {
   const damages = session.players.map(p => p.damageDealt);
   const xpShares = splitPool(session.xpPool, damages);
   const goldShares = splitPool(session.killGoldPool, damages);
+
+  if (!session.isDuel()) {
+    return session.players.map((p, i) => ({
+      survived: p.exited,
+      xp: xpShares[i],
+      gold: p.totalGold + goldShares[i],
+      kills: p.totalKills,
+    }));
+  }
+
+  // A duel banks on the outcome of the fight, not on reaching a gate
+  // (pvp spec sections 5 and 5a): the winner is "survived" where they
+  // stand, a conceder is not although they walked out, the winner takes
+  // the pot less the rake, and the winner's XP includes DUEL_XP_BASE per
+  // level of the loser.  Every one of these is re-derived from the replay
+  // by the GSP, so a mismatch here is a rejected settlement.
+  const winner = session.duelWinner;
+  const loser = winner === 0 ? 1 : 0;
+  const prize = pot - Math.floor(pot * DUEL_RAKE_PERCENT / 100);
+  const duelXp = winner < 0
+    ? 0
+    : DUEL_XP_BASE * (session.players[loser]?.stats.level ?? 0);
+
   return session.players.map((p, i) => ({
-    survived: p.exited,
-    xp: xpShares[i],
-    gold: p.totalGold + goldShares[i],
+    survived: i === winner,
+    xp: xpShares[i] + (i === winner ? duelXp : 0),
+    gold: p.totalGold + goldShares[i] + (i === winner ? prize : 0),
     kills: p.totalKills,
+    duel: (i === winner ? "won" : "lost") as "won" | "lost",
   }));
 }
 
@@ -143,9 +181,9 @@ export function computeClaims(session: DungeonSession): ParticipantClaim[] {
  * participant, tagged with the player name, in canonical order.
  */
 export function toWireResults(
-  session: DungeonSession, names: string[],
+  session: DungeonSession, names: string[], pot = 0,
 ): object[] {
-  return computeClaims(session).map((c, i) => ({ p: names[i], ...c }));
+  return computeClaims(session, pot).map((c, i) => ({ p: names[i], ...c }));
 }
 
 /**

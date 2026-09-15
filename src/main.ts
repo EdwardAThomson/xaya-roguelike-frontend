@@ -1439,7 +1439,8 @@ async function coopSoloSettle(): Promise<void> {
   updateSidebar();
   try {
     s.addMessage("Run over. Settling alone on-chain...", "info");
-    await moves.settle(myName, solo.visitId, toWireResults(s, solo.names),
+    await moves.settle(myName, solo.visitId,
+                       toWireResults(s, solo.names, coopVisit?.pot ?? 0),
                        mergedProof(s.mergedLog), solo.from);
     const ok = await waitForVisitStatus(solo.visitId, st => st !== "active", 60000);
     if (!ok) throw new Error("The GSP did not settle the run in time. Retry the settlement.");
@@ -1487,7 +1488,7 @@ async function coopSettle(): Promise<void> {
   coopSettleError = null;
 
   const hash = settleLogHash(visitId, s.mergedLog);
-  const results = toWireResults(s, runner.names);
+  const results = toWireResults(s, runner.names, coopVisit?.pot ?? 0);
   const actions = mergedProof(s.mergedLog);
   const others = runner.names.filter(n => n !== myName);
 
@@ -4144,7 +4145,7 @@ function duelOutcomeLine(): string {
   // Co-op: partner, turn state, projected reward shares, relay health.
   let coopBlock = "";
   if (coop) {
-    const claims = computeClaims(session);
+    const claims = computeClaims(session, coopVisit?.pot ?? 0);
     const rows = coop.names.map((n, i) => {
       const q = session!.players[i];
       const c = claims[i];
@@ -4213,7 +4214,7 @@ function duelOutcomeLine(): string {
         ${relay}
       </div>`;
   } else if (coopSolo) {
-    const claims = computeClaims(session);
+    const claims = computeClaims(session, coopVisit?.pot ?? 0);
     const c = claims[coopSolo.me];
     coopBlock = `
       <div style="margin-top:6px;border-top:1px solid #333;padding-top:6px">
@@ -4376,7 +4377,7 @@ if (typeof location !== "undefined"
         waitingOn: coop.waitingOn,
         turns: coop.session.turnCount,
         logHash: settleLogHash(channelVisitId, coop.session.mergedLog),
-        claims: computeClaims(coop.session),
+        claims: computeClaims(coop.session, coopVisit?.pot ?? 0),
         players: coop.session.players.map(q => ({
           x: q.x, y: q.y, hp: q.hp, dead: q.dead, exited: q.exited, exitGate: q.exitGate,
         })),
