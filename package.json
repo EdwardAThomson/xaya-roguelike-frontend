@@ -14,7 +14,8 @@
     "persist": "node tests/e2e/persist.mjs",
     "coop": "node tests/e2e/coop.mjs",
     "coop:play": "node tests/e2e/coop_play.mjs",
-    "duel": "node tests/e2e/duel.mjs"
+    "duel": "node tests/e2e/duel.mjs",
+    "duel:evil": "node tests/e2e/duel_adversarial.mjs"
   },
   "repository": {
     "type": "git",
