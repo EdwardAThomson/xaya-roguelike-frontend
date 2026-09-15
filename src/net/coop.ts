@@ -24,10 +24,30 @@
  *
  * The relay keeps the full history, so a reloaded client rebuilds the run
  * by fetching from index 0 and draining in engine order.
+ *
+ * DUELS (backend docs/SPEC_multiplayer_pvp.md) ride this same pipe with no
+ * new message kind.  The spec's section 9 speaks of "commit" and "reveal"
+ * messages alongside "action"; modelling them as ACTION TYPES instead
+ * (session.ts) means they flow through the identical ordinal/queue/drain
+ * path, so one mechanism keeps all three in order and the relay needs no
+ * idea that duels exist.  What a duel does change is the local client's
+ * job per round: the player chooses ONCE, at the commit step, and the
+ * runner then emits the reveal and the action by itself.
  */
 
-import { DungeonSession, GameAction } from "../game/session.js";
+import { DungeonSession, GameAction, duelCommitHash } from "../game/session.js";
 import { loadClaim } from "./moves.js";
+
+/**
+ * 16 bytes of randomness as lowercase hex: a duel round's salt (spec §2).
+ * Must be unpredictable to the opponent -- it is what makes the round's
+ * entropy unbiasable -- so this uses the platform CSPRNG, never Math.random.
+ */
+export function randomSaltHex(): string {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  return Array.from(b, x => x.toString(16).padStart(2, "0")).join("");
+}
 
 /** One relayed action: who, their per-participant ordinal, and the action. */
 export interface CoopMessage {
@@ -104,6 +124,14 @@ export interface CoopRunnerOptions {
   transport: CoopTransport;
   /** Idle time after the partner acted before this client auto-waits. */
   graceMs?: number;
+  /**
+   * Duel only: the fixed tick that bounds the COMMIT step (spec §2c).  A
+   * duel round cannot open on "someone acted", because a commit is opaque
+   * until it arrives -- two players each waiting to see movement would wait
+   * forever -- so the timer runs from the round opening, unconditionally.
+   * Not part of consensus: the log records rounds, never ticks.
+   */
+  tickMs?: number;
   /** Relay poll period. */
   pollMs?: number;
   /** Called after every state change (apply, queue, error) so the UI can redraw. */
@@ -145,6 +173,19 @@ export class CoopRunner {
   private roundOtherAt: number | null = null;
   private otherQueuedAt: number | null = null;
 
+  /* ---- Duel state (unused in co-op) -------------------------------- */
+
+  private tickMs: number;
+  /** The choice this client sealed for the current round, kept so the
+      reveal and the action can be emitted from it without asking the
+      player again. */
+  private choice: { action: GameAction; salt: string } | null = null;
+  /** Round index the current `choice` belongs to, -1 when none. */
+  private choiceRound = -1;
+  /** Round the commit tick is timing, and when that round opened. */
+  private tickRound = -1;
+  private tickStartedAt = 0;
+
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private graceTimer: ReturnType<typeof setInterval> | null = null;
   private polling = false;
@@ -158,6 +199,7 @@ export class CoopRunner {
     this.names = opts.names;
     this.transport = opts.transport;
     this.graceMs = opts.graceMs ?? 700;
+    this.tickMs = opts.tickMs ?? 3000;
     this.pollMs = opts.pollMs ?? 300;
     this.onChange = opts.onChange;
     this.onNote = opts.onNote ?? (() => {});
@@ -169,7 +211,8 @@ export class CoopRunner {
     this.stopped = false;
     void this.pollOnce();
     this.pollTimer = setInterval(() => void this.pollOnce(), this.pollMs);
-    this.graceTimer = setInterval(() => this.graceTick(), 100);
+    this.graceTimer = setInterval(
+      () => (this.session.isDuel() ? this.commitTick() : this.graceTick()), 100);
   }
 
   stop(): void {
@@ -205,6 +248,12 @@ export class CoopRunner {
     const s = this.session;
     if (s.gameOver || !s.isPlayerActive(this.me)) return false;
     if (this.hasPendingOwn) return false;
+
+    // In a duel the player's input seals a choice for the round rather
+    // than taking it: what goes on the wire now is the COMMITMENT, and the
+    // reveal and the action follow automatically once the opponent's
+    // commit is in (spec §2).
+    if (s.isDuel()) return this.commitChoice(action);
 
     const n = this.mySent;
     if (s.nextActor === this.me) {
@@ -306,6 +355,8 @@ export class CoopRunner {
       }
       this.afterApplied(actor);
     }
+    // The engine may now be waiting on this client's reveal or action.
+    this.pumpDuel();
   }
 
   /** Round bookkeeping after participant `actor`'s action was applied. */
@@ -320,6 +371,107 @@ export class CoopRunner {
     for (let i = 0; i < this.queues.length; i++)
       if (i !== this.me && this.queues[i].size > 0) anyOther = true;
     if (!anyOther) this.otherQueuedAt = null;
+  }
+
+  /* ================= Duel round protocol (spec §2) ================= */
+
+  /** What the local player is being asked for right now, for the UI. */
+  get phaseLabel(): "choose" | "waiting for opponent" | "revealing" | "-" {
+    const s = this.session;
+    if (!s.isDuel() || s.gameOver) return "-";
+    if (s.phase === "commit")
+      return this.choiceRound === s.roundIndex ? "waiting for opponent" : "choose";
+    if (s.phase === "reveal") return "revealing";
+    return "waiting for opponent";
+  }
+
+  /** True when the duel is waiting for this player to choose a move. */
+  get myChoicePending(): boolean {
+    const s = this.session;
+    return s.isDuel() && !s.gameOver && s.isPlayerActive(this.me)
+      && s.phase === "commit" && this.choiceRound !== s.roundIndex;
+  }
+
+  /**
+   * Seals `action` for this round: draws a salt, sends the commitment, and
+   * remembers both so reveal and apply need no further input.  The salt
+   * never leaves this client until the reveal, which is what stops the
+   * opponent predicting the round's rolls.
+   */
+  private commitChoice(action: GameAction): boolean {
+    const s = this.session;
+    if (s.phase !== "commit") return false;
+    if (this.choiceRound === s.roundIndex) return false;   // already sealed
+
+    const salt = randomSaltHex();
+    this.choice = { action, salt };
+    this.choiceRound = s.roundIndex;
+    return this.emit({
+      type: "commit",
+      hex: duelCommitHash(s.duelVisitId, s.roundIndex, this.me, action, salt),
+    });
+  }
+
+  /**
+   * Emits whatever the round protocol owes next from the sealed choice: the
+   * reveal once both commits are in, then the action once both reveals are.
+   * Called after every drain, so it fires as soon as the opponent's message
+   * lands rather than on a timer.
+   */
+  private pumpDuel(): void {
+    const s = this.session;
+    if (!s.isDuel() || s.gameOver) return;
+    if (!s.isPlayerActive(this.me)) return;
+    if (this.hasPendingOwn || s.nextActor !== this.me) return;
+    if (!this.choice || this.choiceRound !== s.roundIndex) return;
+
+    if (s.phase === "reveal") this.emit({ type: "reveal", hex: this.choice.salt });
+    else if (s.phase === "act") this.emit(this.choice.action);
+  }
+
+  /**
+   * Queues and ships one of this client's own protocol entries.  Applies it
+   * straight away when the engine is already waiting for it, so the local
+   * view never lags the wire.
+   */
+  private emit(action: GameAction): boolean {
+    const s = this.session;
+    const n = this.mySent;
+    if (s.nextActor === this.me) {
+      if (!s.processActionBy(this.me, action)) return false;
+      this.mySent = n + 1;
+      this.consumed[this.me] = n + 1;
+      this.afterApplied(this.me);
+    } else {
+      this.queues[this.me].set(n, action);
+      this.mySent = n + 1;
+    }
+    this.outbox.push({ n, action });
+    void this.flush();
+    this.drain();
+    this.onChange();
+    return true;
+  }
+
+  /**
+   * The fixed tick (spec §2c): if the player has not chosen by the
+   * deadline, this client commits a WAIT for them -- self-authored, exactly
+   * like co-op's grace wait.  Runs from the round opening rather than from
+   * the opponent acting, because a commit is invisible until it arrives and
+   * two clients each waiting for the other would wait forever.
+   */
+  private commitTick(): void {
+    const s = this.session;
+    if (s.gameOver || !s.isPlayerActive(this.me)) return;
+
+    if (this.tickRound !== s.roundIndex) {
+      this.tickRound = s.roundIndex;
+      this.tickStartedAt = Date.now();
+      return;
+    }
+    if (!this.myChoicePending) return;
+    if (Date.now() - this.tickStartedAt < this.tickMs) return;
+    this.submitLocal({ type: "wait" });
   }
 
   /** Self-authored wait after the partner acted and this player idled. */
