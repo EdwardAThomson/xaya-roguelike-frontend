@@ -6,7 +6,8 @@
  */
 
 import { sha256Hex } from "./hash.js";
-import { DungeonSession, GameAction, LoggedAction } from "./session.js";
+import { DungeonSession, GameAction, LoggedAction,
+         canonicalActionBody } from "./session.js";
 
 /**
  * Wire encoding of one merged-log entry: the solo action object plus the
@@ -20,6 +21,9 @@ export function toWireAction(la: LoggedAction): object {
     case "use":     return { i: la.actor, type: "use", item: a.itemId ?? "" };
     case "equip":   return { i: la.actor, type: "equip", rowid: a.rowid ?? 0, slot: a.slot ?? "" };
     case "unequip": return { i: la.actor, type: "unequip", rowid: a.rowid ?? 0 };
+    // Duel round protocol (SPEC_multiplayer_pvp.md §6).
+    case "commit":  return { i: la.actor, type: "commit", h: a.hex ?? "" };
+    case "reveal":  return { i: la.actor, type: "reveal", s: a.hex ?? "" };
     default:        return { i: la.actor, type: a.type };
   }
 }
@@ -30,17 +34,7 @@ export function toWireAction(la: LoggedAction): object {
  * moveprocessor.cpp.
  */
 export function canonicalActionLine(actor: number, a: GameAction): string {
-  let line = String(actor);
-  switch (a.type) {
-    case "move":    line += ` move ${a.dx ?? 0} ${a.dy ?? 0}`; break;
-    case "pickup":  line += " pickup"; break;
-    case "use":     line += ` use ${a.itemId ?? ""}`; break;
-    case "gate":    line += " gate"; break;
-    case "wait":    line += " wait"; break;
-    case "equip":   line += ` equip ${a.rowid ?? 0} ${a.slot ?? ""}`; break;
-    case "unequip": line += ` unequip ${a.rowid ?? 0}`; break;
-  }
-  return line + "\n";
+  return `${actor} ` + canonicalActionBody(a) + "\n";
 }
 
 /**
@@ -76,6 +70,8 @@ export function parseCanonicalLog(text: string): LoggedAction[] {
       case "wait":    action = { type: "wait" }; break;
       case "equip":   action = { type: "equip", rowid: Number(parts[2]), slot: parts[3] }; break;
       case "unequip": action = { type: "unequip", rowid: Number(parts[2]) }; break;
+      case "commit":  action = { type: "commit", hex: parts[2] }; break;
+      case "reveal":  action = { type: "reveal", hex: parts[2] }; break;
       default: throw new Error("bad canonical log line: " + line);
     }
     out.push({ actor, action });
@@ -187,6 +183,9 @@ function compactEntry(a: GameAction): string {
     case "use":     return "u" + (a.itemId ?? "");
     case "equip":   return `e${a.rowid ?? 0},${a.slot ?? ""}`;
     case "unequip": return `q${a.rowid ?? 0}`;
+    // Duel only (backend STRATEGY_action_proofs.md grammar).
+    case "commit":  return "c" + (a.hex ?? "");
+    case "reveal":  return "r" + (a.hex ?? "");
   }
 }
 
@@ -256,6 +255,8 @@ export function decodeCompactLog(text: string, withActor: boolean): LoggedAction
         if (!/^-?[0-9]+$/.test(arg)) throw new Error("bad unequip: " + entry);
         action = { type: "unequip", rowid: Number(arg) };
         break;
+      case "c": if (!arg) throw new Error("bad commit"); action = { type: "commit", hex: arg }; break;
+      case "r": if (!arg) throw new Error("bad reveal"); action = { type: "reveal", hex: arg }; break;
       default: throw new Error("bad code: " + entry);
     }
     for (let k = 0; k < count; k++) out.push({ actor, action });

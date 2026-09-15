@@ -11,10 +11,11 @@
  */
 
 import { MT19937 } from "./rng.js";
-import { hashSeedSync } from "./hash.js";
+import { hashSeedSync, sha256Hex } from "./hash.js";
 import { Dungeon, Gate, Tile, WIDTH, HEIGHT } from "./dungeon.js";
 import { Monster, spawnMonsters } from "./monsters.js";
-import { PlayerStats, playerAttackMonster, monsterAttackPlayer } from "./combat.js";
+import { PlayerStats, playerAttackMonster, monsterAttackPlayer,
+         playerAttackPlayer } from "./combat.js";
 import { lookupItem, getSpawnableItems } from "./items.js";
 
 export interface GroundItem {
@@ -53,7 +54,9 @@ export interface BagItem {
 }
 
 export type ActionType =
-  "move" | "pickup" | "use" | "gate" | "wait" | "equip" | "unequip";
+  "move" | "pickup" | "use" | "gate" | "wait" | "equip" | "unequip"
+  /** Duel only: the round protocol entries (SPEC_multiplayer_pvp.md §2). */
+  | "commit" | "reveal";
 
 export interface GameAction {
   type: ActionType;
@@ -64,6 +67,78 @@ export interface GameAction {
   rowid?: number;
   /** Target equipment slot for equip. */
   slot?: string;
+  /** Lowercase hex payload: the 64-char commitment for "commit", the
+      32-char (16-byte) salt for "reveal". */
+  hex?: string;
+}
+
+/**
+ * Co-op (the default: every existing visit, and every solo run) or a
+ * hostile 1v1 duel.  Duel mode is the ONLY thing that enables the
+ * commit/reveal round protocol, the per-round reseed and player-vs-player
+ * attacks, so a co-op replay takes none of those paths and stays
+ * byte-identical.  Mirrors DungeonGame::Mode.
+ */
+export type DuelMode = "coop" | "duel";
+
+/** Where a duel round stands (spec §2).  Co-op is always in "act". */
+export type RoundPhase = "commit" | "reveal" | "act";
+
+/**
+ * The canonical encoding of one action WITHOUT the leading participant
+ * index: "move 1 0", "use health_potion", "wait", "commit <h>", ...
+ * The settlement consent hash prefixes the index (canonicalActionLine in
+ * settle.ts) and a duel commitment binds exactly this string, so the two
+ * encodings can never drift apart.  Mirrors CanonicalActionBody.
+ */
+export function canonicalActionBody(a: GameAction): string {
+  switch (a.type) {
+    case "move":    return `move ${a.dx ?? 0} ${a.dy ?? 0}`;
+    case "pickup":  return "pickup";
+    case "use":     return `use ${a.itemId ?? ""}`;
+    case "gate":    return "gate";
+    case "wait":    return "wait";
+    case "equip":   return `equip ${a.rowid ?? 0} ${a.slot ?? ""}`;
+    case "unequip": return `unequip ${a.rowid ?? 0}`;
+    case "commit":  return `commit ${a.hex ?? ""}`;
+    case "reveal":  return `reveal ${a.hex ?? ""}`;
+  }
+}
+
+/**
+ * The preimage a duel commitment covers (spec §2):
+ *
+ *   "rog-duel-commit-v1\n" || visitId || "\n" || round || "\n"
+ *   || participant || "\n" || canonical(action) || "\n" || hex(salt)
+ *
+ * Binding the visit and the round means a commitment can never be replayed
+ * into another duel or another round of the same one.  Mirrors
+ * DuelCommitPreimage.
+ */
+export function duelCommitPreimage(visitId: number, round: number,
+                                    participant: number, action: GameAction,
+                                    saltHex: string): string {
+  return "rog-duel-commit-v1\n"
+       + `${visitId}\n${round}\n${participant}\n`
+       + canonicalActionBody(action) + "\n" + saltHex;
+}
+
+/** SHA-256 hex of duelCommitPreimage: what a "commit" entry carries. */
+export function duelCommitHash(visitId: number, round: number,
+                                participant: number, action: GameAction,
+                                saltHex: string): string {
+  return sha256Hex(
+    duelCommitPreimage(visitId, round, participant, action, saltHex));
+}
+
+/** True iff `h` is exactly `len` lowercase hex digits. */
+function isLowerHex(h: string, len: number): boolean {
+  if (h.length !== len) return false;
+  for (const c of h) {
+    const ok = (c >= "0" && c <= "9") || (c >= "a" && c <= "f");
+    if (!ok) return false;
+  }
+  return true;
 }
 
 /**
@@ -130,6 +205,18 @@ export interface PlayerState {
   exitGate: string;
   /** Display name for messages. */
   name: string;
+  /**
+   * Damage dealt to other participants (duels only).  Deliberately NOT
+   * part of `damageDealt`: the co-op pools split by damage dealt to
+   * MONSTERS (pvp spec §8).
+   */
+  pvpDamage: number;
+  /**
+   * 1-based order of death within the run, 0 while alive.  The duel
+   * tie-break when a monster pass kills both duellists needs to know who
+   * died later (pvp spec §5).
+   */
+  deathSeq: number;
 }
 
 /** maxHp = BASE_HP + effectiveConstitution*HP_PER_CON (must match items.cpp). */
@@ -153,6 +240,7 @@ function newPlayerState(name: string): PlayerState {
     loot: [], collected: [],
     dead: false, exited: false, absent: false, exitGate: "",
     name,
+    pvpDamage: 0, deathSeq: 0,
   };
 }
 
@@ -191,6 +279,40 @@ export class DungeonSession {
   /** Same history with actor indices (multiplayer merged log). */
   mergedLog: LoggedAction[] = [];
 
+  /* ---- Duel state (all inert in "coop" mode) ------------------------- */
+
+  mode: DuelMode = "coop";
+
+  /**
+   * The visit this duel belongs to; bound into every commitment so a
+   * commit can never be replayed into another duel.
+   */
+  duelVisitId: number = 0;
+
+  /** Step of the current round's commit/reveal/apply protocol. */
+  phase: RoundPhase = "act";
+
+  /** 0-based round counter, the `t` of the commitment and the reseed. */
+  roundIndex: number = 0;
+
+  /** This round's commitments and revealed salts, per participant
+      ("" = not supplied this round). */
+  roundCommits: string[] = [];
+  roundSalts: string[] = [];
+
+  /** Deaths so far, for PlayerState.deathSeq. */
+  private deathCounter: number = 0;
+
+  /**
+   * The decided duel winner's canonical index, or -1 while undecided.
+   * Latched the first time at most one participant is active, so a
+   * concession settles the duel on the spot and nothing later can
+   * overturn it.
+   */
+  duelWinner: number = -1;
+
+  isDuel(): boolean { return this.mode === "duel"; }
+
   /**
    * Single-player constructor (original API, byte-identical behaviour):
    * builds one participant and delegates to the shared initialiser.
@@ -223,6 +345,17 @@ export class DungeonSession {
     s.messages = [];
     s.actionLog = [];
     s.mergedLog = [];
+    // Object.create bypasses the class field initialisers, so every field
+    // has to be set here by hand -- including the duel ones, which are
+    // inert in co-op but must not be left undefined (an undefined
+    // duelWinner reads as "already decided" and stops the duel ever
+    // ending).
+    s.mode = "coop";
+    s.duelVisitId = 0;
+    s.phase = "act";
+    s.roundIndex = 0;
+    s.deathCounter = 0;
+    s.duelWinner = -1;
     s.init(seed, depth, setups, constraints);
     return s;
   }
@@ -240,10 +373,46 @@ export class DungeonSession {
     return s;
   }
 
+  /**
+   * Creates a hostile duel between the participants
+   * (SPEC_multiplayer_pvp.md).  `visitId` is bound into every commitment,
+   * so a commit made in one duel can never be replayed into another.  The
+   * dungeon, its monsters and its items are generated exactly as for a
+   * co-op run on the same segment -- the arena stays lively (spec §8) --
+   * and the run opens in the commit phase of round 0.  Mirrors
+   * DungeonGame::CreateDuel.
+   */
+  static createDuel(seed: string, depth: number, setups: PlayerSetup[],
+                    visitId: number, constraints: Gate[] = []): DungeonSession {
+    const s = DungeonSession.createMulti(seed, depth, setups, constraints);
+    s.mode = "duel";
+    s.duelVisitId = visitId;
+    s.phase = "commit";
+    s.roundIndex = 0;
+    return s;
+  }
+
+  /**
+   * Replays a duel's merged log (commit, reveal and action entries) on a
+   * fresh session.  Stops at the first entry that breaks the round
+   * protocol, opens a commitment incorrectly, or is out of turn.
+   * Mirrors DungeonGame::ReplayDuel.
+   */
+  static replayDuel(seed: string, depth: number, setups: PlayerSetup[],
+                    visitId: number, log: LoggedAction[],
+                    constraints: Gate[] = []): DungeonSession {
+    const s = DungeonSession.createDuel(seed, depth, setups, visitId, constraints);
+    for (const la of log)
+      if (!s.processActionBy(la.actor, la.action)) break;
+    return s;
+  }
+
   private init(seed: string, depth: number, setups: PlayerSetup[],
                constraints: Gate[]): void {
     this.depth = depth;
     this.players = [];
+    this.roundCommits = new Array<string>(setups.length).fill("");
+    this.roundSalts = new Array<string>(setups.length).fill("");
 
     for (let i = 0; i < setups.length; i++) {
       const su = setups[i];
@@ -486,6 +655,12 @@ export class DungeonSession {
       return;
     }
 
+    // A duellist who stalls rather than revealing is resolved exactly like
+    // one who vanished: they are absent, so at most one participant is
+    // left and the other wins (pvp spec §7).
+    this.checkDuelEnd();
+    if (this.gameOver) return;
+
     if (this.curTurn === i) {
       const next = this.nextActiveAfter(i);
       if (next === -1) {
@@ -496,6 +671,65 @@ export class DungeonSession {
         this.curTurn = next;
       }
     }
+  }
+
+  /** Number of participants that are currently active. */
+  private activeCount(): number {
+    let n = 0;
+    for (let i = 0; i < this.players.length; i++) if (this.isActive(i)) n++;
+    return n;
+  }
+
+  /**
+   * Latches the duel result if it is now decided (at most one active
+   * participant), and ends the run when it is.  Evaluated after each
+   * applied action and once at the end of each monster pass -- never
+   * between two monsters, so a pass that kills both duellists plays out in
+   * full and is resolved by death order (spec §5).  Mirrors CheckDuelEnd.
+   */
+  private checkDuelEnd(): void {
+    if (this.mode !== "duel" || this.duelWinner !== -1) return;
+    if (this.activeCount() > 1) return;
+
+    // Exactly one left: they win where they stand -- the arena is the
+    // fight, not the exit (spec §5).
+    const survivor = this.firstActive();
+    if (survivor !== -1) {
+      this.duelWinner = survivor;
+    } else {
+      // Nobody active.  A monster pass that killed both duellists is
+      // resolved in favour of whoever died LATER; a participant who
+      // conceded or went absent rather than dying never wins here, because
+      // the other side was still active at that moment and the duel was
+      // already latched above.
+      let best = -1;
+      for (let i = 0; i < this.players.length; i++) {
+        if (this.players[i].deathSeq > 0
+            && (best === -1 || this.players[i].deathSeq > this.players[best].deathSeq))
+          best = i;
+      }
+      this.duelWinner = best;
+    }
+
+    this.gameOver = true;
+  }
+
+  /**
+   * Reseeds the shared stream from the round's revealed salts (spec §3):
+   * hashSeed(s_0 + ":" + s_1 + ... + ":" + t), with the salts of the
+   * round's ACTIVE participants in canonical order.  Called once per duel
+   * round, between the last reveal and the first action, and nowhere else.
+   * A duel always has two active participants (it ends the moment one is
+   * left), so in practice this is exactly the spec's two-salt formula.
+   */
+  private reseedForRound(): void {
+    let material = "";
+    for (let i = 0; i < this.players.length; i++) {
+      if (this.roundSalts[i] === "") continue;
+      material += this.roundSalts[i] + ":";
+    }
+    material += String(this.roundIndex);
+    this.rng = new MT19937(hashSeedSync(material));
   }
 
   private firstActive(): number {
@@ -538,6 +772,112 @@ export class DungeonSession {
     if (actor < 0 || actor >= this.players.length) return false;
     if (actor !== this.curTurn || !this.isActive(actor)) return false;
 
+    const isCommit = action.type === "commit";
+    const isReveal = action.type === "reveal";
+
+    if (this.mode !== "duel") {
+      // Co-op and solo: the commit/reveal entries do not exist here, and
+      // an inapplicable action fails the replay exactly as before.
+      if (isCommit || isReveal) return false;
+      if (!this.applyActionEffects(actor, action)) return false;
+
+      this.actionLog.push(action);
+      this.mergedLog.push({ actor, action });
+      this.turnCount++;
+      this.advanceTurn(actor);
+      return true;
+    }
+
+    // ---- Duel: commit, then reveal, then apply (pvp spec §2) ----
+
+    if (this.phase === "commit") {
+      if (!isCommit || !isLowerHex(action.hex ?? "", 64)) return false;
+      this.roundCommits[actor] = action.hex!;
+    } else if (this.phase === "reveal") {
+      // A reveal is only ever sent once BOTH commits are in, which the
+      // phase itself enforces: the log simply cannot hold a reveal before
+      // the round's commits.
+      if (!isReveal || !isLowerHex(action.hex ?? "", 32)) return false;
+      this.roundSalts[actor] = action.hex!;
+    } else {
+      if (isCommit || isReveal) return false;
+
+      // The commitment must open to exactly the action that follows it
+      // (spec §6).  Because the opponent consented to this log, neither
+      // side can later claim a different choice.
+      const expect = duelCommitHash(this.duelVisitId, this.roundIndex, actor,
+                                    action, this.roundSalts[actor]);
+      if (expect !== this.roundCommits[actor]) return false;
+
+      // An action that the round has overtaken -- the opponent took the
+      // tile first, the monster is already dead, the potion is gone -- is
+      // applied as a wait (spec §2).  Both clients reach that conclusion
+      // from public data, and the log still records what was committed to,
+      // so the commitment above keeps verifying.
+      if (!this.applyActionEffects(actor, action))
+        this.applyActionEffects(actor, { type: "wait" });
+    }
+
+    this.actionLog.push(action);
+    this.mergedLog.push({ actor, action });
+    this.turnCount++;
+
+    if (this.phase !== "act") {
+      // Still collecting this round's commits or reveals: pass along, and
+      // move to the next step once every active participant has supplied
+      // one.
+      const nextP = this.nextActiveAfter(actor);
+      if (nextP !== -1) {
+        this.curTurn = nextP;
+        return true;
+      }
+      if (this.phase === "commit") {
+        this.phase = "reveal";
+      } else {
+        this.reseedForRound();
+        this.phase = "act";
+      }
+      const firstP = this.firstActive();
+      this.curTurn = firstP === -1 ? 0 : firstP;
+      return true;
+    }
+
+    // An applied action can end the duel on the spot (a kill, or a
+    // concession through a gate).
+    this.checkDuelEnd();
+    if (this.gameOver) return true;
+
+    const next = this.nextActiveAfter(actor);
+    if (next !== -1) {
+      this.curTurn = next;
+      return true;
+    }
+
+    // Round over: the monsters take their pass -- they treat both
+    // duellists as targets (spec §8) -- and only then is the duel
+    // re-examined, so a pass that kills both plays out in full and is
+    // resolved by death order.
+    this.processMonsterTurns();
+    this.checkDuelEnd();
+    if (this.gameOver) return true;
+
+    this.roundIndex++;
+    this.phase = "commit";
+    this.roundCommits.fill("");
+    this.roundSalts.fill("");
+    const first = this.firstActive();
+    this.curTurn = first === -1 ? 0 : first;
+    return true;
+  }
+
+  /**
+   * Applies one action's effects for `actor`, with no turn bookkeeping and
+   * nothing logged.  Returns false, having changed nothing, if the action
+   * is not applicable (blocked move, empty pickup, potion the participant
+   * does not hold, ...).  Co-op fails the replay on a false; a duel
+   * substitutes a wait (spec §2).  Mirrors ApplyActionEffects.
+   */
+  private applyActionEffects(actor: number, action: GameAction): boolean {
     const p = this.players[actor];
     let valid = false;
 
@@ -614,6 +954,31 @@ export class DungeonSession {
             }
           } else {
             this.addMessage(`${this.who(actor)} miss${this.players.length > 1 ? "es" : ""} ${target.name}!`, "combat");
+          }
+          valid = true;
+        } else if (this.mode === "duel" && this.playerAt(nx, ny) !== -1
+                   && this.playerAt(nx, ny) !== actor) {
+          // Moving into a hostile participant is an attack (pvp spec §4).
+          // In co-op the same tile is simply blocked, which is what every
+          // existing replay verified against.
+          const victim = this.playerAt(nx, ny);
+          const d = this.players[victim];
+          const result = playerAttackPlayer(p.stats, d.stats, this.rng);
+          if (result.hit) {
+            // Tracked apart from `damageDealt`: the co-op pools are split
+            // by damage dealt to MONSTERS (spec §8).
+            p.pvpDamage += Math.min(result.damage, d.hp);
+            d.hp -= result.damage;
+            const critText = result.critical ? " CRIT!" : "";
+            this.addMessage(
+              `${this.who(actor)} hit ${this.who(victim)} for ${result.damage}${critText}`,
+              "combat");
+            if (d.hp <= 0) {
+              this.playerDied(victim);
+              this.addMessage(`${this.who(victim)} has fallen!`, "combat");
+            }
+          } else {
+            this.addMessage(`${this.who(actor)} misses ${this.who(victim)}!`, "combat");
           }
           valid = true;
         } else if (this.isWalkable(nx, ny, actor)) {
@@ -735,17 +1100,22 @@ export class DungeonSession {
       case "wait":
         valid = true;
         break;
+
+      case "commit":
+      case "reveal":
+        // Protocol entries, handled by the duel phase machine in
+        // processActionBy; they never carry effects.
+        return false;
     }
 
-    if (!valid) return false;
+    return valid;
+  }
 
-    this.actionLog.push(action);
-    this.mergedLog.push({ actor, action });
-    this.turnCount++;
-
-    // Round advance (spec section 2): after the last active participant of
-    // the round, monsters act once; otherwise pass the turn along.  With
-    // one participant this reduces to "monsters act after the player".
+  /**
+   * Passes the turn on after an action in the act phase: monsters act once
+   * the round's last active participant has gone.  Mirrors AdvanceTurn.
+   */
+  private advanceTurn(actor: number): void {
     const next = this.nextActiveAfter(actor);
     if (next === -1) {
       if (!this.gameOver) this.processMonsterTurns();
@@ -754,8 +1124,6 @@ export class DungeonSession {
     } else {
       this.curTurn = next;
     }
-
-    return true;
   }
 
   /**
@@ -798,6 +1166,7 @@ export class DungeonSession {
     const p = this.players[i];
     p.hp = 0;
     p.dead = true;
+    p.deathSeq = ++this.deathCounter;
     if (this.firstActive() === -1) this.gameOver = true;
   }
 
