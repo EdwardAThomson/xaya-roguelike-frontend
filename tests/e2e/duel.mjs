@@ -176,11 +176,13 @@ try {
   await A.standOnGate(dir);
   await A.pickChoice("wait here for a duel");
   await sleep(400);
-  // Whatever stake this character can actually afford.
-  const stakes = await A.page.$$eval(".modal-choice", (els) =>
-    els.map((e) => e.innerText.replace(/\s+/g, " ")));
-  console.log(`   stakes offered: ${JSON.stringify(stakes.map((t) => t.split(" ").slice(0, 3).join(" ")))}`);
-  await A.pickChoice(stakes.length > 1 ? stakes[stakes.length - 1].split(" ")[0] : "no stake");
+  // The stake is a number field now, capped at what this character holds:
+  // type the maximum so a staked duel is what gets exercised.
+  await A.page.waitForSelector(".modal-amount-input", { timeout: 10000 });
+  const maxStake = await A.page.$eval(".modal-amount-input", (e) => Number(e.max));
+  console.log(`   stake field offers up to ${maxStake} gold`);
+  await A.page.fill(".modal-amount-input", String(maxStake));
+  await A.page.click(".modal-confirm");
   const hosted = await A.until((x) => !!x.player?.active_visit, 35000, "the duel to open");
   const visitId = hosted.player.active_visit.visit_id;
   const onChain = await gsp("getvisitinfo", [visitId]);

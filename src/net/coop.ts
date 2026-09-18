@@ -141,6 +141,9 @@ export interface CoopRunnerOptions {
 }
 
 export class CoopRunner {
+  /** How many of this player's own actions may sit ahead of the engine. */
+  static readonly INPUT_QUEUE_DEPTH = 3;
+
   readonly session: DungeonSession;
   readonly me: number;
   readonly names: string[];
@@ -221,11 +224,30 @@ export class CoopRunner {
     if (this.graceTimer) clearInterval(this.graceTimer);
     this.pollTimer = null;
     this.graceTimer = null;
+    this.clearStoredChoices();
+  }
+
+  /** Drops this duel's stored salts once the run is over. */
+  private clearStoredChoices(): void {
+    if (!this.session.isDuel()) return;
+    try {
+      const prefix = `rog:duelchoice:${this.session.duelVisitId}:`;
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(prefix)) localStorage.removeItem(k);
+      }
+    } catch { /* storage unavailable */ }
   }
 
   /** True while an own action is queued but not yet applied by the engine. */
   get hasPendingOwn(): boolean {
     return this.mySent > this.consumed[this.me];
+  }
+
+  /** True when no further input can be accepted: the queue ahead is full. */
+  get inputFull(): boolean {
+    const depth = this.session.isDuel() ? 1 : CoopRunner.INPUT_QUEUE_DEPTH;
+    return this.mySent - this.consumed[this.me] >= depth;
   }
 
   /** Whose action the engine is waiting for, by name. */
@@ -247,7 +269,14 @@ export class CoopRunner {
   submitLocal(action: GameAction): boolean {
     const s = this.session;
     if (s.gameOver || !s.isPlayerActive(this.me)) return false;
-    if (this.hasPendingOwn) return false;
+    // A round takes about a second, so refusing every key until the last one
+    // resolved made ordinary play feel broken.  Co-op lets a couple of moves
+    // sit ahead of the engine; they are validated when their turn comes, and
+    // substituted with a wait if the world moved under them.  A duel stays
+    // at one, because a round there is a sealed choice and pre-committing
+    // the next one before seeing this one resolve is a different game.
+    const depth = s.isDuel() ? 1 : CoopRunner.INPUT_QUEUE_DEPTH;
+    if (this.mySent - this.consumed[this.me] >= depth) return false;
 
     // In a duel the player's input seals a choice for the round rather
     // than taking it: what goes on the wire now is the COMMITMENT, and the
@@ -406,6 +435,7 @@ export class CoopRunner {
     const salt = randomSaltHex();
     this.choice = { action, salt };
     this.choiceRound = s.roundIndex;
+    this.saveChoice(s.roundIndex);
     return this.emit({
       type: "commit",
       hex: duelCommitHash(s.duelVisitId, s.roundIndex, this.me, action, salt),
@@ -423,10 +453,40 @@ export class CoopRunner {
     if (!s.isDuel() || s.gameOver) return;
     if (!s.isPlayerActive(this.me)) return;
     if (this.hasPendingOwn || s.nextActor !== this.me) return;
+    // A reload loses the in-memory salt, and the commitment for this round is
+    // already on the wire: without the salt no reveal can ever open it and the
+    // duel deadlocks for BOTH players until the void timeout refunds it.  Fall
+    // back to the copy written at commit time.
+    if (!this.choice || this.choiceRound !== s.roundIndex) this.restoreChoice(s.roundIndex);
     if (!this.choice || this.choiceRound !== s.roundIndex) return;
 
     if (s.phase === "reveal") this.emit({ type: "reveal", hex: this.choice.salt });
     else if (s.phase === "act") this.emit(this.choice.action);
+  }
+
+  /** localStorage key for a sealed duel choice. */
+  private choiceKey(round: number): string {
+    return `rog:duelchoice:${this.session.duelVisitId}:${round}`;
+  }
+
+  /** Persists the sealed choice so a reload can still open its commitment. */
+  private saveChoice(round: number): void {
+    if (!this.choice) return;
+    try {
+      localStorage.setItem(this.choiceKey(round), JSON.stringify(this.choice));
+    } catch { /* private mode or storage disabled: nothing more we can do */ }
+  }
+
+  /** Reads back a sealed choice after a reload, if one was stored. */
+  private restoreChoice(round: number): void {
+    try {
+      const raw = localStorage.getItem(this.choiceKey(round));
+      if (!raw) return;
+      const c = JSON.parse(raw) as { action: GameAction; salt: string };
+      if (!c || typeof c.salt !== "string" || !c.action) return;
+      this.choice = c;
+      this.choiceRound = round;
+    } catch { /* unreadable: leave the choice unset */ }
   }
 
   /**
