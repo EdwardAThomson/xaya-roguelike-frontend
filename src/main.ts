@@ -5056,7 +5056,16 @@ if (typeof location !== "undefined"
     useItem: (item: string) => doUseItem(item),
     discard: (rowid: number) => doDiscard(rowid),
     allocateStat: (stat: string) => doAllocateStat(stat),
-    dismissModal: () => document.querySelector<HTMLElement>(".modal-dismiss")?.click(),
+    // Any dialog, not just the one-button kind: a CHOICE modal (the gate
+    // dialog, the leave dialog) carries .modal-cancel and no .modal-dismiss,
+    // so a hook that only knew the latter silently did nothing and left
+    // every driver spinning against a modal it could not close.
+    dismissModal: () => {
+      const el = document.querySelector<HTMLElement>(".modal-dismiss")
+        ?? document.querySelector<HTMLElement>(".modal-cancel");
+      el?.click();
+      return !!el;
+    },
     // Overworld map view transform, for pan/zoom tests.
     mapView: () => ({ panX, panY, zoom, mapFollow, selectedSegment }),
     recenter: () => recenterMap(),

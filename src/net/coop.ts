@@ -285,7 +285,13 @@ export class CoopRunner {
     if (s.isDuel()) return this.commitChoice(action);
 
     const n = this.mySent;
-    if (s.nextActor === this.me) {
+    // Applying straight away is only correct when this action is the NEXT one
+    // the engine wants from us.  Holding earlier queued ordinals and applying
+    // a later one jumps `consumed` past them: they never run locally, but the
+    // partner receives them from the relay and runs them in order, so the two
+    // merged logs diverge.  That cannot happen at queue depth 1, which is why
+    // it only appeared when the depth went up.
+    if (s.nextActor === this.me && n === this.consumed[this.me]) {
       // Own turn: apply now (validated against the real state), then ship.
       if (!s.processActionBy(this.me, action)) return false;
       this.mySent = n + 1;
