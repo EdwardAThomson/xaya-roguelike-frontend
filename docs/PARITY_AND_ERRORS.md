@@ -1,6 +1,6 @@
 # Frontend Parity & Error-Handling Plan
 
-Audit date: 2026-04-14 (original), last reconciled 2026-09-09
+Audit date: 2026-04-14 (original), last reconciled 2026-09-17
 Backend reference: `~/Projects/xayaroguelike` at commit `0532b41`,
 re-checked against `32e635b`
 Frontend reference: `~/Projects/xaya-roguelike-frontend` (this repo)
@@ -23,6 +23,15 @@ pinned by the parity vectors in `npm test` (including the absent-partner
 vector for the backend's abandonment rule); the co-op runtime, lobby,
 checkpoint confirms, continue-alone and settle flow (`net/coop.ts`,
 `main.ts`) are covered by the two scenarios of `npm run coop`.
+
+Duels (backend `docs/SPEC_multiplayer_pvp.md`, Phase 4a) mirror the same
+way: the commit/reveal/apply round, the per-round reseed and the
+player-vs-player attack are pinned by five duel vectors in `npm test`,
+the two-client round is covered by `src/net/duel_test.ts`, and the
+settlement claim is exercised against a real chain by `npm run duel` and
+the adversarial `npm run duel:evil`. A client whose rules version differs
+from the GSP's refuses to host or join at all, because such a run is only
+rejected at settlement, once it has already been played out.
 
 The on-chain stat-fabrication attack vector documented in
 `~/Projects/xayaroguelike/docs/SECURITY_Attack_and_Mitigations.md`
@@ -47,6 +56,14 @@ state.
   spawn at the gate they walked in through (`entry_directions` from
   `getvisitinfo`), mirroring the backend's gate-mouth ring scan; the
   same-gate and mixed-entry spawn vectors are pinned in `npm test`
+- [src/game/combat.ts](../src/game/combat.ts) — `playerAttackPlayer`
+  follows the backend's duel draw order, with a miss returning *before*
+  the dodge roll is drawn; the number of draws is consensus, not just
+  the outcome, so that early return cannot move
+- [src/game/settle.ts](../src/game/settle.ts) — `DUEL_XP_BASE` (20) and
+  `DUEL_RAKE_PERCENT` (0) mirror the GSP's `moveprocessor.hpp`. They are
+  a consensus constant in practice: if they drift, the GSP rejects every
+  duel claim the client sends
 - Monster database: 12 monsters, stats and depth-scaling identical
   to backend `monsters.cpp`
 - Item database: 31 items, ids identical to backend `items.cpp`

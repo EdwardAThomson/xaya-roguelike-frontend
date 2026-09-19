@@ -1,6 +1,6 @@
 # Roadmap — Xaya Roguelike Frontend
 
-_Status: active · updated 2026-07-30_
+_Status: active · updated 2026-09-17_
 
 Zero-dependency TypeScript + Canvas browser client for the Xaya Roguelike
 blockchain game. Renders the on-chain overworld, runs dungeon sessions locally
@@ -39,4 +39,4 @@ with deterministic RNG, and submits action-replay proofs on-chain. Pairs with th
 - [ ] Co-op: WebRTC transport (the relay is the only `CoopTransport` today); true state channels (backend Phase 3)
 
 - [ ] Visual polish (Phase F6) — sprite tiles, monster/item art, camera scrolling, attack/particle animations, sound
-- [ ] Multi-player robustness (mid-run checkpoints) and PvP
+- [x] Multi-player robustness (mid-run checkpoints) and PvP — checkpoints shipped with Co-op Phase 2 above; PvP duels shipped end to end: `combat.ts` player-vs-player attack, duel mode in `session.ts` (commit/reveal/apply rounds, per-round reseed, winner latch) and on `CoopRunner`, the stake/join lobby, arena HUD, concession confirm, version handshake and duel claims in `settle.ts`, pinned by five duel parity vectors plus `npm test`'s duel convergence test, `npm run duel` and the adversarial `npm run duel:evil`

@@ -123,6 +123,17 @@ export interface VisitSummary {
   max_players: number;
   created_height: number;
   players: number;
+  /**
+   * Duel lobby fields (backend SPEC_multiplayer_pvp.md section 9): the
+   * joiner must see the mode and the stake BEFORE joining.  Optional
+   * because an older GSP does not send them; absent reads as a co-op
+   * visit with nothing staked.
+   */
+  mode?: string;
+  stake?: number;
+  /** The least a challenger may put up; the host's own stake when unset. */
+  min_stake?: number;
+  pot?: number;
 }
 
 /** Full detail of one visit (`getvisitinfo`). */
@@ -131,6 +142,17 @@ export interface VisitInfo {
   segment: SegmentRef;
   initiator: string;
   status: string;
+  /**
+   * "coop" (the default and every visit that predates duels) or "duel":
+   * a hostile 1v1 with gold in escrow (backend SPEC_multiplayer_pvp.md).
+   * `stake` is what EACH side antes, `pot` the escrow collected so far.
+   * Optional because an older GSP does not send them.
+   */
+  mode?: string;
+  stake?: number;
+  /** The least a challenger may put up; the host's own stake when unset. */
+  min_stake?: number;
+  pot?: number;
   created_height: number;
   started_height?: number;
   settled_height?: number;
@@ -161,6 +183,14 @@ export interface VisitInfo {
 }
 
 export interface FullState {
+  /**
+   * The GSP's rules and banking versions (backend rules.hpp).  A client
+   * whose build does not match `rules` EXACTLY would play runs this GSP
+   * rejects at settlement, so it must refuse to start one; a `banking`
+   * mismatch only means the HUD's projected rewards would be wrong.
+   * Optional because a GSP older than the handshake does not send it.
+   */
+  version?: { rules: number; banking: number };
   players: Array<{
     name: string;
     level: number;

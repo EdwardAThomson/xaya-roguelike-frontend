@@ -140,9 +140,23 @@ export class MoveClient {
    * settles it and leaves you standing where you are with the door open;
    * from the hub or a segment you are standing in, pass nothing.
    */
-  async visit(name: string, dir: string, settlement?: Settlement): Promise<void> {
-    const op: { dir: string; settlement?: Settlement } = { dir };
+  async visit(name: string, dir: string, settlement?: Settlement,
+              duel?: { stake: number; minStake?: number }): Promise<void> {
+    const op: {
+      dir: string; settlement?: Settlement; mode?: string;
+      stake?: number; min_stake?: number;
+    } = { dir };
     if (settlement) op.settlement = settlement;
+    // Absent `mode` is a co-op run, exactly as before duels existed; the
+    // GSP rejects a stake outside a duel, so both travel together or
+    // neither does.  `min_stake` is the least a challenger may put up:
+    // omitted means "match me", which is what every duel did before stakes
+    // could differ.
+    if (duel) {
+      op.mode = "duel";
+      op.stake = duel.stake;
+      if (duel.minStake !== undefined) op.min_stake = duel.minStake;
+    }
     await this.transport.submitMove(name, { v: op });
     await this.transport.mine();
   }
@@ -152,9 +166,14 @@ export class MoveClient {
    * that visit's segment.  The visit activates when it reaches max_players.
    */
   async join(name: string, visitId: number, dir: string,
-             settlement?: Settlement): Promise<void> {
-    const op: { id: number; dir: string; settlement?: Settlement } = { id: visitId, dir };
+             settlement?: Settlement, stake?: number): Promise<void> {
+    const op: {
+      id: number; dir: string; settlement?: Settlement; stake?: number;
+    } = { id: visitId, dir };
     if (settlement) op.settlement = settlement;
+    // What THIS joiner puts up, which need not equal the host's stake; it
+    // must clear the visit's min_stake.  Omitted means match the host.
+    if (stake !== undefined) op.stake = stake;
     await this.transport.submitMove(name, { j: op });
     await this.transport.mine();
   }

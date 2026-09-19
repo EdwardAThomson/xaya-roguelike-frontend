@@ -151,16 +151,130 @@ export function showConfirmModal(opts: ConfirmModalOptions): void {
   (root.querySelector(".modal-confirm") as HTMLButtonElement).focus();
 }
 
+export interface AmountModalOptions {
+  title: string;
+  message: string;
+  /** Label beside the input. */
+  label: string;
+  /** Inclusive bounds; the value is clamped and must be a whole number. */
+  min: number;
+  max: number;
+  initial?: number;
+  /** Quick-pick buttons offered above the input, as [label, value] pairs. */
+  presets?: Array<[string, number]>;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  onConfirm: (value: number) => void;
+  onCancel?: () => void;
+}
+
+/**
+ * Asks for a whole number in a range.  A preset ladder cannot express "stake
+ * the 7 gold I actually have", so anything that is genuinely an amount needs
+ * a field; the presets stay as shortcuts for the common picks.
+ */
+export function showAmountModal(opts: AmountModalOptions): void {
+  document.getElementById("modal-root")?.remove();
+
+  const root = document.createElement("div");
+  root.id = "modal-root";
+  root.className = "modal-overlay";
+  const start = Math.min(Math.max(opts.initial ?? opts.min, opts.min), opts.max);
+  const presets = (opts.presets ?? []).filter(
+    ([, v]) => v >= opts.min && v <= opts.max);
+  root.innerHTML = `
+    <div class="modal modal-info" role="alertdialog" aria-modal="true">
+      <div class="modal-title">${escapeHtml(opts.title)}</div>
+      <div class="modal-body">${escapeHtml(opts.message)}</div>
+      ${presets.length ? `<div class="modal-presets">${presets.map(([l, v]) =>
+        `<button class="modal-preset" data-value="${v}">${escapeHtml(l)}</button>`).join("")}</div>` : ""}
+      <label class="modal-amount">
+        <span>${escapeHtml(opts.label)}</span>
+        <input class="modal-amount-input" type="number" inputmode="numeric"
+               min="${opts.min}" max="${opts.max}" step="1" value="${start}">
+        <span class="modal-amount-max">max ${opts.max}</span>
+      </label>
+      <div class="modal-amount-error" hidden></div>
+      <div class="modal-actions">
+        <button class="modal-cancel">${escapeHtml(opts.cancelLabel ?? "Cancel")}</button>
+        <button class="modal-dismiss modal-confirm">${escapeHtml(opts.confirmLabel ?? "Confirm")}</button>
+      </div>
+    </div>
+  `;
+
+  const input = root.querySelector(".modal-amount-input") as HTMLInputElement;
+  const error = root.querySelector(".modal-amount-error") as HTMLElement;
+
+  /** The entered value when it is a whole number in range, else null. */
+  const parsed = (): number | null => {
+    const raw = input.value.trim();
+    if (raw === "") return null;
+    const v = Number(raw);
+    if (!Number.isInteger(v) || v < opts.min || v > opts.max) return null;
+    return v;
+  };
+
+  const close = (accept: boolean) => {
+    const v = accept ? parsed() : null;
+    if (accept && v === null) {
+      error.textContent =
+        `Enter a whole number between ${opts.min} and ${opts.max}.`;
+      error.hidden = false;
+      input.focus();
+      input.select();
+      return;
+    }
+    root.remove();
+    document.removeEventListener("keydown", onKey);
+    if (accept) opts.onConfirm(v as number);
+    else opts.onCancel?.();
+  };
+
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape") { e.preventDefault(); close(false); }
+    else if (e.key === "Enter") { e.preventDefault(); close(true); }
+  };
+
+  input.addEventListener("input", () => { error.hidden = true; });
+  root.querySelectorAll<HTMLButtonElement>(".modal-preset").forEach(b => {
+    b.addEventListener("click", () => {
+      input.value = b.dataset.value!;
+      error.hidden = true;
+      input.focus();
+    });
+  });
+  root.addEventListener("click", (e) => { if (e.target === root) close(false); });
+  root.querySelector(".modal-cancel")!.addEventListener("click", () => close(false));
+  root.querySelector(".modal-confirm")!.addEventListener("click", () => close(true));
+  document.addEventListener("keydown", onKey);
+
+  document.body.appendChild(root);
+  input.focus();
+  input.select();
+}
+
 export interface ChoiceModalOptions {
   title: string;
   message: string;
   /**
    * The actions offered, in order.  The last one gets focus, matching the
    * confirm modal.  `detail` is a dimmer second line under the label.
+   * A `disabled` choice is shown but cannot be picked -- use it when the
+   * option genuinely exists and the reason it is unavailable belongs in
+   * `detail` (an unaffordable duel stake, say); hide it instead when its
+   * existence is not worth explaining.
    */
-  choices: Array<{ label: string; detail?: string; onPick: () => void }>;
+  choices: Array<{
+    label: string; detail?: string; disabled?: boolean; onPick: () => void;
+  }>;
   cancelLabel?: string;
   onCancel?: () => void;
+  /**
+   * Accent for the dialog frame.  "info" (default) is the teal used when a
+   * choice moves the player forward; "warn" is for leaving, forfeiting or
+   * anything else where teal would read as encouragement.
+   */
+  variant?: "info" | "warn";
 }
 
 /**
@@ -176,11 +290,12 @@ export function showChoiceModal(opts: ChoiceModalOptions): void {
   root.id = "modal-root";
   root.className = "modal-overlay";
   const buttons = opts.choices.map((c, i) =>
-    `<button class="modal-choice" data-choice="${i}">${escapeHtml(c.label)}${
+    `<button class="modal-choice" data-choice="${i}"${c.disabled ? " disabled" : ""}>${
+      escapeHtml(c.label)}${
       c.detail ? `<span class="modal-choice-detail">${escapeHtml(c.detail)}</span>` : ""
     }</button>`).join("");
   root.innerHTML = `
-    <div class="modal modal-info" role="alertdialog" aria-modal="true">
+    <div class="modal modal-${opts.variant === "warn" ? "warn" : "info"}" role="alertdialog" aria-modal="true">
       <div class="modal-title">${escapeHtml(opts.title)}</div>
       <div class="modal-body">${escapeHtml(opts.message)}</div>
       <div class="modal-actions modal-actions-stacked">
@@ -204,11 +319,14 @@ export function showChoiceModal(opts: ChoiceModalOptions): void {
   root.addEventListener("click", (e) => { if (e.target === root) close(null); });
   root.querySelector(".modal-cancel")!.addEventListener("click", () => close(null));
   root.querySelectorAll<HTMLButtonElement>(".modal-choice").forEach(btn => {
+    if (btn.disabled) return;
     btn.addEventListener("click", () => close(Number(btn.dataset.choice)));
   });
   document.addEventListener("keydown", onKey);
 
   document.body.appendChild(root);
-  const last = root.querySelectorAll<HTMLButtonElement>(".modal-choice");
-  (last[last.length - 1] ?? root.querySelector(".modal-cancel") as HTMLButtonElement).focus();
+  const pickable = Array.from(
+    root.querySelectorAll<HTMLButtonElement>(".modal-choice")).filter(b => !b.disabled);
+  (pickable[pickable.length - 1]
+    ?? root.querySelector(".modal-cancel") as HTMLButtonElement).focus();
 }

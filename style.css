@@ -378,6 +378,12 @@ body {
   z-index: 1000;
 }
 
+/* Dialogs (#modal-root) must sit ABOVE the tabbed game modal.  They share
+   .modal-overlay, so with equal z-index the later sibling won, and the game
+   modal is removed and re-appended on every ~1s state poll: a dialog opened
+   from inside it flashed once and was then buried by the next poll. */
+#modal-root { z-index: 1100; }
+
 .modal {
   background: #181820;
   border: 1px solid #444;
@@ -590,10 +596,17 @@ body {
 }
 .inv-pending-title { font-size: 11px; color: #c9b24a; margin-bottom: 6px; }
 .inv-pending { background: rgba(90,80,30,0.12); border-color: #5a5a3a; }
+/* The footer is a real button: on a long tab the header X scrolls out of
+   reach, so the bar along the bottom is the close that is always in view. */
 .inv-foot {
-  padding: 8px 16px; border-top: 1px solid #333;
-  font-size: 11px; color: #777; text-align: center;
+  display: block; width: 100%; flex: 0 0 auto;
+  padding: 10px 16px; border: none; border-top: 1px solid #333;
+  font: inherit; font-size: 11px; color: #777; text-align: center;
+  background: #1a1a1a; cursor: pointer;
+  border-radius: 0 0 8px 8px;
 }
+.inv-foot:hover { background: #262630; color: #bbb; }
+.inv-foot:focus-visible { outline: 1px solid #66a; outline-offset: -2px; }
 
 /* --- Help overlay --- */
 
@@ -840,6 +853,8 @@ body {
   align-items: stretch;
   gap: 6px;
 }
+/* Choice buttons carried no colours at all, so they rendered as native
+   light-grey buttons with black text inside a dark dialog. */
 .modal-choice {
   display: flex;
   flex-direction: column;
@@ -847,12 +862,54 @@ body {
   gap: 2px;
   text-align: left;
   padding: 8px 10px;
+  background: #22222c;
+  color: #ddd;
+  border: 1px solid #555;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: monospace;
+  font-size: 12px;
+}
+.modal-choice:hover:not(:disabled) { background: #2d2d3a; border-color: #778; }
+.modal-choice:focus-visible { outline: 1px solid #88a; outline-offset: 1px; }
+.modal-choice:disabled {
+  background: #1b1b20;
+  color: #666;
+  border-color: #3a3a3a;
+  cursor: not-allowed;
 }
 .modal-choice-detail {
   font-size: 11px;
   color: #999;
   font-weight: normal;
 }
+.modal-choice:disabled .modal-choice-detail { color: #777; }
+
+/* Amount prompt (duel stakes): quick picks above a real number field. */
+.modal-presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.modal-preset {
+  background: #22222c; color: #ddd; border: 1px solid #555;
+  border-radius: 4px; padding: 4px 10px; cursor: pointer;
+  font-family: monospace; font-size: 12px;
+}
+.modal-preset:hover { background: #2d2d3a; border-color: #778; }
+.modal-amount {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: #bbb; margin-bottom: 8px;
+}
+.modal-amount-input {
+  flex: 1 1 auto; min-width: 0;
+  background: #101014; color: #eee; border: 1px solid #555;
+  border-radius: 4px; padding: 6px 8px;
+  font-family: monospace; font-size: 13px;
+}
+.modal-amount-input:focus { outline: 1px solid #4a8; border-color: #4a8; }
+.modal-amount-max { color: #777; font-size: 11px; white-space: nowrap; }
+.modal-amount-error { color: #f88; font-size: 11px; margin-bottom: 8px; }
+
+/* A dialog about leaving or forfeiting should not wear the "go" colour. */
+.modal-warn { border-color: #c86; }
+.modal-warn .modal-title { color: #e9a; }
 
 /* Co-op tab: one panel per run you can start or join from where you stand. */
 .coop-panel {
@@ -863,3 +920,9 @@ body {
   background: #1a1a1a;
 }
 .coop-dim { font-size: 11px; color: #888; margin: 2px 0 6px; }
+/* A duel offer is not a co-op offer: red, so nobody clicks one for the
+   other while skim-reading the panel. */
+.coop-panel-duel { border-color: #633; }
+.action-duel { border-color: #a55; color: #f99; }
+.action-duel:hover:not(:disabled) { background: #3a2020; }
+.coop-panel .action-btn + .action-btn { margin-left: 6px; }

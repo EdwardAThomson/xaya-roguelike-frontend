@@ -5,7 +5,7 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "tsc && node dist/game/parity_test.js && node dist/net/coop_test.js",
+    "test": "tsc && node dist/game/parity_test.js && node dist/net/coop_test.js && node dist/net/duel_test.js",
     "e2e": "node tests/e2e/run.mjs",
     "e2e:ui": "node tests/e2e/ui.mjs",
     "agent": "node tests/e2e/agent.mjs",
@@ -13,7 +13,9 @@
     "compete": "node tests/e2e/compete.mjs",
     "persist": "node tests/e2e/persist.mjs",
     "coop": "node tests/e2e/coop.mjs",
-    "coop:play": "node tests/e2e/coop_play.mjs"
+    "coop:play": "node tests/e2e/coop_play.mjs",
+    "duel": "node tests/e2e/duel.mjs",
+    "duel:evil": "node tests/e2e/duel_adversarial.mjs"
   },
   "repository": {
     "type": "git",

@@ -48,6 +48,7 @@ Flows covered (each an entry in `ui.mjs`, easy to extend):
 | T2b | hub inventory: equip a bag item to its slot, then unequip |
 | T4b | free transit hub ↔ confirmed segment, landing on the other side of the gate, and back to the hub |
 | T7  | die in a dungeon → respawn at the hub with reduced HP |
+| T8  | a provisional segment shows on the map, then disappears when it is pruned (the discoverer forfeits the run that would have confirmed it) without a reload, and the rest of the map survives |
 | T2c | hub inventory: drink a potion while hurt raises HP and drops the count |
 | T2d | hub inventory: discard removes a bag item |
 | T1b | interrupted register (name pre-minted, no player) still registers via the DOM |
@@ -85,6 +86,33 @@ the frontend built (`npx tsc` → `dist/`), the xayax venv at
   mid-run, mines the abandonment window, and has the survivor continue
   alone from the partner's last checkpoint and settle (partner banked as a
   death).
+- `npm run coop:play` — a two-browser co-op *driver* rather than an
+  assertion suite (`coop_play.mjs`): it finds or confirms a segment
+  bordering the hub, hosts and joins from the hub, then hunts every monster
+  and collects every item before walking both players out. Headed by
+  default so it can be watched. For long sessions the suites do not reach
+  (its first full run took 602 turns), which also pushes the compact action
+  proof well past anything the tests cover.
+- `npm run duel` — a full two-player duel through the real UI
+  (`duel.mjs`): one player walks onto a gate, picks "Wait here for a
+  duel" and types the largest stake the character can cover into the stake
+  field, the challenger joins from their own side of the same
+  gate, and they bump into each other until one falls. It drives the real
+  DOM because hosting a duel has no debug hook. Headed by default; env:
+  `ROG_HEADLESS=1`, `ROG_URL`, `ROG_MAX_MIN` (default 12), `ROG_A` /
+  `ROG_B` to reuse existing characters (they need gold to stake).
+- `npm run duel:evil` — the adversarial duel suite (`duel_adversarial.mjs`):
+  no browser, because a Playwright page runs honest code and cannot be made
+  to lie. Both duellists are Node actors holding their own copy of the
+  engine; they fight an honest duel in process, then take turns trying to
+  steal the result over the real move path — settling with no confirm on
+  file, abandoning a live opponent, claiming a win over a consented log, a
+  truncated log, a reveal that does not open its commitment, and a
+  commitment lifted from another round. Every case must be REJECTED, and
+  the last case is the honest control that must be accepted, or the
+  refusals would prove nothing. The wrong-token relay case reports itself
+  as skipped on a devnet with claim tokens off, and the script says how to
+  turn them on. Needs a devnet; the static server is not required.
 - `npm run compete` — scripted competition tests with hard assertions
   (`compete.mjs`): coordinate race (one winner), provisional access +
   confirm-unlocks-others, concurrent reward/ownership isolation. Needs a

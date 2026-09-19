@@ -60,7 +60,7 @@ import {
   discoveryCooldownRemaining, neighbour, segName,
 } from "./net/validator.js";
 import { waitForMove, MoveOutcome } from "./net/pending.js";
-import { showErrorModal, showModal, showConfirmModal, showChoiceModal } from "./ui/modal.js";
+import { showErrorModal, showModal, showConfirmModal, showChoiceModal, showAmountModal } from "./ui/modal.js";
 import { showOverlay, hideOverlay } from "./ui/overlay.js";
 import { lookupItem } from "./game/items.js";
 
@@ -158,7 +158,12 @@ let coopSettling = false;
 let coopSettleError: string | null = null;
 /** Everything needed to rebuild the shared session at a checkpoint. */
 let coopSetup: { seed: string; depth: number; constraints: Gate[];
-                 setups: PlayerSetup[]; names: string[]; me: number } | null = null;
+                 setups: PlayerSetup[]; names: string[]; me: number;
+                 /** The visit id when this run is a DUEL, null for co-op:
+                     rebuilding after an abandonment has to use the same
+                     engine, and a duel's needs the id for its
+                     commitments. */
+                 duelVisitId: number | null } | null = null;
 /**
  * Solo continuation after abandoning a partner (spec section 11): the run
  * was rebuilt at the partner's last checkpoint (`from` actions), the
@@ -236,8 +241,53 @@ let moves: MoveClient | null = null;
 
 // --- Connection ---
 
+/**
+ * The rules version this build implements (backend rules.hpp).  Bumped in
+ * lockstep with RULES_VERSION there whenever anything the REPLAY depends on
+ * changes: a draw, an action, a seed derivation, an encoding, the duel
+ * commitment preimage.
+ */
+const CLIENT_RULES_VERSION = 1;
+/** What settlement awards; see BANKING_VERSION in rules.hpp.
+ *  2: asymmetric duel stakes (the host posts a floor, each side escrows its
+ *  own amount, the pot is the sum, a void refunds each exactly what they
+ *  put in).  This client sends and displays those, so it is a 2. */
+const CLIENT_BANKING_VERSION = 2;
+
+/**
+ * Null while the versions agree (or the GSP is too old to say), otherwise
+ * why this client must not start a run.  A rules mismatch means the run
+ * played here would be REJECTED at settlement -- after the player had
+ * played the whole thing, with the reason only in a GSP log line -- so it
+ * has to be caught before anyone starts one.  A banking mismatch is not
+ * grounds to block play: the engine still agrees, only the projected
+ * rewards in the HUD would be wrong.
+ */
+let rulesMismatch: string | null = null;
+let bankingMismatch = false;
+let versionWarned = false;
+
+function checkVersionHandshake(state: ConnectionState): void {
+  const v = state.fullState?.version;
+  if (!v) return;                       // GSP predates the handshake
+  rulesMismatch = v.rules === CLIENT_RULES_VERSION ? null
+    : `This client implements rules version ${CLIENT_RULES_VERSION}; the ` +
+      `server is running version ${v.rules}. A run played here would be ` +
+      `rejected when you tried to settle it, so starting one is disabled. ` +
+      `Reload to pick up a newer client.`;
+  bankingMismatch = v.banking !== CLIENT_BANKING_VERSION;
+  if (!versionWarned && (rulesMismatch || bankingMismatch)) {
+    versionWarned = true;
+    if (rulesMismatch) showErrorModal("Client out of date", rulesMismatch);
+    else addOverworldMessage(
+      "This client and the server disagree about reward rules; projected " +
+      "XP and gold may not match what you are actually awarded.", "warning");
+  }
+}
+
 const connection = new Connection((state: ConnectionState) => {
   connState = state;
+  checkVersionHandshake(state);
   updateConnectionUI();
   rebuildOverworld();
   ensureSessionFromChainState();
@@ -408,7 +458,7 @@ function promptReconnectChoice(
   showConfirmModal({
     title: "You were in a dungeon when you disconnected",
     message:
-      `Active visit on segment ${seg}.  Your local progress from before is lost.\n\n` +
+      `Active visit on ${segName(seg)} (depth ${depth}).  Your local progress from before is lost.\n\n` +
       `Continue: replay the dungeon from scratch (it's deterministic, ` +
       `so it's the same layout).  You have until the 200-block visit ` +
       `timeout to settle.\n\n` +
@@ -421,7 +471,7 @@ function promptReconnectChoice(
       startChannelDungeon(seed, depth, seg, visitId,
                           constraints, entryDirection);
       addOverworldMessage(
-        `Replaying dungeon at segment ${seg} from scratch.`,
+        `Replaying the dungeon at ${segName(seg)} from scratch.`,
         "info",
       );
     },
@@ -1184,7 +1234,14 @@ async function startCoopRun(v: VisitInfo): Promise<void> {
   }
 
   const constraints = constraintsFor(segInfo);
-  const s = DungeonSession.createMulti(segInfo.seed, segInfo.depth, setups, constraints);
+  // A duel visit must build a DUEL session: the mode is what enables the
+  // commit/reveal rounds, the per-round reseed and bump-to-attack, so
+  // getting it from the visit row rather than from anything local is what
+  // keeps both clients (and the GSP's replay) on the same engine.
+  const isDuel = v.mode === "duel";
+  const s = isDuel
+    ? DungeonSession.createDuel(segInfo.seed, segInfo.depth, setups, v.id, constraints)
+    : DungeonSession.createMulti(segInfo.seed, segInfo.depth, setups, constraints);
   session = s;
   channelSession = true;
   channelSegment = v.segment;
@@ -1192,7 +1249,8 @@ async function startCoopRun(v: VisitInfo): Promise<void> {
   coopSettling = false;
   coopSettleError = null;
   coopSolo = null;
-  coopSetup = { seed: segInfo.seed, depth: segInfo.depth, constraints, setups, names, me: meIdx };
+  coopSetup = { seed: segInfo.seed, depth: segInfo.depth, constraints, setups, names,
+                me: meIdx, duelVisitId: isDuel ? v.id : null };
   coopCheckpointN = -1;
   coopCheckpointAt = 0;
   reconnectPromptShown = false;
@@ -1214,7 +1272,14 @@ async function startCoopRun(v: VisitInfo): Promise<void> {
   camera.centerOn(m.x, m.y);
 
   const partners = names.filter(n => n !== myName).join(", ");
-  s.addMessage(`Co-op run with ${partners} at ${segName(v.segment)}. Rounds: one action each, then the monsters move.`, "info");
+  s.addMessage(isDuel
+    ? `Duel with ${partners} at ${segName(v.segment)}. Each round you both choose in secret, then both moves resolve.`
+    : `Co-op run with ${partners} at ${segName(v.segment)}. Rounds: one action each, then the monsters move.`,
+    "info");
+  // The run has started and the player is now standing in the dungeon: the
+  // lobby they opened it from is stale, and leaving it up over the map
+  // reads as though nothing has happened yet.
+  setModalTab(null);
   coop.start();
   if (coopCheckpointTimer) clearInterval(coopCheckpointTimer);
   coopCheckpointTimer = setInterval(() => maybeCheckpoint(false), 5000);
@@ -1259,6 +1324,35 @@ function coopOnChange(): void {
   saveCurrentFog();
   if (session.gameOver && !coopSettling) void coopSettle();
   else maybeCheckpoint(false);
+  noteGateArrival();
+}
+
+/**
+ * Opens the leave dialog on ARRIVAL at a gate.  A duel round only seals a
+ * choice when you press the key; the move itself does not happen until both
+ * sides reveal, so firing on input showed the dialog while the player was
+ * still standing somewhere else, with "walk out through a gate" greyed and
+ * nothing but Cancel clickable.  Watching the applied position instead
+ * fires it exactly once, when you are really there.
+ */
+let lastGateArrival: string | null = null;
+function noteGateArrival(): void {
+  if (!session || session.gameOver) return;
+  const p = me();
+  if (p.dead || p.exited) { lastGateArrival = null; return; }
+  const g = gateAtPlayer();
+  if (!g) { lastGateArrival = null; return; }
+  const key = `${g.x},${g.y}`;
+  if (lastGateArrival === key) return;   // still standing on the same gate
+  lastGateArrival = key;
+  if (fireArmedIntent(g.direction)) return;
+  session.addMessage(
+    session.isDuel()
+      ? `On the ${g.direction} gate. Leaving here CONCEDES the duel.`
+      : `On the ${g.direction} gate.`,
+    session.isDuel() ? "warning" : "info");
+  updateSidebar();
+  showLeaveOptionsModal();
 }
 
 /**
@@ -1306,8 +1400,15 @@ function continueAlone(): void {
   coop = null;
   if (coopCheckpointTimer) { clearInterval(coopCheckpointTimer); coopCheckpointTimer = null; }
 
-  const s = DungeonSession.replayMulti(
-    coopSetup.seed, coopSetup.depth, coopSetup.setups, prefix, coopSetup.constraints);
+  // Rebuild on the same engine the run has been using: replaying a duel's
+  // prefix through the co-op engine would reject its commit entries and
+  // silently truncate the run.
+  const s = coopSetup.duelVisitId !== null
+    ? DungeonSession.replayDuel(
+        coopSetup.seed, coopSetup.depth, coopSetup.setups, coopSetup.duelVisitId,
+        prefix, coopSetup.constraints)
+    : DungeonSession.replayMulti(
+        coopSetup.seed, coopSetup.depth, coopSetup.setups, prefix, coopSetup.constraints);
   for (let i = 0; i < coopSetup.names.length; i++)
     if (i !== coopSetup.me) s.markAbsent(i);
   session = s;
@@ -1316,8 +1417,11 @@ function continueAlone(): void {
   fov.update(m.x, m.y, s.dungeon);
   camera.centerOn(m.x, m.y);
   s.addMessage(
-    `${cp.name} is gone. Continuing alone from their last checkpoint (${cp.n} actions in); ` +
-    `reach a gate to settle.`, "warning");
+    coopSetup.duelVisitId !== null
+      ? `${cp.name} is gone. They forfeit the duel, and it settles from their last ` +
+        `checkpoint (${cp.n} actions in).`
+      : `${cp.name} is gone. Continuing alone from their last checkpoint (${cp.n} actions in); ` +
+        `reach a gate to settle.`, "warning");
   render();
   updateSidebar();
   if (s.gameOver) void coopSoloSettle();
@@ -1355,8 +1459,9 @@ function handleSoloSuffixInput(action: string, dir?: Direction): void {
   else if (action === "move") {
     const g = gateAtPlayer();
     if (g) {
-      session.addMessage(`On the ${g.direction} gate. Press Enter to leave the dungeon.`, "info");
+      session.addMessage(`On the ${g.direction} gate.`, "info");
       updateSidebar();
+      showLeaveOptionsModal();
     }
   }
 }
@@ -1373,7 +1478,8 @@ async function coopSoloSettle(): Promise<void> {
   updateSidebar();
   try {
     s.addMessage("Run over. Settling alone on-chain...", "info");
-    await moves.settle(myName, solo.visitId, toWireResults(s, solo.names),
+    await moves.settle(myName, solo.visitId,
+                       toWireResults(s, solo.names, coopVisit?.pot ?? 0),
                        mergedProof(s.mergedLog), solo.from);
     const ok = await waitForVisitStatus(solo.visitId, st => st !== "active", 60000);
     if (!ok) throw new Error("The GSP did not settle the run in time. Retry the settlement.");
@@ -1421,7 +1527,7 @@ async function coopSettle(): Promise<void> {
   coopSettleError = null;
 
   const hash = settleLogHash(visitId, s.mergedLog);
-  const results = toWireResults(s, runner.names);
+  const results = toWireResults(s, runner.names, coopVisit?.pot ?? 0);
   const actions = mergedProof(s.mergedLog);
   const others = runner.names.filter(n => n !== myName);
 
@@ -1489,6 +1595,7 @@ async function finishCoop(): Promise<void> {
   if (coopCheckpointTimer) { clearInterval(coopCheckpointTimer); coopCheckpointTimer = null; }
   const visitId = channelVisitId;
 
+  const wasDuel = !!session?.isDuel();
   let summary = "";
   try {
     const v = await connection.rpc?.getvisitinfo(visitId);
@@ -1504,19 +1611,46 @@ async function finishCoop(): Promise<void> {
   fov = null;
   hubBuiltAtHub = false;
   coopVisit = null;
+  armedIntent = null;
   coopSettling = false;
   coopSettleError = null;
   try { await connection.refreshPlayer(); } catch { /* next poll */ }
-  ensureHubSessionIfAtHub();
+  try { ensureHubSessionIfAtHub(); } catch { /* not fatal to the teardown */ }
   if (!session) setMode("overworld");
-  addOverworldMessage("Co-op run settled.", "info");
-  showModal({
-    title: "Co-op run settled",
-    message: summary || "The run has settled on-chain.",
-    variant: "info",
-  });
-  render();
-  updateSidebar();
+  // Where the player is left standing is the first thing they need, and
+  // nothing used to say it.  A duel winner in particular is banked without
+  // ever walking out of a gate, so they end up standing INSIDE the segment
+  // with no run: a state the sidebar calls a recovery case, reached every
+  // single time a duel is won.
+  const now = connState?.player;
+  let whereLine = "";
+  if (now) {
+    if (isHub(now.segment)) {
+      whereLine = "You are back at the hub.";
+    } else if (!now.in_channel) {
+      whereLine = `You are standing in ${segName(now.segment)} with no run under way. ` +
+        `Use "Enter Dungeon Here" in the sidebar to play it again, or enter and walk to a gate to move on.`;
+    } else {
+      whereLine = `You are in ${segName(now.segment)}.`;
+    }
+  }
+  addOverworldMessage(wasDuel ? "Duel settled." : "Co-op run settled.", "info");
+  if (whereLine) addOverworldMessage(whereLine, "info");
+  // The redraw must happen even if the summary dialog throws.  Anything that
+  // skips updateSidebar here leaves the page showing the mid-run sidebar for
+  // a run that no longer exists, with no control to get out of it, and only
+  // a reload recovers.  That is exactly how a settled duel stranded a player.
+  try {
+    showModal({
+      title: wasDuel ? "Duel settled" : "Co-op run settled",
+      message: [summary || "The run has settled on-chain.", whereLine]
+        .filter(Boolean).join("\n\n"),
+      variant: "info",
+    });
+  } finally {
+    render();
+    updateSidebar();
+  }
 }
 
 /**
@@ -1543,13 +1677,149 @@ function inCoopLobby(): boolean {
  * leaves the player standing here with the door open.  From the hub, or a
  * segment they are standing in, there is nothing to settle.
  */
-async function doCoopHost(dir: string): Promise<void> {
+/**
+ * Picks the stake for a duel this player is about to host.  Presets rather
+ * than a free number: the amounts a player would actually choose are few,
+ * and a preset list can be filtered to what they can afford so an
+ * unaffordable stake is never offered at all.  0 is kept deliberately --
+ * a friendly duel with nothing on it is a real thing to want.
+ */
+/**
+ * What the challenger puts up.  It must clear the host's floor and need not
+ * equal their stake: the point of an uneven duel is the underdog risking
+ * less, so this opens at the floor rather than at the host's ante.
+ */
+function showJoinStakeModal(visitId: number, dir: string, hostStake: number,
+                            floor: number, gold: number): void {
+  showAmountModal({
+    title: `Duel for how much?`,
+    message:
+      `They staked ${hostStake} and will accept ` +
+      `${floor === 0 ? "anything" : `${floor} or more`}. Whatever you put up ` +
+      `joins theirs in the pot and the winner takes all of it, so risking ` +
+      `${floor === 0 ? "nothing" : String(floor)} against their ${hostStake} is a cheap shot ` +
+      `worth taking if you fancy your chances. You hold ${gold} gold.`,
+    label: "Your stake",
+    min: floor,
+    max: gold,
+    initial: floor,
+    presets: [
+      [`Least (${floor})`, floor],
+      ...(hostStake >= floor && hostStake <= gold
+        ? [[`Match them (${hostStake})`, hostStake] as [string, number]] : []),
+      ...(gold > floor ? [[`All ${gold}`, gold] as [string, number]] : []),
+    ],
+    confirmLabel: "Walk in",
+    cancelLabel: "Never mind",
+    onConfirm: (stake) => { void doCoopJoin(visitId, dir, stake); },
+  });
+}
+
+function showDuelStakeModal(dir: string, armFor?: SegmentRef): void {
+  const gold = connState?.player?.gold ?? 0;
+  showAmountModal({
+    title: "Stake the duel",
+    message:
+      `What you put up. Your challenger does not have to match it: you set ` +
+      `the floor next, and the winner takes the whole pot. Stake 0 for a ` +
+      `friendly duel with nothing on it. You hold ${gold} gold.`,
+    label: "Your stake",
+    min: 0,
+    max: gold,
+    initial: 0,
+    presets: stakePresets(gold),
+    confirmLabel: "Next",
+    cancelLabel: "Never mind",
+    onConfirm: (stake) => showDuelFloorModal(dir, stake, armFor),
+  });
+}
+
+/**
+ * The least a challenger may put up against `stake`.  This is the host's
+ * only protection: a duel activates the moment it is full, so they never
+ * see who joined or for how much, and without a floor someone could join a
+ * 100 gold duel for 1 and have a nearly free shot at it.  Defaulting to the
+ * host's own stake reproduces matched stakes exactly.
+ */
+function showDuelFloorModal(dir: string, stake: number,
+                            armFor?: SegmentRef): void {
+  if (stake === 0) {
+    // Nothing to protect: a friendly duel has no floor to set.
+    if (armFor) armIntent({ kind: "duel", dir, seg: armFor, stake, minStake: 0,
+                            from: connState!.player!.segment });
+    else void doCoopHost(dir, stake, 0);
+    return;
+  }
+  showAmountModal({
+    title: "The least they may risk",
+    message:
+      `You are staking ${stake}. A challenger must put up at least this ` +
+      `much to take you on, and may put up more. Set it low to let an ` +
+      `underdog take a cheap shot at you; set it to ${stake} to insist they ` +
+      `match you, which is how duels worked before.`,
+    label: "Minimum",
+    min: 0,
+    max: stake,
+    initial: stake,
+    presets: [
+      ["Anything (0)", 0],
+      ...(stake >= 4 ? [[`Quarter (${Math.floor(stake / 4)})`, Math.floor(stake / 4)] as [string, number]] : []),
+      ...(stake >= 2 ? [[`Half (${Math.floor(stake / 2)})`, Math.floor(stake / 2)] as [string, number]] : []),
+      [`Match me (${stake})`, stake],
+    ],
+    confirmLabel: "Open the duel",
+    cancelLabel: "Back",
+    onConfirm: (minStake) => {
+      if (armFor) armIntent({ kind: "duel", dir, seg: armFor, stake, minStake,
+                              from: connState!.player!.segment });
+      else void doCoopHost(dir, stake, minStake);
+    },
+  });
+}
+
+/** Quick picks for an amount up to `gold`: nothing, a quarter, half, all. */
+function stakePresets(gold: number): Array<[string, number]> {
+  const out: Array<[string, number]> = [["No stake", 0]];
+  if (gold > 0) {
+    const quarter = Math.floor(gold / 4);
+    const half = Math.floor(gold / 2);
+    if (quarter > 0) out.push([`${quarter}`, quarter]);
+    if (half > quarter) out.push([`${half}`, half]);
+    out.push([`All ${gold}`, gold]);
+  }
+  return out;
+}
+
+/**
+ * True when the player is parked in a CO-OP visit: a lobby they are waiting
+ * in, or a co-op/duel run under way.
+ *
+ * A plain solo dungeon run also sets `active_visit`, and conflating the two
+ * broke the documented flow.  Opening or joining a run from inside a solo
+ * run is a gate-walk that waits: the move carries that run's settlement,
+ * settles it, and leaves you standing at the gate with the door open.  Both
+ * doCoopHost and doCoopJoin build exactly that settlement a few lines below
+ * the guard that used to reject every `active_visit`, so the code was
+ * unreachable, and the Co-op tab additionally reported a solo run as
+ * "waiting for a partner" and offered to cancel it.  The honest signal is
+ * local: a co-op or duel run always has a runner, and a lobby is always
+ * status "open".
+ */
+function inCoopVisitNow(): boolean {
+  const p = connState?.player;
+  if (!p?.active_visit) return false;
+  return !!coop || !!coopSolo || coopVisit?.status === "open";
+}
+
+async function doCoopHost(dir: string, duelStake?: number,
+                          duelMinStake?: number): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
+  if (rulesMismatch) { showErrorModal("Client out of date", rulesMismatch); return; }
   const p = connState.player;
   if (!p) return;
-  if (p.active_visit) {
-    showErrorModal("Already in a run",
-      "Finish or leave your current visit before starting another.");
+  if (inCoopVisitNow()) {
+    showErrorModal("Already in a co-op visit",
+      "Finish or leave your current co-op visit before starting another.");
     return;
   }
   const target = neighbour(p.segment, dir);
@@ -1568,13 +1838,39 @@ async function doCoopHost(dir: string): Promise<void> {
   busy = true;
   updateSidebar();
   try {
-    await moves.visit(connState.playerName, dir, settlement ?? undefined);
+    await moves.visit(connState.playerName, dir, settlement ?? undefined,
+                      duelStake === undefined
+                        ? undefined
+                        : { stake: duelStake, minStake: duelMinStake });
     const outcome = await waitForMove(connection, ({ player }) =>
       !!player?.active_visit && sameSeg(player.active_visit.segment, target));
     if (outcome === "applied") {
       if (settlement) teardownRunAfterExit();
       addOverworldMessage(
-        `Waiting at the ${dir} gate for a partner to join you in ${segName(target)}.`, "info");
+        duelStake === undefined
+          ? `Waiting at the ${dir} gate for a partner to join you in ${segName(target)}.`
+          : `Waiting at the ${dir} gate for a challenger in ${segName(target)}. ` +
+            `Your ${duelStake} gold is in escrow until the duel settles.`,
+        "info");
+      // Leaving a run to open a lobby is a big, silent state change: the run
+      // ends, the view jumps to the world map, and nothing is happening yet.
+      // Without saying so it reads as a crash.
+      if (settlement) {
+        showModal({
+          title: duelStake === undefined ? "Waiting for a partner" : "Waiting for a challenger",
+          message:
+            `Your run settled on the way out, so you kept what you found` +
+            (connState.segments.get(segKey(p.segment))?.confirmed
+              ? ` and ${segName(p.segment)} is confirmed.` : ".") +
+            `\n\nYou are now standing at the ${dir} gate with ${segName(target)} open ` +
+            `and waiting. Nothing else happens until someone walks in from their own ` +
+            `side of it` +
+            (duelStake === undefined ? "." : `, matching your ${duelStake} gold stake.`) +
+            `\n\nYou are not in a dungeon while you wait. Cancel from the Co-op tab to ` +
+            `go back to playing; it also cancels itself after 100 blocks.`,
+          variant: "info",
+        });
+      }
     } else {
       diagnoseCoopRejection("open a co-op run", dir, target);
     }
@@ -1591,13 +1887,15 @@ async function doCoopHost(dir: string): Promise<void> {
  * (`j`); the run starts as soon as the visit is full.  Same settlement
  * rules as hosting.
  */
-async function doCoopJoin(visitId: number, dir: string): Promise<void> {
+async function doCoopJoin(visitId: number, dir: string,
+                          stake?: number): Promise<void> {
+  if (rulesMismatch) { showErrorModal("Client out of date", rulesMismatch); return; }
   if (busy || !moves || !connState?.playerName) return;
   const p = connState.player;
   if (!p) return;
-  if (p.active_visit) {
-    showErrorModal("Already in a run",
-      "Finish or leave your current visit before joining another.");
+  if (inCoopVisitNow()) {
+    showErrorModal("Already in a co-op visit",
+      "Finish or leave your current co-op visit before joining another.");
     return;
   }
   const target = neighbour(p.segment, dir);
@@ -1611,7 +1909,8 @@ async function doCoopJoin(visitId: number, dir: string): Promise<void> {
   busy = true;
   updateSidebar();
   try {
-    await moves.join(connState.playerName, visitId, dir, settlement ?? undefined);
+    await moves.join(connState.playerName, visitId, dir, settlement ?? undefined,
+                     stake);
     const outcome = await waitForMove(connection, ({ player }) =>
       player?.active_visit?.visit_id === visitId);
     if (outcome === "applied") {
@@ -1676,6 +1975,9 @@ async function doCoopLeave(visitId: number): Promise<void> {
   updateSidebar();
 }
 
+/** Throttles the "queue is full" note so it cannot be printed per keystroke. */
+let lastInputFullNote = 0;
+
 /** Keyboard input during a co-op run: every action goes through the runner. */
 function handleCoopInput(action: string, dir?: Direction): void {
   if (!coop || !session || !fov || session.gameOver) return;
@@ -1697,31 +1999,169 @@ function handleCoopInput(action: string, dir?: Direction): void {
       a = { type: "use", itemId: "health_potion" };
       break;
     case "gate": {
-      const g = gateAtPlayer();
-      if (g) confirmCoopExit(g.direction);
+      // Every one of these used to be a silent no-op: the key did nothing
+      // and the player had no way to tell why.
+      // Not a reason to refuse the leave modal: when the relay is what is
+      // stuck, the routes out are exactly what the player needs to see.
+      showLeaveOptionsModal();
       return;
     }
   }
   if (!a) return;
 
-  if (coop.hasPendingOwn) {
-    session.addMessage("Your previous action is still waiting for the round to close.", "info");
-    updateSidebar();
-    return;
-  }
-  if (!coop.submitLocal(a)) return;  // invalid on our own turn: nothing sent
-
-  if (action === "move") {
-    const g = gateAtPlayer();
-    if (g) {
-      session.addMessage(`On the ${g.direction} gate. Press Enter to leave the dungeon.`, "info");
+  if (coop.inputFull) {
+    // Once every few seconds at most: this fires on every key press while
+    // the buffer is full, and a log line per keystroke reads as a fault in
+    // the game rather than as the pacing it actually is.
+    const now = Date.now();
+    if (now - lastInputFullNote > 4000) {
+      lastInputFullNote = now;
+      session.addMessage(coop.transportError
+        ? `The relay refused your last action (${coop.transportError}), so the round cannot close. ` +
+          `Nothing you press will register until that is fixed; the action retries by itself once it can.`
+        : "Slow down: you are a few moves ahead of the round already.", "info");
       updateSidebar();
     }
+    return;
+  }
+  if (!coop.submitLocal(a)) {
+    // A duel only takes input during the commit phase of a round, and only
+    // once: every other key press was dropped in silence, which is why
+    // drinking a potion mid-duel looked broken.
+    if (session.isDuel()) {
+      const now = Date.now();
+      if (now - lastInputFullNote > 2500) {
+        lastInputFullNote = now;
+        session.addMessage(
+          coop.phaseLabel === "choose"
+            ? "You have already sealed your move for this round."
+            : `Not now: the round is ${coop.phaseLabel}. Your next choice opens when it resolves.`,
+          "info");
+        updateSidebar();
+      }
+    }
+    return;
+  }
+
+  // Arrival on a gate is announced from coopOnChange, once the move has
+  // actually been applied: see noteGateArrival.
+}
+
+/**
+ * Every way out of a live run, on one screen, with the ones you cannot take
+ * right now shown greyed and saying why.  Walking onto a gate and pressing
+ * Enter was the only exit and nothing on screen said so, which left players
+ * believing a run could not be left at all.  Routes out differ in what they
+ * cost, so this lists them rather than picking one: it IS the confirmation,
+ * so a choice here acts immediately.
+ */
+function showLeaveOptionsModal(): void {
+  if (!session || (!coop && !coopSolo)) return;
+  const duel = session.isDuel();
+  const g = gateAtPlayer();
+  const stake = coopVisit?.stake ?? 0;
+  const choices: Array<{ label: string; detail?: string; disabled?: boolean; onPick: () => void }> = [];
+
+  // 1. The gate: the ordinary way out, and in a duel the forfeit.
+  if (duel) {
+    choices.push({
+      label: g ? `Concede through the ${g.direction} gate` : "Concede through a gate",
+      detail: g
+        ? "A forfeit, not an escape. Your opponent wins on the spot" +
+          (stake > 0 ? ` and takes the ${stake * 2} gold pot` : "") +
+          ", and you take the death outcome: half HP, a knock-back, and anything found in here is lost."
+        : "You are not on a gate. Walk onto one first; the gates are in the middle of each edge of the map.",
+      disabled: !g,
+      onPick: () => { submitGateExit(); },
+    });
+  } else {
+    choices.push({
+      label: g ? `Walk out through the ${g.direction} gate` : "Walk out through a gate",
+      detail: g
+        ? "You leave now and keep what you found. The dungeon keeps going for your partner; " +
+          "the run settles on-chain once they are done too."
+        : "You are not on a gate. Walk onto one first; the gates are in the middle of each edge of the map.",
+      disabled: !g,
+      onPick: () => { submitGateExit(); },
+    });
+  }
+
+  // 2. Abandonment: only once the other side has genuinely gone quiet.
+  if (coop) {
+    const cp = partnerCheckpoint();
+    if (!cp) {
+      choices.push({
+        label: "Settle without your partner",
+        detail: "Not yet: they have no checkpoint on chain to settle from.",
+        disabled: true,
+        onPick: () => {},
+      });
+    } else {
+      choices.push({
+        label: `Settle without ${cp.name}`,
+        detail: cp.stale
+          ? `Their last checkpoint (${cp.n} actions) is ${cp.age} blocks old, so you can leave them behind and settle from it.`
+          : `Not yet: their checkpoint is ${cp.age} block${cp.age === 1 ? "" : "s"} old and has to reach ${ABANDON_WINDOW_BLOCKS}. ` +
+            `A partner who is still playing keeps it fresh, so this only opens up once they really have gone.`,
+        disabled: !cp.stale,
+        onPick: () => { continueAlone(); },
+      });
+    }
+  }
+
+  showChoiceModal({
+    title: duel ? "Leaving the duel" : "Leaving the run",
+    message: duel
+      ? "A duel ends when one of you is left standing. There is no neutral exit."
+      : "A run ends when everyone has reached a gate or died, and only then does it settle on-chain.",
+    choices,
+    cancelLabel: duel ? "Keep fighting" : "Stay in the run",
+    variant: "warn",
+  });
+}
+
+/** Sends the gate action for whichever kind of run is live, and says so when
+ *  the runner refuses it rather than failing silently. */
+function submitGateExit(): void {
+  if (coop) {
+    if (!coop.submitLocal({ type: "gate" })) {
+      session?.addMessage(
+        "Could not leave right now: the round is still closing. Try again in a moment.", "warning");
+      updateSidebar();
+    }
+  } else if (coopSolo) {
+    handleSoloSuffixInput("gate-now");
   }
 }
 
-/** Confirmation before exiting a co-op run through a gate. */
+/** Confirmation before exiting a co-op run -- or conceding a duel -- through
+ *  a gate.  In a duel the gate is not an exit at all: it is a forfeit, so
+ *  the wording has to say so before the player walks into it expecting to
+ *  keep what they found (pvp spec section 5). */
 function confirmCoopExit(dir: string): void {
+  if (session?.isDuel()) {
+    const stake = coopVisit?.stake ?? 0;
+    showConfirmModal({
+      title: `Concede through the ${dir} gate?`,
+      message:
+        "Walking out of a duel is a forfeit, not an escape. Your opponent " +
+        "wins on the spot" + (stake > 0 ? ` and takes the ${stake * 2} gold pot` : "") +
+        ", and you take the ordinary death outcome: half HP, a knock-back, " +
+        "and anything you picked up in here is lost.",
+      confirmLabel: "Concede",
+      cancelLabel: "Keep fighting",
+      onConfirm: () => {
+        if (coop && !coop.submitLocal({ type: "gate" })) {
+          session?.addMessage(
+            "Could not concede right now: the round is still closing. Try again in a moment.",
+            "warning");
+          updateSidebar();
+        }
+      },
+      onCancel: () => {},
+    });
+    return;
+  }
   showConfirmModal({
     title: `Leave through the ${dir} gate?`,
     message:
@@ -1731,8 +2171,14 @@ function confirmCoopExit(dir: string): void {
     confirmLabel: "Exit",
     cancelLabel: "Stay",
     onConfirm: () => {
-      if (coop) coop.submitLocal({ type: "gate" });
-      else if (coopSolo) handleSoloSuffixInput("gate-now");
+      if (coop) {
+        if (!coop.submitLocal({ type: "gate" })) {
+          session?.addMessage(
+            "Could not leave right now: the round is still closing. Try again in a moment.",
+            "warning");
+          updateSidebar();
+        }
+      } else if (coopSolo) handleSoloSuffixInput("gate-now");
     },
     onCancel: () => {},
   });
@@ -2708,7 +3154,9 @@ function handleGameInput(action: string, dir?: Direction): void {
     // by accident.  (Enter-on-a-gate is handled directly above.)
     if (action === "move") {
       const gate = gateAtPlayer();
-      if (gate) confirmGateWalk(gate.direction);
+      // An armed intent takes precedence over the confirmation dialog: the
+      // player already decided, back when they armed it.
+      if (gate && !fireArmedIntent(gate.direction)) confirmGateWalk(gate.direction);
     }
   }
 }
@@ -2764,7 +3212,7 @@ function confirmGateWalk(dir: string): void {
   // would meet someone, and it has to be one somebody has already cleared
   // (the frontier stays solo).  Walking through alone is always an option.
   const coopOk = !!moves && !isHub(target) && !!targetInfo?.confirmed
-    && !p.active_visit;
+    && !inCoopVisitNow();
   const joins = coopOk
     ? joinableVisits(curSeg).filter(j => sameSeg(j.visit.segment, target))
     : [];
@@ -2790,15 +3238,46 @@ function confirmGateWalk(dir: string): void {
       detail,
       onPick: () => doGateWalk(dir),
     },
-    ...joins.map(j => ({
-      label: `Join ${j.visit.initiator}'s run`,
-      detail: `${j.visit.players} of ${j.visit.max_players} waiting to go into ${segName(target)}.`,
-      onPick: () => { void doCoopJoin(j.visit.id, dir); },
-    })),
+    ...joins.map(j => {
+      const duel = j.visit.mode === "duel";
+      const stake = j.visit.stake ?? 0;
+      // What the host will actually accept.  Stakes need not match, so the
+      // bar is their floor, not their own ante.
+      const floor = j.visit.min_stake ?? stake;
+      const gold = connState?.player?.gold ?? 0;
+      const affordable = !duel || gold >= floor;
+      return {
+        label: duel
+          ? `Duel ${j.visit.initiator}`
+          : `Join ${j.visit.initiator}'s run`,
+        // The joiner sees the mode and what it will cost BEFORE joining, and
+        // is told when they cannot cover it rather than having the move
+        // silently rejected on chain (spec section 9).
+        detail: duel
+          ? (affordable
+              ? `A fight, not a run. They staked ${stake} and will accept ` +
+                `${floor === 0 ? "any stake at all" : `${floor} or more`}; ` +
+                `the winner takes the whole pot and walking out through a ` +
+                `gate concedes. You hold ${gold} gold.`
+              : `They will not take less than ${floor} and you hold ${gold}.`)
+          : `${j.visit.players} of ${j.visit.max_players} waiting to go into ${segName(target)}.`,
+        disabled: !affordable,
+        onPick: () => {
+          if (duel) showJoinStakeModal(j.visit.id, dir, stake, floor, gold);
+          else void doCoopJoin(j.visit.id, dir);
+        },
+      };
+    }),
     {
       label: "Wait here for a partner",
       detail: `Opens a co-op run in ${segName(target)}. Anyone standing next to it can walk in and join you.`,
       onPick: () => { void doCoopHost(dir); },
+    },
+    {
+      label: "Wait here for a duel",
+      detail: `Opens a 1v1 duel in ${segName(target)}. You stake gold, the ` +
+              `challenger matches it, and the last one standing takes the pot.`,
+      onPick: () => { showDuelStakeModal(dir); },
     },
   ];
 
@@ -2813,6 +3292,10 @@ function confirmGateWalk(dir: string): void {
 document.addEventListener("keydown", (e) => {
   if (isEditableTarget(e.target)) return;
   if (e.key === "Escape") {
+    // A dialog opened from inside the game modal owns Escape: without this
+    // both handlers fire and one keypress closes the dialog AND the modal
+    // it was opened from.
+    if (document.getElementById("modal-root")) return;
     if (helpOpen) { setHelpOpen(false); return; }
     if (activeModalTab) { setModalTab(null); return; }
   }
@@ -2884,8 +3367,66 @@ document.addEventListener("click", (e) => {
     case "coop-host":
       doCoopHost(target.dataset.dir!);
       break;
+    case "duel-host":
+      // Same host move with a stake attached; the modal picks the amount
+      // and filters it to what this player can actually cover.
+      showDuelStakeModal(target.dataset.dir!);
+      break;
+    case "coop-arm-host":
+      armIntent({ kind: "host", dir: target.dataset.dir!,
+                  seg: { x: Number(target.dataset.segX), y: Number(target.dataset.segY) },
+                  from: connState!.player!.segment });
+      break;
+    case "coop-arm-duel":
+      // The stake is chosen now, while the player is thinking about it, and
+      // travels with the armed intent.
+      showDuelStakeModal(target.dataset.dir!, {
+        x: Number(target.dataset.segX), y: Number(target.dataset.segY),
+      });
+      break;
+    case "coop-arm-join":
+      {
+        const base = {
+          kind: "join" as const, dir: target.dataset.dir!,
+          seg: { x: Number(target.dataset.segX), y: Number(target.dataset.segY) },
+          from: connState!.player!.segment,
+          visitId: Number(target.dataset.visit), who: target.dataset.who,
+        };
+        if (target.dataset.duel === "1") {
+          // Decide the amount now, while they are thinking about it; it
+          // travels with the intent and fires at the gate.
+          showAmountModal({
+            title: "Duel for how much?",
+            message:
+              `They staked ${target.dataset.stake} and will accept ` +
+              `${Number(target.dataset.floor) === 0 ? "anything" : target.dataset.floor + " or more"}. ` +
+              `The winner takes the whole pot. This is sealed now and put up ` +
+              `when you reach the gate.`,
+            label: "Your stake",
+            min: Number(target.dataset.floor),
+            max: connState?.player?.gold ?? 0,
+            initial: Number(target.dataset.floor),
+            confirmLabel: "Arm it",
+            cancelLabel: "Never mind",
+            onConfirm: (stake) => armIntent({ ...base, stake }),
+          });
+        } else {
+          armIntent(base);
+        }
+      }
+      break;
+    case "coop-disarm":
+      disarmIntent();
+      break;
     case "coop-join":
-      doCoopJoin(Number(target.dataset.visit), target.dataset.dir!);
+      if (target.dataset.duel === "1") {
+        showJoinStakeModal(
+          Number(target.dataset.visit), target.dataset.dir!,
+          Number(target.dataset.stake), Number(target.dataset.floor),
+          connState?.player?.gold ?? 0);
+      } else {
+        doCoopJoin(Number(target.dataset.visit), target.dataset.dir!);
+      }
       break;
     case "coop-leave":
       doCoopLeave(Number(target.dataset.visit));
@@ -2895,6 +3436,9 @@ document.addEventListener("click", (e) => {
         const g = gateAtPlayer();
         if (g) confirmCoopExit(g.direction);
       }
+      break;
+    case "coop-leave-options":
+      showLeaveOptionsModal();
       break;
     case "coop-settle-retry":
       if (coopSolo) void coopSoloSettle(); else void coopSettle();
@@ -3274,6 +3818,123 @@ function renderPlayersTabBody(): string {
  * same segment through your own gates, so this only ever lists the runs
  * reachable from where you are standing (backend spec section 8a).
  */
+/**
+ * Where a gate sits on the tile map, as a parenthetical.  A direction alone
+ * is not much help when you are standing in a corridor somewhere in an 80x40
+ * grid and the gate is one tile on one edge.
+ */
+function gateHint(dir: string): string {
+  const g = session?.dungeon.gates.find(x => x.direction === dir);
+  if (!g) return "";
+  const edge = dir === "north" ? "top edge"
+    : dir === "south" ? "bottom edge"
+    : dir === "east" ? "right edge" : "left edge";
+  return ` (${edge}, around x ${g.x}, y ${g.y})`;
+}
+
+/* ---- Armed intent: decide now, act when you reach the gate -------------
+ *
+ * Opening or joining a run from inside another run has to leave through one
+ * specific gate, because the move carries that run's settlement.  Presenting
+ * that as a dead grey button was a false affordance: the player had to close
+ * the tab, walk, and then find a different dialog.  Arming lets them decide
+ * here and have it fire on arrival.  Everything about it is visible while
+ * they walk (a sidebar banner with the gate's location and a cancel), so the
+ * one thing it must never do is leave someone wondering why nothing
+ * happened.
+ */
+interface ArmedIntent {
+  kind: "host" | "duel" | "join";
+  dir: string;
+  seg: SegmentRef;
+  /** Where it was armed; leaving that segment retires it. */
+  from: SegmentRef;
+  visitId?: number;
+  stake?: number;
+  /** Duel host only: the least a challenger may put up. */
+  minStake?: number;
+  who?: string;
+}
+let armedIntent: ArmedIntent | null = null;
+
+/**
+ * Retires an intent that can no longer fire, saying why.  Nothing here is
+ * cosmetic: an intent that silently cannot happen is exactly the "why is
+ * nothing happening" trap this feature exists to avoid.
+ */
+function validateArmedIntent(): void {
+  const a = armedIntent;
+  if (!a) return;
+  const p = connState?.player;
+  if (!session || !p) { armedIntent = null; return; }
+  if (!sameSeg(p.segment, a.from)) {      // left the segment it belonged to
+    armedIntent = null;
+    return;
+  }
+  if (a.kind === "join") {
+    const v = connState?.fullState?.visits?.find(x => x.id === a.visitId);
+    if (!v || v.status !== "open") {
+      armedIntent = null;
+      session.addMessage(
+        `${a.who ?? "That run"} is no longer waiting in ${segName(a.seg)}, so the armed join was cancelled.`,
+        "warning");
+    }
+  }
+}
+
+function armIntent(intent: ArmedIntent): void {
+  armedIntent = intent;
+  session?.addMessage(describeArmed(intent) + " Cancel it from the sidebar.", "info");
+  updateSidebar();
+  render();
+}
+
+function disarmIntent(quiet = false): void {
+  if (!armedIntent) return;
+  const was = armedIntent;
+  armedIntent = null;
+  if (!quiet) session?.addMessage(`Cancelled: ${armedLabel(was)} in ${segName(was.seg)}.`, "info");
+  updateSidebar();
+}
+
+function armedLabel(a: ArmedIntent): string {
+  return a.kind === "duel" ? "a duel"
+    : a.kind === "join" ? `joining ${a.who ?? "that run"}`
+    : "a co-op run";
+}
+
+function describeArmed(a: ArmedIntent): string {
+  return `Ready: ${armedLabel(a)} in ${segName(a.seg)}, the moment you step on ` +
+    `your ${a.dir} gate${gateHint(a.dir)}. Your current run settles on the way out.`;
+}
+
+/**
+ * Fires a matching armed intent on arrival at `dir`.  Returns true when it
+ * fired, so the caller skips whatever dialog it would otherwise have shown.
+ */
+function fireArmedIntent(dir: string): boolean {
+  const a = armedIntent;
+  if (!a || a.dir !== dir) return false;
+  armedIntent = null;
+  if (a.kind === "join" && a.visitId !== undefined)
+    void doCoopJoin(a.visitId, dir, a.stake);
+  else if (a.kind === "duel") void doCoopHost(dir, a.stake ?? 0, a.minStake);
+  else void doCoopHost(dir);
+  updateSidebar();
+  return true;
+}
+
+/** Sidebar banner for an armed intent, shown wherever the player is looking. */
+function armedBannerHtml(): string {
+  const a = armedIntent;
+  if (!a) return "";
+  return `<div style="margin-top:6px;padding:6px 8px;border:1px solid #66a;border-radius:4px;background:#1b1b28">
+    <div style="color:#aaf;font-size:11px;font-weight:bold">Armed: ${armedLabel(a)} in ${segName(a.seg)}</div>
+    <div style="color:#999;font-size:10px">Walk onto your ${a.dir} gate${gateHint(a.dir)}. It opens by itself when you get there; your current run settles on the way out.</div>
+    <button data-action="coop-disarm" class="action-btn" ${busy ? "disabled" : ""}>Cancel</button>
+  </div>`;
+}
+
 function renderCoopTabBody(): string {
   const p = connState?.player;
   if (!p) {
@@ -3285,7 +3946,7 @@ function renderCoopTabBody(): string {
     `through your own gates, so you have to be standing next to it.</div>`;
 
   // Already in a visit: waiting, or playing.
-  if (p.active_visit) {
+  if (p.active_visit && inCoopVisitNow()) {
     const v = coopVisit;
     const vid = p.active_visit.visit_id;
     const where = segName(p.active_visit.segment);
@@ -3304,12 +3965,39 @@ function renderCoopTabBody(): string {
         </div>
       </div>`;
     }
+    // Mid-run this tab used to be a dead end: it named the run and told you
+    // to close it again.  It is the obvious place to look for the way out,
+    // so the leave control lives here as well as on the run panel.
+    const live = coop ?? coopSolo;
+    const duelRun = !!session?.isDuel();
+    const stuck = coop?.transportError ?? null;
+    const canLeave = !!live && !!session && !session.gameOver
+      && !me().dead && !me().exited;
+    const leaveBtn = canLeave
+      ? `<button data-action="coop-leave-options" class="action-btn ${
+          duelRun ? "action-duel" : "action-enter"}" ${busy ? "disabled" : ""}>${
+          duelRun ? "Leave the duel\u2026" : "Leave the run\u2026"}</button>`
+      : "";
+    const standing = !live
+      ? "Starting..."
+      : session?.gameOver
+        ? "The run is over and settling on chain."
+        : me().exited
+          ? "You are out through a gate. The run settles once everyone else is done."
+          : me().dead
+            ? "You are down. The run settles once everyone else is done."
+            : "Close this and press M to get back to the dungeon.";
+    const stuckLine = stuck
+      ? `<div style="color:#c44;font-size:11px">The relay is refusing this client (${stuck}), so the run cannot advance.</div>`
+      : "";
     return `<div class="players-wrap">
       ${intro}
-      <div class="players-section-title">Running ${where}</div>
-      <div class="coop-panel">
+      <div class="players-section-title">${duelRun ? "Duelling in" : "Running"} ${where}</div>
+      <div class="coop-panel${duelRun ? " coop-panel-duel" : ""}">
         <div>Run #${vid} is under way with ${v.participants.join(", ")}.</div>
-        <div class="coop-dim">${coop ? "Close this and press M to get back to the dungeon." : "Starting..."}</div>
+        <div class="coop-dim">${standing}</div>
+        ${stuckLine}
+        ${leaveBtn}
       </div>
     </div>`;
   }
@@ -3321,28 +4009,67 @@ function renderCoopTabBody(): string {
 
   let joinHtml = "";
   if (joins.length > 0) {
-    joinHtml = `<div class="players-section-title">Runs you can walk into (${joins.length})</div>` +
+    joinHtml = `<div class="players-section-title">Waiting for you (${joins.length})</div>` +
       joins.map(j => {
         const blocked = p.in_channel && onGate !== j.dir;
-        return `<div class="coop-panel">
-          <div><strong>${j.visit.initiator}</strong> is waiting in ${segName(j.visit.segment)} (${j.visit.players}/${j.visit.max_players})</div>
-          <div class="coop-dim">Through your ${j.dir} gate.${blocked ? ` Walk onto that gate first.` : ""}</div>
-          <button data-action="coop-join" data-visit="${j.visit.id}" data-dir="${j.dir}"
-            class="action-btn action-enter" ${busy || blocked ? "disabled" : ""}>Join ${j.visit.initiator}</button>
+        // A duel is not a run, and the panel must not let anyone walk into
+        // a staked fight thinking it is one: mode, stake and affordability
+        // are shown BEFORE the click, exactly as the gate modal does.
+        const duel = j.visit.mode === "duel";
+        const stake = j.visit.stake ?? 0;
+        const floor = j.visit.min_stake ?? stake;
+        const gold = p.gold ?? 0;
+        const poor = duel && gold < floor;
+        const head = duel
+          ? `<strong>${j.visit.initiator}</strong> is waiting to duel in ${segName(j.visit.segment)}`
+          : `<strong>${j.visit.initiator}</strong> is waiting in ${segName(j.visit.segment)} (${j.visit.players}/${j.visit.max_players})`;
+        const why = duel
+          ? (poor
+              ? `They will not take less than ${floor} and you hold ${gold}.`
+              : `A fight, not a run. They staked ${stake} and will accept ` +
+                `${floor === 0 ? "any stake at all" : `${floor} or more`}; ` +
+                `the winner takes the whole pot and walking out concedes.`)
+          : `Through your ${j.dir} gate.`;
+        return `<div class="coop-panel${duel ? " coop-panel-duel" : ""}">
+          <div>${head}</div>
+          <div class="coop-dim">${why}${blocked ? ` You are mid-run here: walk onto your ${j.dir} gate${gateHint(j.dir)} and this goes live.` : ""}</div>
+          ${armedIntent?.kind === "join" && armedIntent.visitId === j.visit.id
+            ? `<button data-action="coop-disarm" class="action-btn" ${busy ? "disabled" : ""}>Cancel</button>`
+            : `<button data-action="${blocked ? "coop-arm-join" : "coop-join"}"
+                 data-visit="${j.visit.id}" data-dir="${j.dir}"
+                 data-seg-x="${j.visit.segment.x}" data-seg-y="${j.visit.segment.y}"
+                 data-who="${j.visit.initiator}"
+                 data-duel="${duel ? 1 : 0}" data-stake="${stake}" data-floor="${floor}"
+                 class="action-btn action-enter" ${busy || poor ? "disabled" : ""}>${
+                   blocked ? (duel ? "Duel at the gate" : "Join at the gate")
+                           : (duel ? `Duel ${j.visit.initiator}` : `Join ${j.visit.initiator}`)}</button>`}
         </div>`;
       }).join("");
   }
 
   let hostHtml = "";
   if (targets.length > 0) {
-    hostHtml = `<div class="players-section-title">Start a run (${targets.length})</div>` +
+    hostHtml = `<div class="players-section-title">Wait at a gate (${targets.length})</div>` +
       targets.map(t => {
         const blocked = p.in_channel && onGate !== t.dir;
+        const off = busy ? "disabled" : "";
+        const armedHere = armedIntent?.dir === t.dir && armedIntent.kind !== "join";
         return `<div class="coop-panel">
           <div><strong>${segName(t.seg)}</strong> through your ${t.dir} gate</div>
-          <div class="coop-dim">${blocked ? "Walk onto that gate first." : "Opens a run and waits there for someone to join you."}</div>
-          <button data-action="coop-host" data-dir="${t.dir}"
-            class="action-btn action-enter" ${busy || blocked ? "disabled" : ""}>Wait at the ${t.dir} gate</button>
+          <div class="coop-dim">${armedHere
+            ? `Armed. It opens by itself when you step on your ${t.dir} gate${gateHint(t.dir)}.`
+            : blocked
+              ? `You are mid-run, so this settles your current run on the way out and has to ` +
+                `leave by your ${t.dir} gate${gateHint(t.dir)}. Choose one and it fires when you get there.`
+              : "Wait there for someone to walk in: as a partner, or as an opponent."}</div>
+          ${armedHere
+            ? `<button data-action="coop-disarm" class="action-btn" ${off}>Cancel</button>`
+            : `<button data-action="${blocked ? "coop-arm-host" : "coop-host"}" data-dir="${t.dir}"
+                 data-seg-x="${t.seg.x}" data-seg-y="${t.seg.y}"
+                 class="action-btn action-enter" ${off}>${blocked ? "Co-op run at the gate" : "Co-op run"}</button>
+               <button data-action="${blocked ? "coop-arm-duel" : "duel-host"}" data-dir="${t.dir}"
+                 data-seg-x="${t.seg.x}" data-seg-y="${t.seg.y}"
+                 class="action-btn action-duel" ${off}>${blocked ? "Duel at the gate" : "Duel"}</button>`}
         </div>`;
       }).join("");
   }
@@ -3557,7 +4284,7 @@ function renderHelpOverlay(): void {
         <button class="inv-close" data-action="close-help">✕</button>
       </div>
       <div class="modal-tab-body">${renderHelpBody()}</div>
-      <div class="inv-foot">Press Esc to close</div>
+      <button class="inv-foot" data-action="close-help">Close (or press Esc)</button>
     </div>`;
   root.addEventListener("click", (e) => {
     if (e.target === root) setHelpOpen(false);
@@ -3570,8 +4297,10 @@ function renderHelpOverlay(): void {
 /**
  * Renders the single persistent game modal (Inventory / Players / Help).
  * Wipes any existing instance, bails when closed, and rebuilds one
- * `#game-modal` overlay appended to the body.  Closes on the ✕ button and
- * on a backdrop click.  Tab buttons switch the active body without closing.
+ * `#game-modal` overlay appended to the body.  Closes on the ✕ button, on
+ * the footer bar, on Esc and on a backdrop click: the footer matters because
+ * a long tab puts the ✕ off the top of the screen once you have scrolled.
+ * Tab buttons switch the active body without closing.
  */
 function renderGameModal(): void {
   // Preserve the scroll position of the active tab body across re-renders.
@@ -3636,7 +4365,7 @@ function renderGameModal(): void {
       </div>
       <div class="modal-tabs">${tabBar}</div>
       <div class="modal-tab-body">${body}</div>
-      <div class="inv-foot">Press Esc to close</div>
+      <button class="inv-foot" data-action="close-modal">Close (or press Esc)</button>
     </div>`;
   // Backdrop click closes.
   root.addEventListener("click", (e) => {
@@ -3672,6 +4401,7 @@ function goldHeaderHtml(): string {
 // --- Sidebar updates ---
 
 function updateSidebar(): void {
+  validateArmedIntent();
   // The dungeon-mode sidebar (turns, kills, "submit results") only makes
   // sense when we're in an actual channel session.  When dungeon mode is
   // rendering the hub, use the overworld sidebar so the player still has
@@ -3877,6 +4607,7 @@ function updateOverworldStats(): void {
     <div style="color:#888;font-size:11px">
       K:${p.combat_record.kills} D:${p.combat_record.deaths} V:${p.combat_record.visits_completed}
     </div>
+    ${armedBannerHtml()}
     ${enterHereBtn}
     ${statBtns}
     ${potionBtn}
@@ -3982,21 +4713,64 @@ function updateDungeonStats(): void {
     ? `Gold: ${bankedGold} banked (+${me().totalGold} this run, settles on exit)`
     : `Gold: ${me().totalGold} (this run)`;
 
+/**
+ * How a finished duel reads.  The winner is whoever is left when at most
+ * one participant is active, which is NOT the same as "survived": a
+ * conceder walked out through a gate and still lost, so this reads the
+ * engine's latched winner rather than anyone's exit state.
+ */
+function duelOutcomeLine(): string {
+  if (!session || !coop) return "Duel over.";
+  const w = session.duelWinner;
+  if (w < 0) return "Duel over.";
+  const won = w === coop.me;
+  const loser = session.players[w === 0 ? 1 : 0];
+  const how = loser.exited ? "conceded" : "fell";
+  return won
+    ? `You win \u2014 ${coop.names[w === 0 ? 1 : 0]} ${how}. Settle to take the pot.`
+    : `You ${how === "conceded" ? "conceded" : "lost"} \u2014 ${coop.names[w]} takes the pot.`;
+}
+
   // Co-op: partner, turn state, projected reward shares, relay health.
   let coopBlock = "";
   if (coop) {
-    const claims = computeClaims(session);
+    const claims = computeClaims(session, coopVisit?.pot ?? 0);
     const rows = coop.names.map((n, i) => {
       const q = session!.players[i];
       const c = claims[i];
-      const state = q.dead ? "dead" : q.exited ? `exited ${q.exitGate}` : `HP ${q.hp}/${q.maxHp}`;
       const you = i === coop!.me ? " (you)" : "";
+      if (session!.isDuel()) {
+        // Both HP bars, because in a duel the opponent's health IS the
+        // scoreboard -- there is no shared objective to report instead.
+        const frac = q.maxHp > 0 ? Math.max(0, q.hp) / q.maxHp : 0;
+        const state = q.dead ? "dead" : q.exited ? "conceded" : `${q.hp}/${q.maxHp}`;
+        const colour = i === coop!.me ? "#6c6" : "#c66";
+        return `<div class="stat-row"><span class="stat-label">${n}${you}</span>` +
+               `<span class="stat-value">${state}</span></div>` +
+               `<div style="height:4px;background:#222;margin:1px 0 3px">` +
+               `<div style="height:4px;width:${(frac * 100).toFixed(0)}%;background:${colour}"></div></div>`;
+      }
+      const state = q.dead ? "dead" : q.exited ? `exited ${q.exitGate}` : `HP ${q.hp}/${q.maxHp}`;
       return `<div class="stat-row"><span class="stat-label">${n}${you}</span>` +
              `<span class="stat-value">${state} \u00b7 ${c.kills}K \u00b7 ~${c.xp}xp ~${c.gold}g</span></div>`;
     }).join("");
+    const duel = session.isDuel();
     let turnLine: string;
-    if (session.gameOver) turnLine = "Run over.";
+    if (session.gameOver) turnLine = duel ? duelOutcomeLine() : "Run over.";
     else if (me().dead || me().exited) turnLine = "Spectating until the run ends.";
+    else if (duel) {
+      // A duel round asks for one choice and then runs itself, so the
+      // phase is what the player needs to see -- "your move" would be a
+      // lie during the reveal, when nothing is being asked of them.
+      switch (coop.phaseLabel) {
+        case "choose": turnLine = "Choose your move \u2014 both are sealed until revealed."; break;
+        case "waiting for opponent": turnLine = "Sealed. Waiting for your opponent..."; break;
+        case "revealing": turnLine = "Revealing..."; break;
+        default: turnLine = "";
+      }
+    }
+    else if (coop.hasPendingOwn && coop.transportError)
+      turnLine = "Your action could not be sent; the run is stuck until the relay accepts it.";
     else if (coop.hasPendingOwn) turnLine = `Action sent; waiting for ${coop.waitingOn}...`;
     else if (coop.myTurn) turnLine = "Your move.";
     else turnLine = `Waiting for ${coop.waitingOn}...`;
@@ -4013,23 +4787,46 @@ function updateDungeonStats(): void {
         cpLine = `<div style="color:#666;font-size:10px">${cp.name}'s checkpoint: ${cp.n} actions, ${cp.age} block${cp.age === 1 ? "" : "s"} ago (abandon after ${ABANDON_WINDOW_BLOCKS}).</div>`;
       }
     }
+    // Leaving a live run had no button at all: the only way out was to walk
+    // onto a gate and press Enter, which nothing on screen ever said.  The
+    // `coop-exit` handler existed but nothing rendered a control for it.
+    let exitLine = "";
+    if (!session.gameOver && !me().dead && !me().exited) {
+      // Always present, whether or not a gate is underfoot: the modal is
+      // where the routes out and their costs are spelled out.
+      exitLine = `<button data-action="coop-leave-options" class="action-btn ${
+        duel ? "action-duel" : "action-enter"}" ${busy ? "disabled" : ""}>${
+        duel ? "Leave the duel\u2026" : "Leave the run\u2026"}</button>`;
+    }
+    const pot = coopVisit?.pot ?? 0;
+    const header = duel
+      ? `<div style="color:#c88;font-size:11px;font-weight:bold">Duel \u00b7 visit #${channelVisitId}` +
+        (pot > 0 ? ` \u00b7 ${pot} gold pot` : " \u00b7 no stake") + `</div>`
+      : `<div style="color:#8cc;font-size:11px;font-weight:bold">Co-op run \u00b7 visit #${channelVisitId}</div>`;
+    const footnote = duel
+      ? `<div style="color:#666;font-size:10px">Bump your opponent to attack. Leaving through a gate concedes the duel and the pot.</div>`
+      : `<div style="color:#666;font-size:10px">Shares (~) are projected: kill XP and gold pools split by damage dealt, final at settlement.</div>`;
     coopBlock = `
       <div style="margin-top:6px;border-top:1px solid #333;padding-top:6px">
-        <div style="color:#8cc;font-size:11px;font-weight:bold">Co-op run \u00b7 visit #${channelVisitId}</div>
+        ${header}
         ${rows}
         <div style="color:#aaa;font-size:11px">${turnLine}</div>
-        <div style="color:#666;font-size:10px">Shares (~) are projected: kill XP and gold pools split by damage dealt, final at settlement.</div>
+        ${exitLine}
+        ${footnote}
         ${cpLine}
         ${relay}
       </div>`;
   } else if (coopSolo) {
-    const claims = computeClaims(session);
+    const claims = computeClaims(session, coopVisit?.pot ?? 0);
     const c = claims[coopSolo.me];
     coopBlock = `
       <div style="margin-top:6px;border-top:1px solid #333;padding-top:6px">
         <div style="color:#8cc;font-size:11px;font-weight:bold">Co-op run \u00b7 visit #${coopSolo.visitId} \u00b7 continuing alone</div>
         <div style="color:#aaa;font-size:11px">Partner left behind at action ${coopSolo.from}; reach a gate to settle.</div>
         <div class="stat-row"><span class="stat-label">Projected</span><span class="stat-value">${c.kills}K \u00b7 ~${c.xp}xp ~${c.gold}g</span></div>
+        ${!session.gameOver && !me().dead && !me().exited
+          ? `<button data-action="coop-leave-options" class="action-btn action-enter" ${busy ? "disabled" : ""}>Leave the run\u2026</button>`
+          : ""}
       </div>`;
   }
 
@@ -4073,10 +4870,25 @@ function updateDungeonStats(): void {
     <div>Kills: ${me().totalKills} &nbsp; Depth: ${session.depth}</div>
     ${coopBlock}
     ${(session.gameOver || ((coop || coopSolo) && (me().dead || me().exited)))
-      ? `<div style="margin-top:8px;color:${me().exited ? '#4a4' : '#c44'};font-weight:bold">
-           ${me().exited ? 'SURVIVED \u2014 Exited ' + me().exitGate : 'YOU DIED'}
-         </div>${endButtons}`
+      ? (() => {
+          // A duel winner never walks out of a gate, so the old test (exited
+          // or else dead) labelled every victory "YOU DIED".
+          const duelWon = session!.isDuel() && coop !== null
+            && session!.duelWinner === coop.me;
+          const won = duelWon || me().exited;
+          const label = duelWon
+            ? "YOU WON THE DUEL"
+            : session!.isDuel() && session!.duelWinner >= 0
+              ? (me().dead ? "YOU DIED" : "YOU LOST THE DUEL")
+              : me().exited
+                ? "SURVIVED \u2014 Exited " + me().exitGate
+                : "YOU DIED";
+          return `<div style="margin-top:8px;color:${won ? "#4a4" : "#c44"};font-weight:bold">
+           ${label}
+         </div>${endButtons}`;
+        })()
       : ''}
+    ${armedBannerHtml()}
     ${busy ? '<div style="margin-top:6px;color:#aa8">Submitting...</div>' : ""}
     <div style="margin-top:8px;font-size:11px;color:#888">
       WASD/Arrows: Move &nbsp; G: Pickup<br>
@@ -4186,7 +4998,7 @@ if (typeof location !== "undefined"
         waitingOn: coop.waitingOn,
         turns: coop.session.turnCount,
         logHash: settleLogHash(channelVisitId, coop.session.mergedLog),
-        claims: computeClaims(coop.session),
+        claims: computeClaims(coop.session, coopVisit?.pot ?? 0),
         players: coop.session.players.map(q => ({
           x: q.x, y: q.y, hp: q.hp, dead: q.dead, exited: q.exited, exitGate: q.exitGate,
         })),
@@ -4247,7 +5059,16 @@ if (typeof location !== "undefined"
     useItem: (item: string) => doUseItem(item),
     discard: (rowid: number) => doDiscard(rowid),
     allocateStat: (stat: string) => doAllocateStat(stat),
-    dismissModal: () => document.querySelector<HTMLElement>(".modal-dismiss")?.click(),
+    // Any dialog, not just the one-button kind: a CHOICE modal (the gate
+    // dialog, the leave dialog) carries .modal-cancel and no .modal-dismiss,
+    // so a hook that only knew the latter silently did nothing and left
+    // every driver spinning against a modal it could not close.
+    dismissModal: () => {
+      const el = document.querySelector<HTMLElement>(".modal-dismiss")
+        ?? document.querySelector<HTMLElement>(".modal-cancel");
+      el?.click();
+      return !!el;
+    },
     // Overworld map view transform, for pan/zoom tests.
     mapView: () => ({ panX, panY, zoom, mapFollow, selectedSegment }),
     recenter: () => recenterMap(),
