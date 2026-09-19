@@ -248,8 +248,11 @@ let moves: MoveClient | null = null;
  * commitment preimage.
  */
 const CLIENT_RULES_VERSION = 1;
-/** What settlement awards; see BANKING_VERSION in rules.hpp. */
-const CLIENT_BANKING_VERSION = 1;
+/** What settlement awards; see BANKING_VERSION in rules.hpp.
+ *  2: asymmetric duel stakes (the host posts a floor, each side escrows its
+ *  own amount, the pot is the sum, a void refunds each exactly what they
+ *  put in).  This client sends and displays those, so it is a 2. */
+const CLIENT_BANKING_VERSION = 2;
 
 /**
  * Null while the versions agree (or the GSP is too old to say), otherwise
