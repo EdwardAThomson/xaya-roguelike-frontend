@@ -1681,35 +1681,110 @@ function inCoopLobby(): boolean {
  * unaffordable stake is never offered at all.  0 is kept deliberately --
  * a friendly duel with nothing on it is a real thing to want.
  */
+/**
+ * What the challenger puts up.  It must clear the host's floor and need not
+ * equal their stake: the point of an uneven duel is the underdog risking
+ * less, so this opens at the floor rather than at the host's ante.
+ */
+function showJoinStakeModal(visitId: number, dir: string, hostStake: number,
+                            floor: number, gold: number): void {
+  showAmountModal({
+    title: `Duel for how much?`,
+    message:
+      `They staked ${hostStake} and will accept ` +
+      `${floor === 0 ? "anything" : `${floor} or more`}. Whatever you put up ` +
+      `joins theirs in the pot and the winner takes all of it, so risking ` +
+      `${floor === 0 ? "nothing" : String(floor)} against their ${hostStake} is a cheap shot ` +
+      `worth taking if you fancy your chances. You hold ${gold} gold.`,
+    label: "Your stake",
+    min: floor,
+    max: gold,
+    initial: floor,
+    presets: [
+      [`Least (${floor})`, floor],
+      ...(hostStake >= floor && hostStake <= gold
+        ? [[`Match them (${hostStake})`, hostStake] as [string, number]] : []),
+      ...(gold > floor ? [[`All ${gold}`, gold] as [string, number]] : []),
+    ],
+    confirmLabel: "Walk in",
+    cancelLabel: "Never mind",
+    onConfirm: (stake) => { void doCoopJoin(visitId, dir, stake); },
+  });
+}
+
 function showDuelStakeModal(dir: string, armFor?: SegmentRef): void {
   const gold = connState?.player?.gold ?? 0;
-  const presets: Array<[string, number]> = [["No stake", 0]];
-  if (gold > 0) {
-    const quarter = Math.floor(gold / 4);
-    const half = Math.floor(gold / 2);
-    if (quarter > 0) presets.push([`${quarter}`, quarter]);
-    if (half > quarter) presets.push([`${half}`, half]);
-    presets.push([`All ${gold}`, gold]);
-  }
   showAmountModal({
     title: "Stake the duel",
     message:
-      `Whatever you stake, your challenger has to match. The last one standing ` +
-      `takes the pot; walking out through a gate concedes it. Stake 0 for a ` +
+      `What you put up. Your challenger does not have to match it: you set ` +
+      `the floor next, and the winner takes the whole pot. Stake 0 for a ` +
       `friendly duel with nothing on it. You hold ${gold} gold.`,
-    label: "Stake",
+    label: "Your stake",
     min: 0,
     max: gold,
     initial: 0,
-    presets,
-    confirmLabel: "Open the duel",
+    presets: stakePresets(gold),
+    confirmLabel: "Next",
     cancelLabel: "Never mind",
-    onConfirm: (stake) => {
-      if (armFor) armIntent({ kind: "duel", dir, seg: armFor, stake,
+    onConfirm: (stake) => showDuelFloorModal(dir, stake, armFor),
+  });
+}
+
+/**
+ * The least a challenger may put up against `stake`.  This is the host's
+ * only protection: a duel activates the moment it is full, so they never
+ * see who joined or for how much, and without a floor someone could join a
+ * 100 gold duel for 1 and have a nearly free shot at it.  Defaulting to the
+ * host's own stake reproduces matched stakes exactly.
+ */
+function showDuelFloorModal(dir: string, stake: number,
+                            armFor?: SegmentRef): void {
+  if (stake === 0) {
+    // Nothing to protect: a friendly duel has no floor to set.
+    if (armFor) armIntent({ kind: "duel", dir, seg: armFor, stake, minStake: 0,
+                            from: connState!.player!.segment });
+    else void doCoopHost(dir, stake, 0);
+    return;
+  }
+  showAmountModal({
+    title: "The least they may risk",
+    message:
+      `You are staking ${stake}. A challenger must put up at least this ` +
+      `much to take you on, and may put up more. Set it low to let an ` +
+      `underdog take a cheap shot at you; set it to ${stake} to insist they ` +
+      `match you, which is how duels worked before.`,
+    label: "Minimum",
+    min: 0,
+    max: stake,
+    initial: stake,
+    presets: [
+      ["Anything (0)", 0],
+      ...(stake >= 4 ? [[`Quarter (${Math.floor(stake / 4)})`, Math.floor(stake / 4)] as [string, number]] : []),
+      ...(stake >= 2 ? [[`Half (${Math.floor(stake / 2)})`, Math.floor(stake / 2)] as [string, number]] : []),
+      [`Match me (${stake})`, stake],
+    ],
+    confirmLabel: "Open the duel",
+    cancelLabel: "Back",
+    onConfirm: (minStake) => {
+      if (armFor) armIntent({ kind: "duel", dir, seg: armFor, stake, minStake,
                               from: connState!.player!.segment });
-      else void doCoopHost(dir, stake);
+      else void doCoopHost(dir, stake, minStake);
     },
   });
+}
+
+/** Quick picks for an amount up to `gold`: nothing, a quarter, half, all. */
+function stakePresets(gold: number): Array<[string, number]> {
+  const out: Array<[string, number]> = [["No stake", 0]];
+  if (gold > 0) {
+    const quarter = Math.floor(gold / 4);
+    const half = Math.floor(gold / 2);
+    if (quarter > 0) out.push([`${quarter}`, quarter]);
+    if (half > quarter) out.push([`${half}`, half]);
+    out.push([`All ${gold}`, gold]);
+  }
+  return out;
 }
 
 /**
@@ -1733,7 +1808,8 @@ function inCoopVisitNow(): boolean {
   return !!coop || !!coopSolo || coopVisit?.status === "open";
 }
 
-async function doCoopHost(dir: string, duelStake?: number): Promise<void> {
+async function doCoopHost(dir: string, duelStake?: number,
+                          duelMinStake?: number): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
   if (rulesMismatch) { showErrorModal("Client out of date", rulesMismatch); return; }
   const p = connState.player;
@@ -1760,7 +1836,9 @@ async function doCoopHost(dir: string, duelStake?: number): Promise<void> {
   updateSidebar();
   try {
     await moves.visit(connState.playerName, dir, settlement ?? undefined,
-                      duelStake === undefined ? undefined : { stake: duelStake });
+                      duelStake === undefined
+                        ? undefined
+                        : { stake: duelStake, minStake: duelMinStake });
     const outcome = await waitForMove(connection, ({ player }) =>
       !!player?.active_visit && sameSeg(player.active_visit.segment, target));
     if (outcome === "applied") {
@@ -1806,7 +1884,8 @@ async function doCoopHost(dir: string, duelStake?: number): Promise<void> {
  * (`j`); the run starts as soon as the visit is full.  Same settlement
  * rules as hosting.
  */
-async function doCoopJoin(visitId: number, dir: string): Promise<void> {
+async function doCoopJoin(visitId: number, dir: string,
+                          stake?: number): Promise<void> {
   if (rulesMismatch) { showErrorModal("Client out of date", rulesMismatch); return; }
   if (busy || !moves || !connState?.playerName) return;
   const p = connState.player;
@@ -1827,7 +1906,8 @@ async function doCoopJoin(visitId: number, dir: string): Promise<void> {
   busy = true;
   updateSidebar();
   try {
-    await moves.join(connState.playerName, visitId, dir, settlement ?? undefined);
+    await moves.join(connState.playerName, visitId, dir, settlement ?? undefined,
+                     stake);
     const outcome = await waitForMove(connection, ({ player }) =>
       player?.active_visit?.visit_id === visitId);
     if (outcome === "applied") {
@@ -3156,25 +3236,33 @@ function confirmGateWalk(dir: string): void {
       onPick: () => doGateWalk(dir),
     },
     ...joins.map(j => {
-      const stake = j.visit.stake ?? 0;
       const duel = j.visit.mode === "duel";
+      const stake = j.visit.stake ?? 0;
+      // What the host will actually accept.  Stakes need not match, so the
+      // bar is their floor, not their own ante.
+      const floor = j.visit.min_stake ?? stake;
       const gold = connState?.player?.gold ?? 0;
-      const affordable = !duel || gold >= stake;
+      const affordable = !duel || gold >= floor;
       return {
         label: duel
-          ? `Duel ${j.visit.initiator} for ${stake} gold`
+          ? `Duel ${j.visit.initiator}`
           : `Join ${j.visit.initiator}'s run`,
-        // The joiner sees the mode and the stake BEFORE joining, and is
-        // told when they cannot cover it rather than having the move
+        // The joiner sees the mode and what it will cost BEFORE joining, and
+        // is told when they cannot cover it rather than having the move
         // silently rejected on chain (spec section 9).
         detail: duel
           ? (affordable
-              ? `A fight, not a run: last one standing takes the ${stake * 2} gold pot. ` +
-                `Walking out through a gate concedes. You hold ${gold} gold.`
-              : `You need ${stake} gold to match this stake and hold ${gold}.`)
+              ? `A fight, not a run. They staked ${stake} and will accept ` +
+                `${floor === 0 ? "any stake at all" : `${floor} or more`}; ` +
+                `the winner takes the whole pot and walking out through a ` +
+                `gate concedes. You hold ${gold} gold.`
+              : `They will not take less than ${floor} and you hold ${gold}.`)
           : `${j.visit.players} of ${j.visit.max_players} waiting to go into ${segName(target)}.`,
         disabled: !affordable,
-        onPick: () => { void doCoopJoin(j.visit.id, dir); },
+        onPick: () => {
+          if (duel) showJoinStakeModal(j.visit.id, dir, stake, floor, gold);
+          else void doCoopJoin(j.visit.id, dir);
+        },
       };
     }),
     {
@@ -3294,16 +3382,48 @@ document.addEventListener("click", (e) => {
       });
       break;
     case "coop-arm-join":
-      armIntent({ kind: "join", dir: target.dataset.dir!,
-                  seg: { x: Number(target.dataset.segX), y: Number(target.dataset.segY) },
-                  from: connState!.player!.segment,
-                  visitId: Number(target.dataset.visit), who: target.dataset.who });
+      {
+        const base = {
+          kind: "join" as const, dir: target.dataset.dir!,
+          seg: { x: Number(target.dataset.segX), y: Number(target.dataset.segY) },
+          from: connState!.player!.segment,
+          visitId: Number(target.dataset.visit), who: target.dataset.who,
+        };
+        if (target.dataset.duel === "1") {
+          // Decide the amount now, while they are thinking about it; it
+          // travels with the intent and fires at the gate.
+          showAmountModal({
+            title: "Duel for how much?",
+            message:
+              `They staked ${target.dataset.stake} and will accept ` +
+              `${Number(target.dataset.floor) === 0 ? "anything" : target.dataset.floor + " or more"}. ` +
+              `The winner takes the whole pot. This is sealed now and put up ` +
+              `when you reach the gate.`,
+            label: "Your stake",
+            min: Number(target.dataset.floor),
+            max: connState?.player?.gold ?? 0,
+            initial: Number(target.dataset.floor),
+            confirmLabel: "Arm it",
+            cancelLabel: "Never mind",
+            onConfirm: (stake) => armIntent({ ...base, stake }),
+          });
+        } else {
+          armIntent(base);
+        }
+      }
       break;
     case "coop-disarm":
       disarmIntent();
       break;
     case "coop-join":
-      doCoopJoin(Number(target.dataset.visit), target.dataset.dir!);
+      if (target.dataset.duel === "1") {
+        showJoinStakeModal(
+          Number(target.dataset.visit), target.dataset.dir!,
+          Number(target.dataset.stake), Number(target.dataset.floor),
+          connState?.player?.gold ?? 0);
+      } else {
+        doCoopJoin(Number(target.dataset.visit), target.dataset.dir!);
+      }
       break;
     case "coop-leave":
       doCoopLeave(Number(target.dataset.visit));
@@ -3728,6 +3848,8 @@ interface ArmedIntent {
   from: SegmentRef;
   visitId?: number;
   stake?: number;
+  /** Duel host only: the least a challenger may put up. */
+  minStake?: number;
   who?: string;
 }
 let armedIntent: ArmedIntent | null = null;
@@ -3791,8 +3913,9 @@ function fireArmedIntent(dir: string): boolean {
   const a = armedIntent;
   if (!a || a.dir !== dir) return false;
   armedIntent = null;
-  if (a.kind === "join" && a.visitId !== undefined) void doCoopJoin(a.visitId, dir);
-  else if (a.kind === "duel") void doCoopHost(dir, a.stake ?? 0);
+  if (a.kind === "join" && a.visitId !== undefined)
+    void doCoopJoin(a.visitId, dir, a.stake);
+  else if (a.kind === "duel") void doCoopHost(dir, a.stake ?? 0, a.minStake);
   else void doCoopHost(dir);
   updateSidebar();
   return true;
@@ -3891,17 +4014,18 @@ function renderCoopTabBody(): string {
         // are shown BEFORE the click, exactly as the gate modal does.
         const duel = j.visit.mode === "duel";
         const stake = j.visit.stake ?? 0;
+        const floor = j.visit.min_stake ?? stake;
         const gold = p.gold ?? 0;
-        const poor = duel && gold < stake;
+        const poor = duel && gold < floor;
         const head = duel
           ? `<strong>${j.visit.initiator}</strong> is waiting to duel in ${segName(j.visit.segment)}`
           : `<strong>${j.visit.initiator}</strong> is waiting in ${segName(j.visit.segment)} (${j.visit.players}/${j.visit.max_players})`;
         const why = duel
           ? (poor
-              ? `You need ${stake} gold to match this stake and hold ${gold}.`
-              : `A fight, not a run: ${stake === 0 ? "nothing staked" : `${stake} gold each`}, ` +
-                `last one standing takes ${stake === 0 ? "the bragging rights" : `the ${stake * 2} gold pot`}. ` +
-                `Walking out through a gate concedes.`)
+              ? `They will not take less than ${floor} and you hold ${gold}.`
+              : `A fight, not a run. They staked ${stake} and will accept ` +
+                `${floor === 0 ? "any stake at all" : `${floor} or more`}; ` +
+                `the winner takes the whole pot and walking out concedes.`)
           : `Through your ${j.dir} gate.`;
         return `<div class="coop-panel${duel ? " coop-panel-duel" : ""}">
           <div>${head}</div>
@@ -3912,6 +4036,7 @@ function renderCoopTabBody(): string {
                  data-visit="${j.visit.id}" data-dir="${j.dir}"
                  data-seg-x="${j.visit.segment.x}" data-seg-y="${j.visit.segment.y}"
                  data-who="${j.visit.initiator}"
+                 data-duel="${duel ? 1 : 0}" data-stake="${stake}" data-floor="${floor}"
                  class="action-btn action-enter" ${busy || poor ? "disabled" : ""}>${
                    blocked ? (duel ? "Duel at the gate" : "Join at the gate")
                            : (duel ? `Duel ${j.visit.initiator}` : `Join ${j.visit.initiator}`)}</button>`}

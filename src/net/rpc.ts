@@ -131,6 +131,8 @@ export interface VisitSummary {
    */
   mode?: string;
   stake?: number;
+  /** The least a challenger may put up; the host's own stake when unset. */
+  min_stake?: number;
   pot?: number;
 }
 
@@ -148,6 +150,8 @@ export interface VisitInfo {
    */
   mode?: string;
   stake?: number;
+  /** The least a challenger may put up; the host's own stake when unset. */
+  min_stake?: number;
   pot?: number;
   created_height: number;
   started_height?: number;

@@ -176,13 +176,22 @@ try {
   await A.standOnGate(dir);
   await A.pickChoice("wait here for a duel");
   await sleep(400);
-  // The stake is a number field now, capped at what this character holds:
-  // type the maximum so a staked duel is what gets exercised.
+  // Hosting is two number fields now: what you stake, then the least a
+  // challenger may put up.  Stake everything, and set a floor of 1 so the
+  // ASYMMETRIC path is what gets exercised rather than matched stakes.
   await A.page.waitForSelector(".modal-amount-input", { timeout: 10000 });
   const maxStake = await A.page.$eval(".modal-amount-input", (e) => Number(e.max));
   console.log(`   stake field offers up to ${maxStake} gold`);
   await A.page.fill(".modal-amount-input", String(maxStake));
   await A.page.click(".modal-confirm");
+
+  const floor = maxStake > 0 ? 1 : 0;
+  if (maxStake > 0) {
+    await A.page.waitForSelector(".modal-amount-input", { timeout: 10000 });
+    await A.page.fill(".modal-amount-input", String(floor));
+    await A.page.click(".modal-confirm");
+    console.log(`   host staked ${maxStake}, will accept ${floor} or more`);
+  }
   const hosted = await A.until((x) => !!x.player?.active_visit, 35000, "the duel to open");
   const visitId = hosted.player.active_visit.visit_id;
   const onChain = await gsp("getvisitinfo", [visitId]);
@@ -194,9 +203,17 @@ try {
                 "the duel to reach the challenger's lobby");
   await B.standOnGate(dir);
   await B.pickChoice("duel");
+  // The challenger names their own stake, which need not match the host's.
+  await B.page.waitForSelector(".modal-amount-input", { timeout: 10000 });
+  const myMin = await B.page.$eval(".modal-amount-input", (e) => Number(e.min));
+  await B.page.fill(".modal-amount-input", String(myMin));
+  await B.page.click(".modal-confirm");
   await B.until((x) => x.player?.active_visit?.visit_id === visitId, 35000, "to join");
   const joined = await gsp("getvisitinfo", [visitId]);
-  ok(`both in, status ${joined.status}, pot ${joined.pot ?? 0}`);
+  if (maxStake > 0 && joined.pot === maxStake * 2)
+    fail(`pot ${joined.pot} looks like matched stakes; the uneven join did not take`);
+  else ok(`both in, status ${joined.status}, pot ${joined.pot ?? 0} ` +
+          `(host ${maxStake} + challenger ${myMin})`);
 
   console.log("5. both clients open the arena");
   await Promise.all([
