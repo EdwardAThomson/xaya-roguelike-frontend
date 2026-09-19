@@ -94,8 +94,9 @@ the frontend built (`npx tsc` → `dist/`), the xayax venv at
   (its first full run took 602 turns), which also pushes the compact action
   proof well past anything the tests cover.
 - `npm run duel` — a full two-player duel through the real UI
-  (`duel.mjs`): one player walks onto a gate and picks "Wait here for a
-  duel" with a stake, the challenger joins from their own side of the same
+  (`duel.mjs`): one player walks onto a gate, picks "Wait here for a
+  duel" and types the largest stake the character can cover into the stake
+  field, the challenger joins from their own side of the same
   gate, and they bump into each other until one falls. It drives the real
   DOM because hosting a duel has no debug hook. Headed by default; env:
   `ROG_HEADLESS=1`, `ROG_URL`, `ROG_MAX_MIN` (default 12), `ROG_A` /

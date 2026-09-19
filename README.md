@@ -17,7 +17,7 @@ Browser-based frontend for the [Xaya Roguelike](https://github.com/EdwardAThomso
 - **Dungeon play**: Full turn-based roguelike (12 monster types, 31 items, fog of war, 8-dir movement)
 - **In-dungeon map**: Fog-of-war-aware minimap of the current dungeon (the Map view's "Dungeon" tab, alongside the "World" segment graph)
 - **Character sheet**: Tabbed in-game panel (Inventory, Character, Players, Co-op, Help) with base and effective stats, XP progress, and mid-run equip of banked gear
-- **Crash-safe runs**: In-progress dungeon runs persist locally and deterministically resume on reload, and explored maps (fog of war) survive reloads too; server-side timeouts and death knock-backs auto-recover
+- **Crash-safe runs**: In-progress dungeon runs persist locally and deterministically resume on reload, and explored maps (fog of war) survive reloads too; a duel's sealed choice for the round is persisted as well, so a reload can still produce its reveal; server-side timeouts and death knock-backs auto-recover
 - **Multiplayer presence**: Other players shown as tokens on the overworld map and listed (active first) in a Players tab
 - **Two-player co-op**: Co-op is local: you meet a partner by walking into the same confirmed segment through your own gates. Step onto a gate and pick "wait here for a partner" or "join" someone already waiting, or use the Co-op tab, which lists only the runs reachable from where you stand. Each player spawns at the gate they came in through, then you play one shared dungeon in rounds of one action each; your partner is drawn in the dungeon and on the minimap, kill rewards split by damage dealt, and the run settles on-chain by mutual consent (`sc` confirm + `s` settle). Checkpoint confirms go out during the run, so if a partner vanishes the sidebar offers **Continue alone from their checkpoint** once their last checkpoint is old enough, and the survivor finishes solo and settles with `solo_from`
 - **Player-vs-player duels**: The same gate that opens a co-op run can open a **duel** instead: stake gold (or nothing), and the challenger who walks in from their own side matches it. Each round is commit / reveal / apply, so neither side can see the other's choice before making their own, and the round's RNG is reseeded from both revealed salts. You attack by bumping into your opponent, the arena shows both HP bars and the round phase, and walking out through a gate is a concession, not an escape: the last one standing takes the pot and banks XP for it
@@ -84,6 +84,19 @@ own gates, so both players have to be standing next to it first.
 4. When the run is over, settlement is automatic: the other player sends an `sc` confirm of the merged action log, and participant 0 (first in canonical name order, not necessarily the host) sends the `s` settle once that confirm is on chain
 5. During the run each client also sends periodic `sc` checkpoint confirms (every `COOP_CHECKPOINT_ACTIONS` applied actions, and at least every `COOP_HEARTBEAT_MS` as a heartbeat). The sidebar shows the partner's last checkpoint and its age; once it is `ABANDON_WINDOW_BLOCKS` old, **Continue alone from their checkpoint** rebuilds the run at that checkpoint, marks the partner absent, and lets the survivor play out and settle solo (`s` with `solo_from`). All three constants live in `src/config.ts`
 
+Leaving a live run is explicit: **Leave the run…** in the sidebar and in the
+Co-op tab opens a panel listing every route out (the gate under you, or settling
+without a stale partner) with what each costs and why the ones you cannot take
+right now are closed. The same panel opens by itself when you arrive on a gate,
+and on Enter. During the run your own moves may sit a couple ahead of the engine
+rather than being refused until the previous round closes.
+
+You can host or join another run from inside a live one, which has to leave by a
+specific gate. Rather than refusing, the client *arms* the choice: a sidebar
+banner names the gate and offers a cancel, the run opens by itself the moment
+you step onto that gate (your current run settling on the way out), and the
+intent retires itself if the target run closes or you leave the segment.
+
 `npm run coop` drives this flow end to end in two headless browsers (see `tests/e2e/README.md`).
 
 ### Duels (two browsers)
@@ -91,9 +104,10 @@ own gates, so both players have to be standing next to it first.
 A duel is hosted from the same gate dialog as a co-op run, and reaches the same
 segment, so both players still have to be standing next to it first.
 
-1. Player A steps onto the gate and picks **Wait here for a duel**, then a stake
-   from the presets (0, 10, 25, 50, 100 gold, filtered to what they hold). The
-   stake leaves the purse immediately and sits in escrow
+1. Player A steps onto the gate and picks **Wait here for a duel**, then names a
+   stake: a number field capped at what they actually hold, with quick picks for
+   nothing, a quarter, a half and all of it. The stake leaves the purse
+   immediately and sits in escrow
 2. Player B walks to their own gate into that segment and sees the mode and the
    stake before joining; a stake they cannot cover is shown as a disabled choice
    saying what they hold, rather than a move the chain would reject
@@ -101,10 +115,13 @@ segment, so both players still have to be standing next to it first.
    commit step, and the client emits the reveal and then the sealed action as the
    opponent's messages arrive. The round is reseeded from both revealed salts,
    so neither side can bias it. A player who stalls is carried by a fixed tick
-   that runs from the round opening
-4. Bump into your opponent to attack. Stepping onto a gate warns that Enter is a
-   forfeit, and the confirm spells out the cost: the opponent wins on the spot
-   and takes the pot, and you take the ordinary death outcome with your finds lost
+   that runs from the round opening. Input is only taken at the commit step, and
+   a key pressed outside it says which phase the round is in rather than being
+   dropped in silence
+4. Bump into your opponent to attack. Walking onto a gate opens **Leaving the
+   duel**, which spells out the cost of the only route out: conceding means the
+   opponent wins on the spot and takes the pot, and you take the ordinary death
+   outcome with your finds lost
 5. Settlement is the co-op path with a duel claim: survival means *won*, the
    winner's gold includes the pot less the rake (`DUEL_RAKE_PERCENT`, 0 today)
    and their XP includes `DUEL_XP_BASE` (20) per level of the loser. Both
@@ -164,7 +181,7 @@ src/
     coop_test.ts            Two-runner convergence test over an in-memory relay (`npm test`)
     duel_test.ts            Two-client duel convergence test, each with its own secret salt (`npm test`)
   ui/
-    modal.ts                Error/confirm dialogs
+    modal.ts                Error/confirm/choice dialogs and the amount (stake) picker
     overlay.ts              Overlay rendering
 tests/e2e/                  Headless Playwright harness + soak bots (see tests/e2e/README.md)
 dist/                       Compiled JS + source maps
