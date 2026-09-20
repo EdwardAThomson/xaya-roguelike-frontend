@@ -95,10 +95,13 @@ the frontend built (`npx tsc` → `dist/`), the xayax venv at
   proof well past anything the tests cover.
 - `npm run duel` — a full two-player duel through the real UI
   (`duel.mjs`): one player walks onto a gate, picks "Wait here for a
-  duel" and types the largest stake the character can cover into the stake
-  field, the challenger joins from their own side of the same
-  gate, and they bump into each other until one falls. It drives the real
-  DOM because hosting a duel has no debug hook. Headed by default; env:
+  duel", types the largest stake the character can cover into the stake
+  field and then a floor of 1 into the minimum field, the challenger joins
+  from their own side of the same gate putting up only that floor, and they
+  bump into each other until one falls. The run fails if the on-chain pot is
+  simply twice the host's stake, so a silently matched join cannot pass for
+  an uneven one. It drives the real DOM because hosting a duel has no debug
+  hook. Headed by default; env:
   `ROG_HEADLESS=1`, `ROG_URL`, `ROG_MAX_MIN` (default 12), `ROG_A` /
   `ROG_B` to reuse existing characters (they need gold to stake).
 - `npm run duel:evil` — the adversarial duel suite (`duel_adversarial.mjs`):

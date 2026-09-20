@@ -106,11 +106,18 @@ segment, so both players still have to be standing next to it first.
 
 1. Player A steps onto the gate and picks **Wait here for a duel**, then names a
    stake: a number field capped at what they actually hold, with quick picks for
-   nothing, a quarter, a half and all of it. The stake leaves the purse
+   nothing, a quarter, a half and all of it. A second field then sets the
+   **floor**, the least a challenger may put up (sent as `min_stake` on the `v`
+   move); it defaults to the host's own stake, which is the old matched-stakes
+   behaviour, and a stake of 0 skips the question. The stake leaves the purse
    immediately and sits in escrow
-2. Player B walks to their own gate into that segment and sees the mode and the
-   stake before joining; a stake they cannot cover is shown as a disabled choice
-   saying what they hold, rather than a move the chain would reject
+2. Player B walks to their own gate into that segment and sees the mode, the
+   host's stake and the floor before joining; if they cannot cover the floor the
+   choice is disabled and says what they hold, rather than a move the chain
+   would reject. Otherwise they name their **own** stake, from the floor up to
+   their whole purse (sent as `stake` on the `j` move); it need not match the
+   host's, and the pot is the sum of the two. Arming a duel join from inside a
+   run asks for the amount up front and seals it with the intent
 3. Each round runs commit → reveal → apply: the player chooses once, at the
    commit step, and the client emits the reveal and then the sealed action as the
    opponent's messages arrive. The round is reseeded from both revealed salts,
