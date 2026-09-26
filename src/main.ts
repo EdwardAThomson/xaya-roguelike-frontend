@@ -33,7 +33,7 @@ import { drawDungeonMap } from "./render/dungeonmap.js";
 import {
   DEFAULT_GSP_URL, DEFAULT_PROXY_URL, isHostedOrigin,
   ABANDON_WINDOW_BLOCKS, COOP_CHECKPOINT_ACTIONS, COOP_HEARTBEAT_MS,
-  COMPACT_ACTIONS,
+  COMPACT_ACTIONS, MAX_BAG_ROWS,
 } from "./config.js";
 
 /** A solo action proof for xc / gw: compact string or the JSON array. */
@@ -60,7 +60,8 @@ import {
   discoveryCooldownRemaining, neighbour, segName,
 } from "./net/validator.js";
 import { waitForMove, MoveOutcome } from "./net/pending.js";
-import { showErrorModal, showModal, showConfirmModal, showChoiceModal, showAmountModal } from "./ui/modal.js";
+import { showErrorModal, showModal, showConfirmModal, showChoiceModal, showAmountModal,
+         showItemStakeModal, type ItemStakeRow } from "./ui/modal.js";
 import { showOverlay, hideOverlay } from "./ui/overlay.js";
 import { lookupItem } from "./game/items.js";
 
@@ -251,8 +252,13 @@ const CLIENT_RULES_VERSION = 1;
 /** What settlement awards; see BANKING_VERSION in rules.hpp.
  *  2: asymmetric duel stakes (the host posts a floor, each side escrows its
  *  own amount, the pot is the sum, a void refunds each exactly what they
- *  put in).  This client sends and displays those, so it is a 2. */
-const CLIENT_BANKING_VERSION = 2;
+ *  put in).
+ *  3: item stakes.  A duellist may put up bag rows as well as gold, valued
+ *  at ItemDef.value times quantity against the floor; the winner receives
+ *  them before the run's own loot is banked, and a join is refused when
+ *  either side lacks the bag space to receive what the other put up.  This
+ *  client picks and displays those, so it is a 3. */
+const CLIENT_BANKING_VERSION = 3;
 
 /**
  * Null while the versions agree (or the GSP is too old to say), otherwise
@@ -1689,6 +1695,13 @@ function inCoopLobby(): boolean {
  * equal their stake: the point of an uneven duel is the underdog risking
  * less, so this opens at the floor rather than at the host's ante.
  */
+/** The open visit with this id, if it is one we could join from here. */
+function visitById(visitId: number): JoinableVisit | null {
+  const from = connState?.player?.segment;
+  if (!from) return null;
+  return joinableVisits(from).find(j => j.visit.id === visitId) ?? null;
+}
+
 function showJoinStakeModal(visitId: number, dir: string, hostStake: number,
                             floor: number, gold: number): void {
   showAmountModal({
@@ -1699,19 +1712,184 @@ function showJoinStakeModal(visitId: number, dir: string, hostStake: number,
       `joins theirs in the pot and the winner takes all of it, so risking ` +
       `${floor === 0 ? "nothing" : String(floor)} against their ${hostStake} is a cheap shot ` +
       `worth taking if you fancy your chances. You hold ${gold} gold.`,
-    label: "Your stake",
-    min: floor,
+    label: "Your gold",
+    min: 0,
     max: gold,
-    initial: floor,
+    initial: Math.min(floor, gold),
     presets: [
-      [`Least (${floor})`, floor],
-      ...(hostStake >= floor && hostStake <= gold
+      ["Nothing", 0],
+      ...(floor > 0 && floor <= gold
+        ? [[`The floor (${floor})`, floor] as [string, number]] : []),
+      ...(hostStake > 0 && hostStake <= gold && hostStake !== floor
         ? [[`Match them (${hostStake})`, hostStake] as [string, number]] : []),
-      ...(gold > floor ? [[`All ${gold}`, gold] as [string, number]] : []),
+      ...(gold > 0 ? [[`All ${gold}`, gold] as [string, number]] : []),
     ],
-    confirmLabel: "Walk in",
+    confirmLabel: "Next",
     cancelLabel: "Never mind",
-    onConfirm: (stake) => { void doCoopJoin(visitId, dir, stake); },
+    onConfirm: (stake) => showJoinItemsModal(visitId, dir, stake, floor),
+  });
+}
+
+/**
+ * Items the challenger puts up, and the last step before walking in.
+ *
+ * This is where the floor is enforced, on gold plus item worth together,
+ * because that total is what the GSP compares with min_stake. It is also
+ * where the bag-space warning belongs: what the host staked is known here,
+ * and winning it is what could overflow the bag.
+ */
+function showJoinItemsModal(visitId: number, dir: string, stake: number,
+                            floor: number): void {
+  const staked = visitById(visitId)?.visit.staked_items ?? [];
+  const rows = stakeableRows();
+  const incoming = staked.length;
+  const spoils = staked.length === 0
+    ? ""
+    : ` They have put up ${staked.map(i => i.quantity > 1
+        ? `${i.quantity}x ${lookupItem(i.item_id)?.name ?? i.item_id}`
+        : (lookupItem(i.item_id)?.name ?? i.item_id)).join(", ")}, ` +
+      `which you take if you win.`;
+
+  if (rows.length === 0) {
+    // Nothing to offer.  Gold alone has to clear the floor, and if it does
+    // not, say so plainly rather than opening an empty picker.
+    if (stake < floor) {
+      showErrorModal("Not enough to take them on",
+        `This duel asks for ${floor} and you can only put up ${stake}. ` +
+        `Your bag is empty, so there is nothing to make up the difference ` +
+        `with. ${shortfallAdvice(floor - stake)}`);
+      return;
+    }
+    const warn = bagSpaceWarning(incoming);
+    if (warn) { showErrorModal("No room to win", warn); return; }
+    void doCoopJoin(visitId, dir, stake, []);
+    return;
+  }
+
+  showItemStakeModal({
+    title: "Anything from your bag?",
+    message:
+      `You can make up the stake with items as well as gold, and they are ` +
+      `locked until the duel settles.${spoils}`,
+    rows,
+    goldWorth: stake,
+    floor,
+    warning: () => bagSpaceWarning(incoming),
+    shortfall: shortfallAdvice,
+    confirmLabel: "Walk in",
+    cancelLabel: "Back",
+    onConfirm: (rowids) => { void doCoopJoin(visitId, dir, stake, rowids); },
+  });
+}
+
+/**
+ * The bag rows this player could stake, with what each is worth.
+ *
+ * Bag rows only: the GSP refuses to escrow equipped gear, so wagering a
+ * sword means unequipping it first.  Whole rows only as well, which is why
+ * a stack shows as one entry worth the whole stack.
+ */
+function stakeableRows(): ItemStakeRow[] {
+  const inv = connState?.player?.inventory ?? [];
+  return inv.filter(i => i.slot === "bag").map(i => {
+    const def = lookupItem(i.item_id);
+    const worth = (def?.value ?? 0) * i.quantity;
+    return {
+      rowid: i.rowid,
+      label: i.quantity > 1
+        ? `${i.quantity}x ${def?.name ?? i.item_id}`
+        : (def?.name ?? i.item_id),
+      detail: `worth ${worth}`,
+      worth,
+    };
+  }).filter(r => r.worth > 0);
+}
+
+/**
+ * Equipped rows that could be unequipped and then staked, cheapest first.
+ *
+ * Only bag rows are stakeable, so a player short of a duel's floor is very
+ * often short only because their value is worn rather than carried. Telling
+ * them that is the difference between a dialog that refuses them and one
+ * that shows them the way through.
+ */
+function unequippableWorth(): Array<{ name: string; worth: number }> {
+  const inv = connState?.player?.inventory ?? [];
+  return inv
+    .filter(i => i.slot !== "bag")
+    .map(i => {
+      const def = lookupItem(i.item_id);
+      return { name: def?.name ?? i.item_id,
+               worth: (def?.value ?? 0) * i.quantity };
+    })
+    .filter(i => i.worth > 0)
+    .sort((a, b) => a.worth - b.worth);
+}
+
+/**
+ * Says how to close a shortfall of `short`, naming the gear that would do
+ * it.  Falls back to the bare fact when nothing they own would help.
+ */
+function shortfallAdvice(short: number): string {
+  const worn = unequippableWorth();
+  const enough = worn.filter(w => w.worth >= short);
+  if (enough.length > 0) {
+    const pick = enough[0];
+    return `Short by ${short}. Unequipping your ${pick.name} (worth ` +
+           `${pick.worth}) would cover it, then stake it here.`;
+  }
+  const all = worn.reduce((n, w) => n + w.worth, 0);
+  if (all >= short) {
+    return `Short by ${short}. Unequipping your gear (${worn.map(
+      w => `${w.name} ${w.worth}`).join(", ")}) would get you there.`;
+  }
+  return `Short by ${short}, and everything you own would not cover it. ` +
+         `This duel is out of your reach.`;
+}
+
+/** Bag rows free, for the warning about winning more than will fit. */
+function freeBagRows(): number {
+  const inv = connState?.player?.inventory ?? [];
+  return MAX_BAG_ROWS - inv.filter(i => i.slot === "bag").length;
+}
+
+/**
+ * Warns when what the OPPONENT put up would not fit if we won it.  The GSP
+ * refuses such a join outright (it will not let a duel reach a settlement
+ * it cannot pay out), so this only explains it before the move is sent.
+ * `incoming` is the number of rows we would receive.
+ */
+function bagSpaceWarning(incoming: number): string | null {
+  const free = freeBagRows();
+  if (incoming <= free) return null;
+  return `Your bag has ${free} free row${free === 1 ? "" : "s"} and winning ` +
+         `would hand you ${incoming}. Make room first or the duel will be refused.`;
+}
+
+/**
+ * Bag rows to stake, between picking the gold and setting the floor.  The
+ * floor is measured against gold plus item worth, so this runs before it.
+ */
+function showDuelItemsModal(dir: string, stake: number,
+                            armFor?: SegmentRef): void {
+  const rows = stakeableRows();
+  if (rows.length === 0) {
+    // Nothing to offer; skip the step rather than show an empty dialog.
+    showDuelFloorModal(dir, stake, [], armFor);
+    return;
+  }
+  showItemStakeModal({
+    title: "Anything from your bag?",
+    message:
+      `You can wager items as well as gold. The winner takes them, and ` +
+      `they are locked until the duel settles, so you cannot drink a ` +
+      `staked potion or equip a staked sword in the meantime. Equipped ` +
+      `gear cannot be staked; unequip it first if you want to put it up.`,
+    rows,
+    goldWorth: stake,
+    confirmLabel: "Next",
+    cancelLabel: "Back",
+    onConfirm: (rowids) => showDuelFloorModal(dir, stake, rowids, armFor),
   });
 }
 
@@ -1730,7 +1908,7 @@ function showDuelStakeModal(dir: string, armFor?: SegmentRef): void {
     presets: stakePresets(gold),
     confirmLabel: "Next",
     cancelLabel: "Never mind",
-    onConfirm: (stake) => showDuelFloorModal(dir, stake, armFor),
+    onConfirm: (stake) => showDuelItemsModal(dir, stake, armFor),
   });
 }
 
@@ -1742,37 +1920,54 @@ function showDuelStakeModal(dir: string, armFor?: SegmentRef): void {
  * host's own stake reproduces matched stakes exactly.
  */
 function showDuelFloorModal(dir: string, stake: number,
+                            stakeItems: number[],
                             armFor?: SegmentRef): void {
-  if (stake === 0) {
+  // The floor is measured against everything put up, gold and items
+  // together, because that is the sum the GSP compares with min_stake.
+  const rows = stakeableRows();
+  const itemWorth = rows.filter(r => stakeItems.includes(r.rowid))
+                        .reduce((n, r) => n + r.worth, 0);
+  const worth = stake + itemWorth;
+  if (worth === 0) {
     // Nothing to protect: a friendly duel has no floor to set.
     if (armFor) armIntent({ kind: "duel", dir, seg: armFor, stake, minStake: 0,
-                            from: connState!.player!.segment });
-    else void doCoopHost(dir, stake, 0);
+                            stakeItems, from: connState!.player!.segment });
+    else void doCoopHost(dir, stake, 0, stakeItems);
     return;
   }
   showAmountModal({
     title: "The least they may risk",
     message:
-      `You are staking ${stake}. A challenger must put up at least this ` +
-      `much to take you on, and may put up more. Set it low to let an ` +
-      `underdog take a cheap shot at you; set it to ${stake} to insist they ` +
-      `match you, which is how duels worked before.`,
+      `You are putting up ${worth}${itemWorth > 0
+        ? ` (${stake} gold and ${itemWorth} in items)` : ""}. A challenger ` +
+      `must put up at least this much to take you on, in gold or items of ` +
+      `their own, and may put up more. Set it low to let an underdog take ` +
+      `a cheap shot at you; set it to ${worth} to insist they match you.` +
+      (itemWorth > 0
+        ? ` Bear in mind that items are lumpy: insisting on ${worth} may ` +
+          `mean nobody can accept without stripping their own gear, so a ` +
+          `high floor on an item duel is a duel that sits empty.`
+        : ""),
     label: "Minimum",
     min: 0,
-    max: stake,
-    initial: stake,
+    max: worth,
+    // Gold-only duels open at "match me", exactly as they always have.  An
+    // item stake opens at half instead: matching a specific sword means the
+    // challenger needs comparable gear, and defaulting to that produces
+    // duels nobody can join (which is how this was found).
+    initial: itemWorth > 0 ? Math.floor(worth / 2) : worth,
     presets: [
       ["Anything (0)", 0],
-      ...(stake >= 4 ? [[`Quarter (${Math.floor(stake / 4)})`, Math.floor(stake / 4)] as [string, number]] : []),
-      ...(stake >= 2 ? [[`Half (${Math.floor(stake / 2)})`, Math.floor(stake / 2)] as [string, number]] : []),
-      [`Match me (${stake})`, stake],
+      ...(worth >= 4 ? [[`Quarter (${Math.floor(worth / 4)})`, Math.floor(worth / 4)] as [string, number]] : []),
+      ...(worth >= 2 ? [[`Half (${Math.floor(worth / 2)})`, Math.floor(worth / 2)] as [string, number]] : []),
+      [`Match me (${worth})`, worth],
     ],
     confirmLabel: "Open the duel",
     cancelLabel: "Back",
     onConfirm: (minStake) => {
       if (armFor) armIntent({ kind: "duel", dir, seg: armFor, stake, minStake,
-                              from: connState!.player!.segment });
-      else void doCoopHost(dir, stake, minStake);
+                              stakeItems, from: connState!.player!.segment });
+      else void doCoopHost(dir, stake, minStake, stakeItems);
     },
   });
 }
@@ -1812,7 +2007,8 @@ function inCoopVisitNow(): boolean {
 }
 
 async function doCoopHost(dir: string, duelStake?: number,
-                          duelMinStake?: number): Promise<void> {
+                          duelMinStake?: number,
+                          duelStakeItems?: number[]): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
   if (rulesMismatch) { showErrorModal("Client out of date", rulesMismatch); return; }
   const p = connState.player;
@@ -1841,7 +2037,8 @@ async function doCoopHost(dir: string, duelStake?: number,
     await moves.visit(connState.playerName, dir, settlement ?? undefined,
                       duelStake === undefined
                         ? undefined
-                        : { stake: duelStake, minStake: duelMinStake });
+                        : { stake: duelStake, minStake: duelMinStake,
+                            stakeItems: duelStakeItems });
     const outcome = await waitForMove(connection, ({ player }) =>
       !!player?.active_visit && sameSeg(player.active_visit.segment, target));
     if (outcome === "applied") {
@@ -1888,7 +2085,8 @@ async function doCoopHost(dir: string, duelStake?: number,
  * rules as hosting.
  */
 async function doCoopJoin(visitId: number, dir: string,
-                          stake?: number): Promise<void> {
+                          stake?: number,
+                          stakeItems?: number[]): Promise<void> {
   if (rulesMismatch) { showErrorModal("Client out of date", rulesMismatch); return; }
   if (busy || !moves || !connState?.playerName) return;
   const p = connState.player;
@@ -1910,7 +2108,7 @@ async function doCoopJoin(visitId: number, dir: string,
   updateSidebar();
   try {
     await moves.join(connState.playerName, visitId, dir, settlement ?? undefined,
-                     stake);
+                     stake, stakeItems);
     const outcome = await waitForMove(connection, ({ player }) =>
       player?.active_visit?.visit_id === visitId);
     if (outcome === "applied") {
@@ -2024,23 +2222,33 @@ function handleCoopInput(action: string, dir?: Direction): void {
     }
     return;
   }
+  const held = coop.heldIntent;
   if (!coop.submitLocal(a)) {
-    // A duel only takes input during the commit phase of a round, and only
-    // once: every other key press was dropped in silence, which is why
-    // drinking a potion mid-duel looked broken.
     if (session.isDuel()) {
       const now = Date.now();
       if (now - lastInputFullNote > 2500) {
         lastInputFullNote = now;
         session.addMessage(
-          coop.phaseLabel === "choose"
-            ? "You have already sealed your move for this round."
-            : `Not now: the round is ${coop.phaseLabel}. Your next choice opens when it resolves.`,
+          "Not now: this round cannot take a choice. It will open again.",
           "info");
         updateSidebar();
       }
     }
     return;
+  }
+  // A duel press outside the commit window is HELD for the next round
+  // rather than dropped (see CoopRunner.intent). Say so, or the player
+  // sees nothing happen and presses again, which is how a duel ended up
+  // feeling like it ignored you while the tick committed waits for you.
+  if (session.isDuel() && coop.heldIntent !== null && coop.heldIntent !== held) {
+    const now = Date.now();
+    if (now - lastInputFullNote > 1200) {
+      lastInputFullNote = now;
+      session.addMessage(
+        "Standing order: that is what you will do each round until you " +
+        "press something else.", "info");
+      updateSidebar();
+    }
   }
 
   // Arrival on a gate is announced from coopOnChange, once the move has
@@ -3853,6 +4061,8 @@ interface ArmedIntent {
   stake?: number;
   /** Duel host only: the least a challenger may put up. */
   minStake?: number;
+  /** Duel only: bag rowids to escrow alongside the gold. */
+  stakeItems?: number[];
   who?: string;
 }
 let armedIntent: ArmedIntent | null = null;
@@ -3917,8 +4127,9 @@ function fireArmedIntent(dir: string): boolean {
   if (!a || a.dir !== dir) return false;
   armedIntent = null;
   if (a.kind === "join" && a.visitId !== undefined)
-    void doCoopJoin(a.visitId, dir, a.stake);
-  else if (a.kind === "duel") void doCoopHost(dir, a.stake ?? 0, a.minStake);
+    void doCoopJoin(a.visitId, dir, a.stake, a.stakeItems);
+  else if (a.kind === "duel")
+    void doCoopHost(dir, a.stake ?? 0, a.minStake, a.stakeItems);
   else void doCoopHost(dir);
   updateSidebar();
   return true;

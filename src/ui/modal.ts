@@ -330,3 +330,145 @@ export function showChoiceModal(opts: ChoiceModalOptions): void {
   (pickable[pickable.length - 1]
     ?? root.querySelector(".modal-cancel") as HTMLButtonElement).focus();
 }
+
+export interface ItemStakeRow {
+  rowid: number;
+  label: string;
+  /** Dimmer second line: what it is, what it is worth. */
+  detail?: string;
+  /** Gold worth of the whole row, ItemDef.value times quantity. */
+  worth: number;
+}
+
+export interface ItemStakeModalOptions {
+  title: string;
+  message: string;
+  rows: ItemStakeRow[];
+  /** Rows ticked when the dialog opens. */
+  initial?: number[];
+  /** Gold already staked, added to the running total but not selectable. */
+  goldWorth?: number;
+  /** Confirm stays disabled until gold plus picked worth reaches this. */
+  floor?: number;
+  /** Live advice under the total; null for none.  Never blocks confirm. */
+  warning?: (picked: number[]) => string | null;
+  /**
+   * What to say when the total is below the floor.  Being told you are
+   * short is useless on its own: the caller knows what WOULD close the
+   * gap (unequipping a sword, usually) and this is where it says so.
+   * `short` is how much is missing.
+   */
+  shortfall?: (short: number) => string;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  onConfirm: (rowids: number[]) => void;
+  onCancel?: () => void;
+}
+
+/**
+ * Picks bag rows to stake on a duel.
+ *
+ * Whole rows only, which is the GSP's rule rather than a UI simplification
+ * (docs/PVP_item_staking_checklist.md decision 3): staking part of a stack
+ * would mean splitting the row at escrow and merging it back on a refund,
+ * so a stack of three potions is all three or none.
+ *
+ * The running total is gold plus the worth of what is ticked, because that
+ * sum is exactly what the GSP measures against a duel's floor.  Equipped
+ * gear never appears: only bag rows are stakeable, and the caller filters
+ * for that.
+ */
+export function showItemStakeModal(opts: ItemStakeModalOptions): void {
+  document.getElementById("modal-root")?.remove();
+
+  const root = document.createElement("div");
+  root.id = "modal-root";
+  root.className = "modal-overlay";
+  const gold = opts.goldWorth ?? 0;
+  const floor = opts.floor ?? 0;
+  const picked = new Set<number>(opts.initial ?? []);
+
+  const list = opts.rows.map(r => `
+    <label class="modal-stake-row" style="display:flex;align-items:flex-start;
+           gap:.5em;padding:.35em .2em;cursor:pointer">
+      <input type="checkbox" data-rowid="${r.rowid}"${
+        picked.has(r.rowid) ? " checked" : ""} style="margin-top:.25em">
+      <span style="flex:1">${escapeHtml(r.label)}${
+        r.detail ? `<span class="modal-choice-detail" style="display:block">${
+          escapeHtml(r.detail)}</span>` : ""}</span>
+    </label>`).join("");
+
+  root.innerHTML = `
+    <div class="modal modal-info" role="alertdialog" aria-modal="true">
+      <div class="modal-title">${escapeHtml(opts.title)}</div>
+      <div class="modal-body">${escapeHtml(opts.message)}</div>
+      ${opts.rows.length
+        ? `<div class="modal-stake-list" style="max-height:15em;overflow-y:auto;
+             margin:.5em 0;border-top:1px solid rgba(128,128,128,.3);
+             border-bottom:1px solid rgba(128,128,128,.3)">${list}</div>`
+        : `<div class="modal-body" style="opacity:.7">Your bag is empty, so
+             there is nothing to stake. Unequip something first if you want
+             to wager it.</div>`}
+      <div class="modal-stake-total" style="font-weight:600;margin:.3em 0"></div>
+      <div class="modal-stake-warning modal-amount-error" hidden></div>
+      <div class="modal-actions">
+        <button class="modal-cancel">${escapeHtml(opts.cancelLabel ?? "Cancel")}</button>
+        <button class="modal-dismiss modal-confirm">${
+          escapeHtml(opts.confirmLabel ?? "Confirm")}</button>
+      </div>
+    </div>
+  `;
+
+  const totalEl = root.querySelector(".modal-stake-total") as HTMLElement;
+  const warnEl = root.querySelector(".modal-stake-warning") as HTMLElement;
+  const confirm = root.querySelector(".modal-confirm") as HTMLButtonElement;
+
+  const refresh = () => {
+    const rowids = [...picked];
+    const items = opts.rows
+      .filter(r => picked.has(r.rowid))
+      .reduce((n, r) => n + r.worth, 0);
+    const total = gold + items;
+    totalEl.textContent = gold > 0
+      ? `Putting up ${gold} gold + ${items} in items = ${total}`
+      : `Putting up ${items} in items`;
+    const short = total < floor;
+    confirm.disabled = short;
+    const advice = short
+      ? (opts.shortfall?.(floor - total)
+         ?? `That is below the ${floor} this duel asks for.`)
+      : (opts.warning?.(rowids) ?? null);
+    warnEl.textContent = advice ?? "";
+    warnEl.hidden = advice === null;
+  };
+
+  const close = (accept: boolean) => {
+    root.remove();
+    document.removeEventListener("keydown", onKey);
+    if (accept) opts.onConfirm([...picked]);
+    else opts.onCancel?.();
+  };
+
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape") { e.preventDefault(); close(false); }
+    else if (e.key === "Enter" && !confirm.disabled) {
+      e.preventDefault(); close(true);
+    }
+  };
+
+  root.querySelectorAll<HTMLInputElement>("input[type=checkbox]").forEach(cb => {
+    cb.addEventListener("change", () => {
+      const id = Number(cb.dataset.rowid);
+      if (cb.checked) picked.add(id); else picked.delete(id);
+      refresh();
+    });
+  });
+  root.addEventListener("click", (e) => { if (e.target === root) close(false); });
+  root.querySelector(".modal-cancel")!.addEventListener("click", () => close(false));
+  confirm.addEventListener("click", () => { if (!confirm.disabled) close(true); });
+  document.addEventListener("keydown", onKey);
+
+  document.body.appendChild(root);
+  refresh();
+  confirm.focus();
+}

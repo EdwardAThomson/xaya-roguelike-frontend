@@ -134,6 +134,14 @@ export interface VisitSummary {
   /** The least a challenger may put up; the host's own stake when unset. */
   min_stake?: number;
   pot?: number;
+  /**
+   * Items escrowed on this visit.  A challenger has to see what is in the
+   * pot to judge the duel, and the COUNT is what says whether winning
+   * would overflow their bag (the GSP refuses such a join). Rowids are
+   * deliberately not sent: they are the owner's handle on their own
+   * inventory. Absent from an older GSP, which reads as nothing staked.
+   */
+  staked_items?: Array<{ item_id: string; quantity: number; worth: number }>;
 }
 
 /** Full detail of one visit (`getvisitinfo`). */
