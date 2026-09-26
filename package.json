@@ -15,7 +15,9 @@
     "coop": "node tests/e2e/coop.mjs",
     "coop:play": "node tests/e2e/coop_play.mjs",
     "duel": "node tests/e2e/duel.mjs",
-    "duel:evil": "node tests/e2e/duel_adversarial.mjs"
+    "duel:evil": "node tests/e2e/duel_adversarial.mjs",
+    "duel:bot": "node tests/e2e/duel_bot.mjs",
+    "duel:bots": "node tests/e2e/duel_bots.mjs"
   },
   "repository": {
     "type": "git",
