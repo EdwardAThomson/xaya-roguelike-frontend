@@ -20,7 +20,7 @@ Browser-based frontend for the [Xaya Roguelike](https://github.com/EdwardAThomso
 - **Crash-safe runs**: In-progress dungeon runs persist locally and deterministically resume on reload, and explored maps (fog of war) survive reloads too; a duel's sealed choice for the round is persisted as well, so a reload can still produce its reveal; server-side timeouts and death knock-backs auto-recover
 - **Multiplayer presence**: Other players shown as tokens on the overworld map and listed (active first) in a Players tab
 - **Two-player co-op**: Co-op is local: you meet a partner by walking into the same confirmed segment through your own gates. Step onto a gate and pick "wait here for a partner" or "join" someone already waiting, or use the Co-op tab, which lists only the runs reachable from where you stand. Each player spawns at the gate they came in through, then you play one shared dungeon in rounds of one action each; your partner is drawn in the dungeon and on the minimap, kill rewards split by damage dealt, and the run settles on-chain by mutual consent (`sc` confirm + `s` settle). Checkpoint confirms go out during the run, so if a partner vanishes the sidebar offers **Continue alone from their checkpoint** once their last checkpoint is old enough, and the survivor finishes solo and settles with `solo_from`
-- **Player-vs-player duels**: The same gate that opens a co-op run can open a **duel** instead: stake gold (or nothing), and the challenger who walks in from their own side matches it. Each round is commit / reveal / apply, so neither side can see the other's choice before making their own, and the round's RNG is reseeded from both revealed salts. You attack by bumping into your opponent, the arena shows both HP bars and the round phase, and walking out through a gate is a concession, not an escape: the last one standing takes the pot and banks XP for it
+- **Player-vs-player duels**: The same gate that opens a co-op run can open a **duel** instead: stake gold, items from your bag, or nothing, and the challenger who walks in from their own side puts up at least the host's floor. Each round is commit / reveal / apply, so neither side can see the other's choice before making their own, and the round's RNG is reseeded from both revealed salts. You attack by bumping into your opponent, the arena shows both HP bars and the round phase, and walking out through a gate is a concession, not an escape: the last one standing takes the pot and banks XP for it
 - **Account picker**: On a hosted deploy, Play opens a character chooser listing the characters this browser has already claimed, plus a "new character" form that registers on-chain; local dev keeps the name + Connect controls in the topbar
 - **Channel integration**: Enter dungeons using real on-chain player stats, exit with cryptographic replay proof
 - **Deterministic**: Dungeon generation and RNG verified identical to C++ backend (SHA-256 + MT19937)
@@ -110,21 +110,31 @@ segment, so both players still have to be standing next to it first.
    **floor**, the least a challenger may put up (sent as `min_stake` on the `v`
    move); it defaults to the host's own stake, which is the old matched-stakes
    behaviour, and a stake of 0 skips the question. The stake leaves the purse
-   immediately and sits in escrow
+   immediately and sits in escrow. Between the two, a picker offers every
+   stakeable **bag** row with what it is worth (`stake_items` on the `v` move),
+   with a running "gold + items = total" line, because the floor is measured
+   against that total. Equipped gear cannot be staked. When items are part of
+   the stake the floor defaults to half the total rather than all of it, since
+   matching a specific sword would make the duel unjoinable
 2. Player B walks to their own gate into that segment and sees the mode, the
    host's stake and the floor before joining; if they cannot cover the floor the
    choice is disabled and says what they hold, rather than a move the chain
    would reject. Otherwise they name their **own** stake, from the floor up to
-   their whole purse (sent as `stake` on the `j` move); it need not match the
-   host's, and the pot is the sum of the two. Arming a duel join from inside a
+   their whole purse (sent as `stake` on the `j` move), then pick bag rows to
+   add (`stake_items` on the `j` move); the floor is enforced on gold plus item
+   worth, so a player with no gold can still join with a sword. The picker names
+   what the host put up, warns when winning would overflow the bag
+   (`MAX_BAG_ROWS` in `src/config.ts`), and when short of the floor names the
+   cheapest worn piece of gear that would cover the gap. Stakes need not match,
+   and the pot is the sum of the two. Arming a duel join from inside a
    run asks for the amount up front and seals it with the intent
 3. Each round runs commit → reveal → apply: the player chooses once, at the
    commit step, and the client emits the reveal and then the sealed action as the
    opponent's messages arrive. The round is reseeded from both revealed salts,
    so neither side can bias it. A player who stalls is carried by a fixed tick
-   that runs from the round opening. Input is only taken at the commit step, and
-   a key pressed outside it says which phase the round is in rather than being
-   dropped in silence
+   that runs from the round opening. A key pressed outside the commit step is
+   held and committed as soon as the next round opens, instead of being dropped
+   and replaced by a wait; it counts for one round only, not as a standing order
 4. Bump into your opponent to attack. Walking onto a gate opens **Leaving the
    duel**, which spells out the cost of the only route out: conceding means the
    opponent wins on the spot and takes the pot, and you take the ordinary death
@@ -144,7 +154,10 @@ and carries on, since only the projected rewards would be wrong.
 `npm run duel` drives a full two-browser duel through the real UI, and
 `npm run duel:evil` runs the adversarial suite: two Node actors holding their own
 copy of the engine fight honestly, then take turns trying to steal the result
-over the real move path (see `tests/e2e/README.md`).
+over the real move path. `npm run duel:bot` is a headless opponent for a human
+(it joins an open duel, or hosts one with `ROG_BOT_OPEN=1`), and
+`npm run duel:bots` has two of them fight a staked duel and checks the chain
+(see `tests/e2e/README.md`).
 
 ## Project structure
 

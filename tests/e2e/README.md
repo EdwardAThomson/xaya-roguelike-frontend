@@ -116,6 +116,21 @@ the frontend built (`npx tsc` → `dist/`), the xayax venv at
   refusals would prove nothing. The wrong-token relay case reports itself
   as skipped on a devnet with claim tokens off, and the script says how to
   turn them on. Needs a devnet; the static server is not required.
+- `npm run duel:bot`: a headless duel opponent (`duel_bot.mjs`), so one
+  person can test a duel from a browser. It joins an open duel (or hosts
+  one with `ROG_BOT_OPEN=1`, re-hosting until joined) and plays it by
+  driving the real `CoopRunner` over the real relay, sending the checkpoint
+  confirms the browser would, so the human can settle. It closes in on its
+  opponent orthogonally so an arrow-key player can reach it. Env:
+  `ROG_BOT` (name), `ROG_HOST` (only join this player's duels),
+  `ROG_BOT_STAKE_ITEMS=0` (do not stake the bot's bag), `ROG_BOT_WAIT`
+  (seconds, default 300), `ROG_BOT_CONCEDE=1` (walk out and concede),
+  `ROG_BOT_DIR` (gate, default east). Needs a devnet and a confirmed arena.
+- `npm run duel:bots`: two `duel:bot` processes fight a staked duel in one
+  command (`duel_bots.mjs`), then it asserts against the chain that a duel
+  completed and that exactly one bag grew while the other shrank, so escrow
+  and the item transfer run live. Env: `ROG_BOTS_STAKE=0` (fight for
+  nothing), `ROG_BOTS_TIMEOUT` (seconds, default 300). Needs a devnet.
 - `npm run compete` — scripted competition tests with hard assertions
   (`compete.mjs`): coordinate race (one winner), provisional access +
   confirm-unlocks-others, concurrent reward/ownership isolation. Needs a
