@@ -263,8 +263,13 @@ const CLIENT_RULES_VERSION = 1;
  *  at ItemDef.value times quantity against the floor; the winner receives
  *  them before the run's own loot is banked, and a join is refused when
  *  either side lacks the bag space to receive what the other put up.  This
- *  client picks and displays those, so it is a 3. */
-const CLIENT_BANKING_VERSION = 3;
+ *  client picks and displays those, so it is a 3.
+ *  4: opening confirms. Activating a visit records a length-0 confirm for
+ *  every participant, so someone who joins and never runs a client can
+ *  still be abandoned normally instead of freezing their opponent until
+ *  the void timeout. This client's own opening confirm is unchanged and
+ *  becomes a duplicate. */
+const CLIENT_BANKING_VERSION = 4;
 
 /**
  * Null while the versions agree (or the GSP is too old to say), otherwise
