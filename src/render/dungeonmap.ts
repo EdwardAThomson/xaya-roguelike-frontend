@@ -152,20 +152,29 @@ export function drawDungeonMap(
     if (q.dead || q.exited || !fov.isVisible(q.x, q.y)) continue;
     const qx = offX + q.x * cell + cell / 2;
     const qy = offY + q.y * cell + cell / 2;
-    ctx.fillStyle = "#3cb8b0";
+    // Red for a duel opponent: on a map at this scale a hostile figure
+    // reading as a teammate is worse than no marker at all.
+    ctx.fillStyle = session.isDuel() ? "#d9534f" : "#3cb8b0";
     ctx.beginPath();
     ctx.arc(qx, qy, Math.max(2.5, cell / 1.4), 0, Math.PI * 2);
     ctx.fill();
   }
 
-  // Player position (always drawn on top).
+  // Player position (always drawn on top), ringed so which dot is YOU does
+  // not rest on telling gold from teal at a few pixels across.
   const meP = session.players[meIndex];
   const px = offX + meP.x * cell + cell / 2;
   const py = offY + meP.y * cell + cell / 2;
+  const r = Math.max(2.5, cell / 1.4);
   ctx.fillStyle = "#daa520";
   ctx.beginPath();
-  ctx.arc(px, py, Math.max(2.5, cell / 1.4), 0, Math.PI * 2);
+  ctx.arc(px, py, r, 0, Math.PI * 2);
   ctx.fill();
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = Math.max(1, cell / 8);
+  ctx.beginPath();
+  ctx.arc(px, py, r + ctx.lineWidth, 0, Math.PI * 2);
+  ctx.stroke();
   if (cell >= 5) {
     ctx.fillStyle = "#000";
     ctx.font = `bold ${cell + 1}px monospace`;

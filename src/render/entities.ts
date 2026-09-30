@@ -68,28 +68,60 @@ export function drawGroundItems(ctx: CanvasRenderingContext2D, camera: Camera,
 }
 
 export function drawPlayer(ctx: CanvasRenderingContext2D, camera: Camera,
-                            x: number, y: number, color: string = "#daa520"): void {
+                            x: number, y: number, color: string = "#daa520",
+                            self: boolean = true): void {
   if (!camera.isVisible(x, y)) return;
 
   const [px, py] = camera.toScreen(x, y);
+  const cx = px + TILE_SIZE / 2;
+  const cy = py + TILE_SIZE / 2;
 
-  // Gold circle (a co-op partner gets a different colour).
+  // Gold circle (a co-op partner or a duel opponent gets another colour).
   ctx.fillStyle = color;
   ctx.beginPath();
-  ctx.arc(px + TILE_SIZE / 2, py + TILE_SIZE / 2,
-          TILE_SIZE / 2 - 2, 0, Math.PI * 2);
+  ctx.arc(cx, cy, TILE_SIZE / 2 - 2, 0, Math.PI * 2);
   ctx.fill();
+
+  // Which one is YOU cannot rest on the fill colour alone. Two figures with
+  // the same glyph on a floor of coloured items is genuinely hard to read
+  // mid-fight, and it is unreadable to anyone who does not separate gold
+  // from teal at all. So your own figure gets two marks that survive
+  // without colour: a bright ring, and a caret pointing down at you.
+  if (self) {
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, TILE_SIZE / 2 - 1, 0, Math.PI * 2);
+    ctx.stroke();
+
+    const tip = py - 1;             // just above the tile
+    const halfW = Math.max(3, TILE_SIZE / 6);
+    const h = Math.max(4, TILE_SIZE / 5);
+    ctx.fillStyle = "#fff";
+    ctx.beginPath();
+    ctx.moveTo(cx, tip);            // point, aimed at the figure
+    ctx.lineTo(cx - halfW, tip - h);
+    ctx.lineTo(cx + halfW, tip - h);
+    ctx.closePath();
+    ctx.fill();
+  }
 
   // @ symbol.
   ctx.fillStyle = "#000";
   ctx.font = `bold ${TILE_SIZE - 6}px monospace`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText("@", px + TILE_SIZE / 2, py + TILE_SIZE / 2 + 1);
+  ctx.fillText("@", cx, cy + 1);
 }
 
-/** A co-op partner: same glyph as the player, teal instead of gold. */
+/**
+ * Someone else in the run: the same glyph, and deliberately WITHOUT the
+ * ring and caret, so the marked figure is always you.  Teal for a co-op
+ * partner, red for a duel opponent, because an enemy reading as a
+ * teammate is its own kind of confusion.
+ */
 export function drawPartner(ctx: CanvasRenderingContext2D, camera: Camera,
-                            x: number, y: number): void {
-  drawPlayer(ctx, camera, x, y, "#3cb8b0");
+                            x: number, y: number,
+                            hostile: boolean = false): void {
+  drawPlayer(ctx, camera, x, y, hostile ? "#d9534f" : "#3cb8b0", false);
 }
