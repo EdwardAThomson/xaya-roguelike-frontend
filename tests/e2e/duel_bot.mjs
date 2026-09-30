@@ -40,6 +40,7 @@
 import {
   PROXY, sleep, gsp, move, mine, register, installStorageShim, installClaim,
   setupFromPlayer, constraintsFor, canonicalNames, visitUntil, tokens,
+  ensureArena,
 } from "./duelcore.mjs";
 
 installStorageShim();
@@ -82,6 +83,17 @@ if (process.env.ROG_BOT_STRIP === "1") {
 let active = null;
 
 if (OPEN) {
+  // A duel needs a CONFIRMED arena on the other side of the gate, and on a
+  // fresh chain there is nothing at all. Walk a real run in and out to
+  // confirm one, which is what confirmation means -- rather than expecting
+  // whoever starts the bot to have built the world first.
+  const segs = (await gsp("listsegments", [])) || [];
+  if (!segs.some(x => x.x === 1 && x.y === 0 && x.confirmed)) {
+    log("No arena yet. Confirming (1, 0) with a real run first...");
+    await ensureArena(BOT, DungeonSession);
+    log("Arena (1, 0) confirmed.");
+  }
+
   // An open visit is swept after VISIT_OPEN_TIMEOUT blocks (100), which on
   // a devnet mining every 3 seconds is about five minutes. A bot that hosts
   // once and then waits half an hour is offering a duel that stopped

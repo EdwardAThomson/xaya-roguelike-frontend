@@ -25,8 +25,18 @@ const OPPOSITE = { north: "south", south: "north", east: "west", west: "east" };
 const DIRS = { east: [1, 0], west: [-1, 0], north: [0, 1], south: [0, -1] };
 
 const findings = [];
+/** Set once the fight loop is reached; drives one actor's duel move. */
+let duelStep = null;
 const fail = (m) => { findings.push(m); console.log("  ✗ " + m); };
 const ok = (m) => console.log("  ✓ " + m);
+
+/** Mines blocks on the devnet: the staleness window counts in blocks. */
+async function mineBlocks(blocks) {
+  await fetch(PROXY, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "mine", blocks }),
+  });
+}
 
 async function gsp(method, params = []) {
   const r = await fetch(`${PROXY}/gsp`, {
@@ -35,6 +45,40 @@ async function gsp(method, params = []) {
   });
   const res = (await r.json()).result;
   return res && typeof res === "object" && "data" in res ? res.data : res;
+}
+
+
+/**
+ * Ticks every row in the stake picker and confirms it, returning how many
+ * were staked.  Returns 0 when no picker appears, which is the case for a
+ * character whose bag is empty: the flow skips the step rather than showing
+ * an empty dialog.
+ */
+async function pickAllStakeItems(page, ms = 6000) {
+  const box = await page.waitForSelector(".modal-stake-list", { timeout: ms })
+    .catch(() => null);
+  if (!box) return 0;
+  const rows = await page.$$(".modal-stake-row input[type=checkbox]");
+  for (const r of rows) if (!(await r.isChecked())) await r.check();
+  await page.click(".modal-confirm");
+  await sleep(300);
+  return rows.length;
+}
+
+/** Mirrors page console + errors into the run log, prefixed by actor. */
+function wireDiagnostics(page, name) {
+  page.on("console", (m) => {
+    const t = m.text();
+    if (m.type() === "error" || /reject|refus|fail|cannot|invalid/i.test(t))
+      console.log(`   [${name} console] ${t}`);
+  });
+  page.on("pageerror", (e) => console.log(`   [${name} pageerror] ${e.message}`));
+}
+
+/** Whatever dialog is on screen, for when a step times out silently. */
+async function visibleModal(page) {
+  return page.evaluate(() =>
+    document.getElementById("modal-root")?.innerText?.replace(/\s+/g, " ")?.slice(0, 300) ?? null);
 }
 
 function driver(page, name) {
@@ -121,6 +165,8 @@ function driver(page, name) {
 const browser = await chromium.launch({ headless: !!process.env.ROG_HEADLESS });
 const A = driver(await (await browser.newContext()).newPage(), NAME_A);
 const B = driver(await (await browser.newContext()).newPage(), NAME_B);
+wireDiagnostics(A.page, NAME_A);
+wireDiagnostics(B.page, NAME_B);
 for (const d of [A, B]) {
   d.page.on("pageerror", (e) => fail(`[${d.name}] page error: ${e.message}`));
   // Settlement runs as a floating promise, so a throw inside it surfaces
@@ -185,8 +231,15 @@ try {
   await A.page.fill(".modal-amount-input", String(maxStake));
   await A.page.click(".modal-confirm");
 
-  const floor = maxStake > 0 ? 1 : 0;
-  if (maxStake > 0) {
+  // Then the item picker: a stake can be bag rows as well as gold, so
+  // hosting gained a step between the amount and the floor. Tick
+  // everything, which is what makes the floor non-zero for a character with
+  // no gold and therefore exercises the asymmetric path below.
+  const stakedItems = await pickAllStakeItems(A.page);
+  if (stakedItems > 0) console.log(`   host also staked ${stakedItems} bag row(s)`);
+
+  const floor = maxStake > 0 || stakedItems > 0 ? 1 : 0;
+  if (maxStake > 0 || stakedItems > 0) {
     await A.page.waitForSelector(".modal-amount-input", { timeout: 10000 });
     await A.page.fill(".modal-amount-input", String(floor));
     await A.page.click(".modal-confirm");
@@ -208,7 +261,18 @@ try {
   const myMin = await B.page.$eval(".modal-amount-input", (e) => Number(e.min));
   await B.page.fill(".modal-amount-input", String(myMin));
   await B.page.click(".modal-confirm");
-  await B.until((x) => x.player?.active_visit?.visit_id === visitId, 35000, "to join");
+  // The challenger gets the picker too, and must clear the floor with gold
+  // and items TOGETHER, so a player with no gold can still take the duel.
+  await pickAllStakeItems(B.page);
+  try {
+    await B.until((x) => x.player?.active_visit?.visit_id === visitId, 35000, "to join");
+  } catch (e) {
+    // The join move never reached the chain. Say what the client is showing
+    // and what it thinks its own state is, instead of only "timed out".
+    console.log(`   [${NAME_B} modal] ${await visibleModal(B.page)}`);
+    console.log(`   [${NAME_B} state] ${JSON.stringify(await B.state()).slice(0, 400)}`);
+    throw e;
+  }
   const joined = await gsp("getvisitinfo", [visitId]);
   if (maxStake > 0 && joined.pot === maxStake * 2)
     fail(`pot ${joined.pot} looks like matched stakes; the uneven join did not take`);
@@ -226,6 +290,28 @@ try {
 
   console.log("6. fight");
   const walls = (await A.map()).walls;
+  // One duel move for one actor: attack an adjacent foe, otherwise an
+  // adjacent monster, otherwise step toward the foe. Hoisted so the stall
+  // scenario below can drive a single side with the same logic.
+  duelStep = async (d, wallsFor) => {
+    const st = await d.state();
+    if (st.modal) { await d.closeModal(); return; }
+    if (!st.coop) return;
+    const c = st.coop;
+    const self = c.players[c.me];
+    const foe = c.players[1 - c.me];
+    if (self.dead || self.exited || c.settling || c.pendingOwn || !c.myTurn) return;
+    const sess = st.session;
+    if (!sess) return;
+    if (Math.abs(self.x - foe.x) <= 1 && Math.abs(self.y - foe.y) <= 1)
+      return d.call("input", "move", foe.x - self.x, foe.y - self.y);
+    const mon = sess.monsters.find(
+      (m) => Math.abs(m.x - self.x) <= 1 && Math.abs(m.y - self.y) <= 1);
+    if (mon) return d.call("input", "move", mon.x - self.x, mon.y - self.y);
+    const step = bfsStep(wallsFor, self.x, self.y, foe.x, foe.y);
+    if (!step || (!step[0] && !step[1])) return d.call("input", "wait");
+    return d.call("input", "move", step[0], step[1]);
+  };
   const t0 = Date.now();
   let lastTurn = -1;
   let reportedDeath = false;
@@ -297,6 +383,105 @@ try {
     console.log(`   ${d.name}: ${p.gold} gold, ${p.xp} xp, hp ${p.hp}/${p.max_hp}, at (${p.segment.x}, ${p.segment.y})`);
     if (p.active_visit) fail(`${d.name} still has an active visit`);
   }
+  // ---------------------------------------------------------------- stall
+  // The other half of the checklist item: a duellist who stops responding.
+  // Co-op answers this with "continue alone"; a duel does not, because an
+  // absent duellist has ALREADY LOST -- the duel is over the moment at most
+  // one participant is active, and the survivor banks it. That difference
+  // is the whole reason this needs its own scenario rather than trusting
+  // the co-op one.
+  console.log("8. stall: a second duel where the challenger vanishes");
+  for (const d of [A, B]) {
+    const st = await d.state();
+    if (st.modal) await d.closeModal();
+  }
+
+  // Put both back at the hub first. A duel leaves its two sides in
+  // DIFFERENT places -- the winner stands in the arena (banked as having
+  // survived without reaching a gate), the loser is knocked back to the
+  // segment they came from -- so after one duel they are no longer both
+  // next door to the arena, and neither can host or see a duel on it.
+  for (const d of [A, B]) {
+    const p0 = await gsp("getplayerinfo", [d.name]);
+    if (p0.segment.x === 0 && p0.segment.y === 0) continue;
+    console.log(`   walking ${d.name} back to the hub from (${p0.segment.x}, ${p0.segment.y})`);
+    await d.call("travel", OPPOSITE[dir]);
+    await d.until((x) => x.player?.segment?.x === 0 && x.player?.segment?.y === 0,
+                  30000, `${d.name} to reach the hub`);
+  }
+  ok("both back at the hub");
+
+  await A.standOnGate(dir);
+  await A.pickChoice("wait here for a duel");
+  await sleep(400);
+  await A.page.waitForSelector(".modal-amount-input", { timeout: 10000 });
+  await A.page.fill(".modal-amount-input", "0");
+  await A.page.click(".modal-confirm");
+  await pickAllStakeItems(A.page);
+  const st2 = await A.page.$(".modal-amount-input");
+  if (st2) { await A.page.fill(".modal-amount-input", "0"); await A.page.click(".modal-confirm"); }
+  const hosted2 = await A.until((x) => !!x.player?.active_visit, 35000, "the second duel to open");
+  const visit2 = hosted2.player.active_visit.visit_id;
+  ok(`duel #${visit2} open`);
+
+  await B.until((x) => (x.joinable ?? []).some((j) => j.visit.id === visit2), 25000,
+                "the second duel to reach the challenger");
+  await B.standOnGate(dir);
+  await B.pickChoice("duel");
+  await B.page.waitForSelector(".modal-amount-input", { timeout: 10000 });
+  await B.page.fill(".modal-amount-input", "0");
+  await B.page.click(".modal-confirm");
+  await pickAllStakeItems(B.page);
+  await B.until((x) => x.player?.active_visit?.visit_id === visit2, 35000, "to join the second duel");
+  await Promise.all([
+    A.until((x) => !!x.coop, 45000, "the second duel to start for the host"),
+    B.until((x) => !!x.coop, 45000, "the second duel to start for the challenger"),
+  ]);
+  ok(`duel #${visit2} active, both runners up`);
+
+  // A few rounds together, so the vanishing side leaves a checkpoint that
+  // is beyond the start and therefore worth going stale.
+  const walls2 = (await A.map()).walls;
+  const tS = Date.now();
+  while (Date.now() - tS < 25000) {
+    await duelStep(A, walls2);
+    await duelStep(B, walls2);
+    const sa = await A.state();
+    if (!sa.coop || sa.coop.gameOver || (sa.coop.round ?? 0) >= 4) break;
+    await sleep(120);
+  }
+  const before = await A.state();
+  console.log(`   challenger leaves at round ${before.coop?.round ?? "?"}; ` +
+              `confirms: ${JSON.stringify(before.coopVisit?.confirms ?? {})}`);
+  await B.page.context().close();
+
+  // Mine the staleness window, then let the host settle it unilaterally.
+  await mineBlocks(25);
+  const stalled = await A.until(
+    (x) => !x.player?.active_visit || x.coop?.gameOver || !!x.partnerCheckpoint?.stale,
+    90000, "the vanished challenger to go stale");
+  console.log(`   host sees: gameOver=${stalled.coop?.gameOver} ` +
+              `stale=${JSON.stringify(stalled.partnerCheckpoint ?? null)}`);
+
+  let v2 = null;
+  for (let i = 0; i < 150; i++) {
+    v2 = await gsp("getvisitinfo", [visit2]);
+    if (v2 && v2.status !== "active") break;
+    // Nudge the chain along: the window and the void both count in blocks.
+    if (i % 10 === 9) await mineBlocks(5);
+    await sleep(1000);
+  }
+  if (!v2 || v2.status === "active")
+    fail(`the stalled duel never resolved (status ${v2?.status})`);
+  else {
+    ok(`stalled duel #${visit2} resolved as ${v2.status}`);
+    for (const r of v2.results ?? [])
+      console.log(`   ${r.name}: survived=${r.survived} xp=${r.xp_gained}`);
+  }
+  const pa = await gsp("getplayerinfo", [A.name]);
+  if (pa.active_visit) fail(`${A.name} is still stuck in a visit after the stall`);
+  else ok(`${A.name} is free again, at (${pa.segment.x}, ${pa.segment.y})`);
+
 } catch (e) {
   fail(`exception: ${e.message}`);
 } finally {
