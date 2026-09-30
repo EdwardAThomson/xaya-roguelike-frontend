@@ -144,6 +144,12 @@ let channelVisitId = -1;
 /** Snapshot of player.segment the last time we built a hub session,
  *  so we know to rebuild if it changes (e.g. on death respawn). */
 let hubBuiltAtHub = false;
+/** Only announce the between-runs state once per arrival, not every poll. */
+let strandedNoticeShown = false;
+/** The segment a between-runs lobby room was built for, if any. */
+let lobbyBuiltFor: SegmentRef | null = null;
+/** The segment a finished run's arena is being kept for, if any. */
+let keptArenaFor: SegmentRef | null = null;
 /** True while the reconnect-mid-channel modal is on screen; prevents
  *  it being shown again on every poll. */
 let reconnectPromptShown = false;
@@ -405,6 +411,17 @@ function ensureSessionFromChainState(): void {
     return;
   }
 
+  // A kept arena belongs to ONE segment. Walking away from it must drop it,
+  // or the player carries a stale map into wherever they went: after
+  // travelling back to the hub they were still looking at the arena, and
+  // its gates are not the hub's gates.
+  if (!channelSession && session && keptArenaFor
+      && !sameSeg(keptArenaFor, p.segment)) {
+    keptArenaFor = null;
+    session = null;
+    fov = null;
+  }
+
   if (channelSession || session) return;  // already have something
 
   if (p.in_channel && p.active_visit) {
@@ -438,6 +455,26 @@ function ensureSessionFromChainState(): void {
   }
 
   ensureHubSessionIfAtHub();
+  ensureLobbySessionIfStanding();
+
+  // Standing in a real segment, out of any run. There is no world to draw
+  // here: the overworld is a meta-view, not a place, and the only session
+  // the client builds outside a run is the hub's safe room. Saying nothing
+  // leaves a blank game and a Map, which reads as a hang -- and this is no
+  // longer a rare state, because a duel winner is banked as having survived
+  // without reaching a gate and lands here every time they win.
+  if (!p.in_channel && !isHub(p.segment) && !session && !strandedNoticeShown) {
+    strandedNoticeShown = true;
+    setMode("overworld");
+    setMapTab("world");
+    selectedSegment = p.segment;
+    addOverworldMessage(
+      `You are standing in ${segName(p.segment)}, between runs. ` +
+      `Enter the dungeon here, or walk to a neighbouring segment ` +
+      `(travelling can run into trouble on the way).`, "info");
+    updateSidebar();
+    render();
+  }
 }
 
 /**
@@ -615,6 +652,9 @@ function ensureHubSessionIfAtHub(entryDirection: string = ""): void {
   if (!p) return;
   if (channelSession) return;  // real session takes precedence
   if (p.in_channel) return;     // about to load a real session
+  // As in ensureLobbySessionIfStanding: a multiplayer participant is not
+  // in_channel, so in_channel alone is not "has no run".
+  if (p.active_visit) return;
   if (!isHub(p.segment)) return;
 
   if (hubBuiltAtHub && session !== null) return;  // already built
@@ -636,6 +676,9 @@ function ensureHubSessionIfAtHub(entryDirection: string = ""): void {
     equipAttack: p.effective_stats.equip_attack,
     equipDefense: p.effective_stats.equip_defense,
   };
+  strandedNoticeShown = false;
+  lobbyBuiltFor = null;
+  keptArenaFor = null;
   session = DungeonSession.createHub(stats, p.hp, p.max_hp, entryDirection);
   fov = new FovMap();
   currentFogKey = "hub";
@@ -643,6 +686,59 @@ function ensureHubSessionIfAtHub(entryDirection: string = ""): void {
   fov.update(me().x, me().y, session.dungeon);
   camera.centerOn(me().x, me().y);
   hubBuiltAtHub = true;
+}
+
+/**
+ * A body to stand in while between runs on a real segment.
+ *
+ * The hub is a room you can walk around; every other segment, out of a run,
+ * was a map and some buttons and no character at all. That is not a view of
+ * anything -- the player reasonably reads it as the game having lost them,
+ * and a duel winner lands there every single time they win, because they are
+ * banked as having survived without ever walking out of a gate.
+ *
+ * So: the same safe room the hub uses, anchored at this segment. It is
+ * cosmetic exactly as the hub's is (depth 0, no monsters, no loot, never
+ * replayed, `channelSession` stays false so nothing mistakes it for a run).
+ * What it buys is the interaction the player already knows: walk to a gate,
+ * step through, and doGateWalk does a free transit to the neighbour.
+ */
+function ensureLobbySessionIfStanding(): void {
+  const p = connState?.player;
+  if (!p) return;
+  if (channelSession || coop || coopSolo) return;
+  // `in_channel` is FALSE for a multiplayer participant: a duellist is in an
+  // active VISIT, not a channel. Checking only in_channel built this room on
+  // top of a live duel whenever `coop` was briefly null -- which is exactly
+  // the window after a reload, before syncCoopFromChain restores the run.
+  // The player then walked around a phantom room while their duel was still
+  // being fought, and stepping on one of its gates fired a real gate-walk
+  // that discovered a new segment mid-duel. Never build a body for someone
+  // the chain says is already in a visit.
+  if (p.in_channel || p.active_visit || isHub(p.segment)) return;
+  if (session && lobbyBuiltFor && sameSeg(lobbyBuiltFor, p.segment)) return;
+  // A session we are already holding is the real arena kept after a run
+  // (see finishCoop). Replacing it with the generic room would undo the
+  // whole point of keeping it.
+  if (session && !lobbyBuiltFor
+      && (!keptArenaFor || sameSeg(keptArenaFor, p.segment))) return;
+
+  const stats: PlayerStats = {
+    level: p.level,
+    strength: p.effective_stats.strength,
+    dexterity: p.effective_stats.dexterity,
+    constitution: p.effective_stats.constitution,
+    intelligence: p.effective_stats.intelligence,
+    equipAttack: p.effective_stats.equip_attack,
+    equipDefense: p.effective_stats.equip_defense,
+  };
+  session = DungeonSession.createHub(stats, p.hp, p.max_hp, "");
+  fov = new FovMap();
+  currentFogKey = "lobby:" + segKey(p.segment);
+  fov.explored = persistentExplored(currentFogKey);
+  fov.update(me().x, me().y, session.dungeon);
+  camera.centerOn(me().x, me().y);
+  lobbyBuiltFor = p.segment;
 }
 
 gspUrlInput.value = DEFAULT_GSP_URL;
@@ -1531,6 +1627,11 @@ async function coopSettle(): Promise<void> {
   const myName = connState!.playerName;
   coopSettling = true;
   coopSettleError = null;
+  // Snapshot the pot NOW. Settlement hands the escrowed rows to the winner
+  // and clears them, so by the time the summary is built the visit reports
+  // no staked items and the one thing the winner cares about has vanished
+  // from the only screen that reports the result.
+  lastDuelPot = coopVisit?.staked_items ?? [];
   const progress = showProgressModal(
     "Settling the run",
     "Writing the result to the chain. This takes a few blocks.");
@@ -1611,6 +1712,9 @@ async function coopSettle(): Promise<void> {
 }
 
 /** Tears down a finished co-op run and re-syncs the view to the chain. */
+/** The items staked on the duel being settled, captured before payout. */
+let lastDuelPot: Array<{ item_id: string; quantity: number; worth: number }> = [];
+
 async function finishCoop(): Promise<void> {
   if (!coop && !coopSolo) return;
   coop?.stop();
@@ -1625,22 +1729,45 @@ async function finishCoop(): Promise<void> {
   try {
     const v = await connection.rpc?.getvisitinfo(visitId);
     if (v?.results) {
+      const duel = v.mode === "duel";
       summary = v.results.map(r =>
-        `${r.name}: ${r.survived ? "survived" : "died"}, +${r.xp_gained} XP, ` +
-        `+${r.gold_gained} gold, ${r.kills} kill${r.kills === 1 ? "" : "s"}`).join("\n");
+        `${r.name}: ${duel ? (r.survived ? "won" : "lost") : (r.survived ? "survived" : "died")}` +
+        `, +${r.xp_gained} XP, +${r.gold_gained} gold` +
+        // `kills` counts MONSTERS. Printing "0 kills" beside a duel a player
+        // just won by killing someone reads as nothing having happened.
+        (duel ? "" : `, ${r.kills} kill${r.kills === 1 ? "" : "s"}`)).join("\n");
     }
   } catch { /* summary is best-effort */ }
 
   channelSession = false;
-  session = null;
-  fov = null;
+  // KEEP the arena the run was fought in.
+  //
+  // Throwing it away and building the generic lobby room in its place is
+  // what made winning a duel look like being teleported out of the place
+  // you won it: on-chain a duel winner is standing in the arena (banked as
+  // having survived without reaching a gate), and the client replaced that
+  // with a featureless box. The session is finished, so `channelSession` is
+  // false and nothing mistakes it for a live run -- but it is the REAL map,
+  // with the player where they actually are, and its gates are that
+  // segment's real gates. Walking onto one does an ordinary free transit.
+  const p0 = connState?.player;
+  const keepArena = !!session && !!p0 && !p0.in_channel && !isHub(p0.segment);
+  if (keepArena) {
+    keptArenaFor = p0!.segment;
+  } else {
+    keptArenaFor = null;
+    session = null;
+    fov = null;
+  }
   hubBuiltAtHub = false;
   coopVisit = null;
   armedIntent = null;
   coopSettling = false;
   coopSettleError = null;
   try { await connection.refreshPlayer(); } catch { /* next poll */ }
+  lobbyBuiltFor = null;
   try { ensureHubSessionIfAtHub(); } catch { /* not fatal to the teardown */ }
+  try { ensureLobbySessionIfStanding(); } catch { /* not fatal to the teardown */ }
   if (!session) setMode("overworld");
   // Where the player is left standing is the first thing they need, and
   // nothing used to say it.  A duel winner in particular is banked without
@@ -1659,7 +1786,25 @@ async function finishCoop(): Promise<void> {
       whereLine = `You are in ${segName(now.segment)}.`;
     }
   }
+  // What changed hands. The winner's whole reason for taking the duel, and
+  // the summary said nothing about it.
+  let potLine = "";
+  if (wasDuel && lastDuelPot.length > 0 && now) {
+    const iWon = !!(await connection.rpc?.getvisitinfo(visitId)
+      .then(v => v?.results?.find(r => r.name === now.name)?.survived)
+      .catch(() => undefined));
+    const list = lastDuelPot.map(i => i.quantity > 1
+      ? `${i.quantity}x ${lookupItem(i.item_id)?.name ?? i.item_id}`
+      : (lookupItem(i.item_id)?.name ?? i.item_id)).join(", ");
+    const worth = lastDuelPot.reduce((n, i) => n + i.worth, 0);
+    potLine = iWon
+      ? `You won the pot: ${list} (worth ${worth}). It is in your bag.`
+      : `You lost the pot: ${list} (worth ${worth}).`;
+  }
+  lastDuelPot = [];
+
   addOverworldMessage(wasDuel ? "Duel settled." : "Co-op run settled.", "info");
+  if (potLine) addOverworldMessage(potLine, wasDuel ? "info" : "info");
   if (whereLine) addOverworldMessage(whereLine, "info");
   // The redraw must happen even if the summary dialog throws.  Anything that
   // skips updateSidebar here leaves the page showing the mid-run sidebar for
@@ -1668,7 +1813,7 @@ async function finishCoop(): Promise<void> {
   try {
     showModal({
       title: wasDuel ? "Duel settled" : "Co-op run settled",
-      message: [summary || "The run has settled on-chain.", whereLine]
+      message: [summary || "The run has settled on-chain.", potLine, whereLine]
         .filter(Boolean).join("\n\n"),
       variant: "info",
     });
@@ -3191,9 +3336,20 @@ resize();
 
 function render(): void {
   if (mode === "overworld") {
+    // The Dungeon tab reflects a real dungeon run only. With no run it drew
+    // an empty canvas and said nothing, which is indistinguishable from the
+    // game having died -- and a duel winner is left in exactly that state
+    // every time, because they are banked without walking out of a gate.
+    // Fall back to the World map, which always has something true to show.
+    // Switch the tab without going back through setMapTab, which calls
+    // render() and would re-enter this function.
+    if (mapTab === "dungeon" && !channelSession) {
+      mapTab = "world";
+      mapTabWorldBtn.classList.add("active");
+      mapTabDungeonBtn.classList.remove("active");
+      applyMapTabControls();
+    }
     if (mapTab === "dungeon") {
-      // The Dungeon tab reflects a real dungeon run only; the hub and the
-      // no-session state fall through to the renderer's placeholder.
       drawDungeonMap(ctx, channelSession ? session : null,
         channelSession ? fov : null, canvas.width, canvas.height,
         coop ? coop.me : 0);
@@ -3294,7 +3450,7 @@ function renderDungeon(): void {
       if (i === coop.me) continue;
       const q = session.players[i];
       if (q.dead || q.exited || !fov.isVisible(q.x, q.y)) continue;
-      drawPartner(ctx, camera, q.x, q.y);
+      drawPartner(ctx, camera, q.x, q.y, session.isDuel());
     }
   }
   drawPlayer(ctx, camera, me().x, me().y);
@@ -3472,7 +3628,14 @@ function confirmGateWalk(dir: string): void {
       // bar is their floor, not their own ante.
       const floor = j.visit.min_stake ?? stake;
       const gold = connState?.player?.gold ?? 0;
-      const affordable = !duel || gold >= floor;
+      // What you can put up is gold PLUS the worth of your bag. Judging
+      // affordability on gold alone locked a challenger out of the very
+      // duels item stakes exist for: a fresh character has no gold and a
+      // bag worth 45, and was told "they will not take less than 1 and you
+      // hold 0" with the button greyed out.
+      const bagWorth = stakeableRows().reduce((n, r) => n + r.worth, 0);
+      const canPutUp = gold + bagWorth;
+      const affordable = !duel || canPutUp >= floor;
       return {
         label: duel
           ? `Duel ${j.visit.initiator}`
@@ -3485,8 +3648,10 @@ function confirmGateWalk(dir: string): void {
               ? `A fight, not a run. They staked ${stake} and will accept ` +
                 `${floor === 0 ? "any stake at all" : `${floor} or more`}; ` +
                 `the winner takes the whole pot and walking out through a ` +
-                `gate concedes. You hold ${gold} gold.`
-              : `They will not take less than ${floor} and you hold ${gold}.`)
+                `gate concedes. You can put up ${canPutUp} ` +
+                `(${gold} gold${bagWorth > 0 ? ` and ${bagWorth} in items` : ""}).`
+              : `They will not take less than ${floor}, and everything you ` +
+                `could stake comes to ${canPutUp}.`)
           : `${j.visit.players} of ${j.visit.max_players} waiting to go into ${segName(target)}.`,
         disabled: !affordable,
         onPick: () => {
@@ -4806,16 +4971,27 @@ function updateOverworldStats(): void {
     }
   }
 
-  // Recovery: if we are out-of-channel on a real (non-hub) segment, offer a
-  // one-click way into that segment's dungeon.  Normal play never lands here
-  // (gate-walk always enters a channel; the hub is the only out-of-channel
-  // spot), so this only appears after an odd state and lets the player get
-  // moving again (walk to a gate and step through to travel onward).
+  // Out-of-channel on a real (non-hub) segment: offer a one-click way into
+  // that segment's dungeon.  This used to be a recovery path for an odd
+  // state, and is now a ROUTINE one: a duel winner is banked as having
+  // survived without reaching a gate, so they are left standing inside the
+  // arena with no run every single time they win.
   let enterHereBtn = "";
   if (!p.in_channel && !isHub(p.segment) && hasProxy) {
     enterHereBtn = `<button data-action="enter-channel"
       data-seg-x="${p.segment.x}" data-seg-y="${p.segment.y}"
       class="action-btn action-enter" ${busy ? "disabled" : ""}>Enter Dungeon Here</button>`;
+    // And the way OUT. Entering the dungeon was the only thing offered
+    // here, which is the riskier option for someone who has just won a
+    // duel on a sliver of health and wants to bank it.
+    const node = connState?.segments.get(segKey(p.segment));
+    for (const dir of ["north", "south", "east", "west"]) {
+      const link = node?.links?.[dir];
+      if (!link) continue;
+      const to = `(${link.to.x}, ${link.to.y})`;
+      enterHereBtn += `<button data-action="travel" data-dir="${dir}"
+        class="action-btn" ${busy ? "disabled" : ""}>Walk ${dir} to ${to}</button>`;
+    }
   }
 
   el.innerHTML = `

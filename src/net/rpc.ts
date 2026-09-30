@@ -161,6 +161,13 @@ export interface VisitInfo {
   /** The least a challenger may put up; the host's own stake when unset. */
   min_stake?: number;
   pot?: number;
+  /**
+   * Items escrowed on this visit, while it is live.  Settlement hands them
+   * to the winner and clears the escrow, so this is EMPTY afterwards: a
+   * client that wants to report what changed hands has to capture it before
+   * it settles.  Absent from an older GSP.
+   */
+  staked_items?: Array<{ item_id: string; quantity: number; worth: number }>;
   created_height: number;
   started_height?: number;
   settled_height?: number;
