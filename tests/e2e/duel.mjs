@@ -441,27 +441,52 @@ try {
 
   // A few rounds together, so the vanishing side leaves a checkpoint that
   // is beyond the start and therefore worth going stale.
-  const walls2 = (await A.map()).walls;
+  //
+  // WAIT rather than walk. duelStep paths toward the opponent, and in a
+  // duel stepping on a gate is a CONCESSION, not a move: the first version
+  // of this scenario had the driver walk the host onto a gate, which
+  // conceded the duel and settled it normally with the "vanished" side
+  // winning. It looked like an abandonment result and was nothing of the
+  // kind.
   const tS = Date.now();
-  while (Date.now() - tS < 25000) {
-    await duelStep(A, walls2);
-    await duelStep(B, walls2);
+  let roundsTogether = 0;
+  while (Date.now() - tS < 25000 && roundsTogether < 4) {
+    for (const d of [A, B]) {
+      const st = await d.state();
+      if (st.modal) { await d.closeModal(); continue; }
+      if (st.coop?.myTurn && !st.coop.pendingOwn) await d.call("input", "wait");
+    }
     const sa = await A.state();
-    if (!sa.coop || sa.coop.gameOver || (sa.coop.round ?? 0) >= 4) break;
-    await sleep(120);
+    if (!sa.coop || sa.coop.gameOver) break;
+    roundsTogether = sa.coop.turns ?? roundsTogether + 1;
+    await sleep(150);
   }
+  // Both sides must have a checkpoint on file, or nobody can settle
+  // unilaterally at all: the GSP refuses a settle with no confirm from the
+  // other side, which is the 1000-block freeze rather than an abandonment.
+  for (const d of [A, B]) await d.call("coopCheckpoint").catch(() => {});
+  await sleep(1500);
   const before = await A.state();
   console.log(`   challenger leaves at round ${before.coop?.round ?? "?"}; ` +
               `confirms: ${JSON.stringify(before.coopVisit?.confirms ?? {})}`);
   await B.page.context().close();
 
-  // Mine the staleness window, then let the host settle it unilaterally.
+  // Mine the staleness window, then abandon deliberately -- the same
+  // control a real player is offered once the other side has gone quiet.
   await mineBlocks(25);
   const stalled = await A.until(
     (x) => !x.player?.active_visit || x.coop?.gameOver || !!x.partnerCheckpoint?.stale,
-    90000, "the vanished challenger to go stale");
+    90000, "the vanished challenger's checkpoint to go stale");
   console.log(`   host sees: gameOver=${stalled.coop?.gameOver} ` +
               `stale=${JSON.stringify(stalled.partnerCheckpoint ?? null)}`);
+  if (stalled.partnerCheckpoint?.stale) {
+    await A.call("coopAbandon");
+    ok(`host abandons from the challenger's last checkpoint ` +
+       `(${stalled.partnerCheckpoint.n} actions)`);
+  } else if (!stalled.coop?.gameOver) {
+    fail("the challenger never went stale, so the host had no way to settle: " +
+         "this is the freeze, not an abandonment");
+  }
 
   let v2 = null;
   for (let i = 0; i < 150; i++) {
@@ -477,6 +502,17 @@ try {
     ok(`stalled duel #${visit2} resolved as ${v2.status}`);
     for (const r of v2.results ?? [])
       console.log(`   ${r.name}: survived=${r.survived} xp=${r.xp_gained}`);
+    // The spec is explicit: an absent duellist has ALREADY LOST. A result
+    // where the side that closed its browser wins is the bug this scenario
+    // exists to catch.
+    if (v2.status === "completed") {
+      const host = (v2.results ?? []).find((r) => r.name === A.name);
+      const gone = (v2.results ?? []).find((r) => r.name === B.name);
+      if (gone?.survived && !host?.survived)
+        fail(`${B.name} vanished and still won: an absent duellist must lose`);
+      else if (host?.survived)
+        ok(`${A.name} took the duel the challenger walked out of`);
+    }
   }
   const pa = await gsp("getplayerinfo", [A.name]);
   if (pa.active_visit) fail(`${A.name} is still stuck in a visit after the stall`);
