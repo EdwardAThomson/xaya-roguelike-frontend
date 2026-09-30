@@ -61,7 +61,7 @@ import {
 } from "./net/validator.js";
 import { waitForMove, MoveOutcome } from "./net/pending.js";
 import { showErrorModal, showModal, showConfirmModal, showChoiceModal, showAmountModal,
-         showItemStakeModal, type ItemStakeRow } from "./ui/modal.js";
+         showItemStakeModal, showProgressModal, type ItemStakeRow } from "./ui/modal.js";
 import { showOverlay, hideOverlay } from "./ui/overlay.js";
 import { lookupItem } from "./game/items.js";
 
@@ -1531,6 +1531,9 @@ async function coopSettle(): Promise<void> {
   const myName = connState!.playerName;
   coopSettling = true;
   coopSettleError = null;
+  const progress = showProgressModal(
+    "Settling the run",
+    "Writing the result to the chain. This takes a few blocks.");
 
   const hash = settleLogHash(visitId, s.mergedLog);
   const results = toWireResults(s, runner.names, coopVisit?.pot ?? 0);
@@ -1542,6 +1545,7 @@ async function coopSettle(): Promise<void> {
   try {
     if (runner.me === 0) {
       s.addMessage("Run over. Waiting for your partner's confirmation...", "info");
+      progress.update("Waiting for the other side to confirm the log.");
       updateSidebar();
       const deadline = Date.now() + 180000;
       let done = false;
@@ -1559,6 +1563,7 @@ async function coopSettle(): Promise<void> {
         }
         if (others.every(n => v.confirms[n]?.h === hash && v.confirms[n]?.n === total)) {
           s.addMessage("Confirmation received. Settling on-chain...", "info");
+          progress.update("Confirmed. Writing the settlement to the chain...");
           updateSidebar();
           await moves.settle(myName, visitId, results, actions);
           const ok = await waitForVisitStatus(visitId, st => st !== "active", 60000);
@@ -1574,9 +1579,23 @@ async function coopSettle(): Promise<void> {
       updateSidebar();
       await moves.settleConfirm(myName, visitId, hash, s.mergedLog.length);
       s.addMessage("Confirmed. Waiting for the host to settle...", "info");
+      progress.update("Your confirmation is in. Waiting for them to submit.");
       updateSidebar();
-      const ok = await waitForVisitStatus(visitId, st => st !== "active", 180000);
-      if (!ok) throw new Error("Timed out waiting for the settlement. Retry to re-send your confirmation.");
+      // Participant 0 submitting is a convention to save a duplicate move,
+      // not a rule the GSP enforces: it accepts a settle from anyone whose
+      // opponents have confirmed the whole log. Waiting forever on that
+      // convention strands the WINNER when the host is the one who lost and
+      // has no reason to hurry, which is a duel decided and then frozen.
+      // So wait a short while for them, then settle it ourselves.
+      const theirs = await waitForVisitStatus(visitId, st => st !== "active", 20000);
+      if (!theirs) {
+        s.addMessage("They have not settled it. Doing it myself...", "info");
+        progress.update("They have not submitted it. Settling it myself...");
+        updateSidebar();
+        await moves.settle(myName, visitId, results, actions);
+        const ok = await waitForVisitStatus(visitId, st => st !== "active", 60000);
+        if (!ok) throw new Error("The GSP did not settle the run in time. Retry the settlement.");
+      }
     }
     busy = false;
     coopSettling = false;

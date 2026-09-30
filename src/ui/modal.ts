@@ -472,3 +472,39 @@ export function showItemStakeModal(opts: ItemStakeModalOptions): void {
   refresh();
   confirm.focus();
 }
+
+/**
+ * A modal with no way out, for a step the player must simply wait through.
+ *
+ * Settlement is the case it exists for. It takes a couple of on-chain moves
+ * and can take longer when the other side is slow to submit, and until it
+ * lands the player cannot move: a line in the log box saying "confirming"
+ * while the game ignores every key reads exactly like a hang, which is what
+ * it was reported as. Returns a function that updates the text, and one
+ * that closes it.
+ */
+export function showProgressModal(title: string, message: string):
+    { update: (m: string) => void; close: () => void } {
+  document.getElementById("modal-root")?.remove();
+
+  const root = document.createElement("div");
+  root.id = "modal-root";
+  root.className = "modal-overlay";
+  root.innerHTML = `
+    <div class="modal modal-info" role="alertdialog" aria-modal="true">
+      <div class="modal-title">${escapeHtml(title)}</div>
+      <div class="modal-body modal-progress-body">${escapeHtml(message)}</div>
+    </div>
+  `;
+  // Deliberately no dismiss, no backdrop close and no Escape handler: there
+  // is nothing useful to do with the game until this resolves, and letting
+  // it be dismissed would put the player back in a world that is about to
+  // change under them.
+  document.body.appendChild(root);
+
+  const body = root.querySelector(".modal-progress-body") as HTMLElement;
+  return {
+    update: (m: string) => { body.textContent = m; },
+    close: () => { root.remove(); },
+  };
+}

@@ -382,12 +382,87 @@ async function arrowKeysCanFight(): Promise<void> {
   console.log("[duel-orthogonal] ✓ OK");
 }
 
+/**
+ * A refreshed client rebuilds a duel from the relay alone.
+ *
+ * This is the path a page reload takes. Nothing about a multiplayer run is
+ * persisted locally on purpose -- persistRun skips when `coop` is set --
+ * because the relay holds every message for the visit and replaying it from
+ * cursor 0 reconstructs the merged log exactly. co_op_test covers that for
+ * a co-op run; a duel was never covered, and a duel is the harder case: its
+ * log carries commit and reveal entries, and the round protocol has to come
+ * back up in the right phase rather than mid-round.
+ *
+ * A rebuilt client that disagrees about the log cannot settle, because a
+ * settle needs the opponents' confirms to match its own hash exactly.
+ */
+async function reloadRebuildsTheDuel(): Promise<void> {
+  const rng = new Lcg(11);
+  const names = ["alice", "bob"];
+  const relay = new MemoryRelay(rng, 12);
+  const sessions = names.map(() =>
+    DungeonSession.createDuel("duel-reload", 3, setups(), VISIT_ID));
+  const runners = names.map((n, i) => new CoopRunner({
+    session: sessions[i], me: i, names, transport: relay.transport(n),
+    tickMs: 120, pollMs: 15, onChange: () => {},
+  }));
+  for (const r of runners) r.start();
+
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline && !sessions.every(s => s.gameOver)) {
+    for (let i = 0; i < 2; i++)
+      if (runners[i].myChoicePending) runners[i].submitLocal(towardOpponent(sessions[i], i));
+    await sleep(20);
+  }
+  const quiet = Date.now() + 800;
+  while (Date.now() < quiet) await sleep(20);
+  for (const r of runners) r.stop();
+  if (!sessions[0].gameOver)
+    throw new Error("[duel-reload] the duel did not finish; nothing to rebuild");
+
+  const original = settleLogHash(VISIT_ID, sessions[0].mergedLog);
+  const winner = sessions[0].duelWinner;
+
+  // The refresh: a brand new client for bob, no local state at all.
+  const rebuilt = DungeonSession.createDuel("duel-reload", 3, setups(), VISIT_ID);
+  const late = new CoopRunner({
+    session: rebuilt, me: 1, names, transport: relay.transport("bob"),
+    tickMs: 100000, pollMs: 20, onChange: () => {},
+  });
+  late.start();
+  const until = Date.now() + 3000;
+  while (Date.now() < until
+         && rebuilt.mergedLog.length < sessions[0].mergedLog.length) await sleep(20);
+  late.stop();
+
+  const rebuiltHash = settleLogHash(VISIT_ID, rebuilt.mergedLog);
+  console.log(`[duel-reload] rebuilt ${rebuilt.mergedLog.length}/` +
+              `${sessions[0].mergedLog.length} entries, winner ` +
+              `${rebuilt.duelWinner}/${winner}, hash ` +
+              `${rebuiltHash === original ? "matches" : "DIFFERS"}`);
+  if (rebuilt.mergedLog.length !== sessions[0].mergedLog.length)
+    throw new Error(`[duel-reload] rebuilt ${rebuilt.mergedLog.length} of ` +
+                    `${sessions[0].mergedLog.length} entries: a refreshed ` +
+                    `client cannot reconstruct the run`);
+  if (rebuiltHash !== original)
+    throw new Error("[duel-reload] the rebuilt log hashes differently, so a " +
+                    "refreshed client could never settle");
+  if (rebuilt.duelWinner !== winner)
+    throw new Error(`[duel-reload] rebuilt winner ${rebuilt.duelWinner} but ` +
+                    `the duel was won by ${winner}`);
+  if (!rebuilt.gameOver)
+    throw new Error("[duel-reload] the rebuilt session does not know the " +
+                    "duel is over, so it will never settle");
+  console.log("[duel-reload] ✓ OK");
+}
+
 async function main(): Promise<void> {
   for (const seed of [1, 2, 3]) await runScenario(seed);
   console.log("[duel-runtime] ✓ OK");
   await pressingEachRoundLandsBlows();
   await onePressIsOneRound();
   await arrowKeysCanFight();
+  await reloadRebuildsTheDuel();
 }
 
 // An unhandled rejection makes `node dist/net/duel_test.js` exit non-zero,

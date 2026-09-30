@@ -32,6 +32,10 @@
  *                    whose only opponent is another script deadlocks in
  *                    exactly the way it exists to prevent.
  *       ROG_BOT_DIR  gate to host through / join by (default east)
+ *       ROG_BOT_STRIP=1  unequip the bot's gear before staking, so the pot
+ *                    holds something visibly different from the potions
+ *                    every character starts with. Only bag rows are
+ *                    stakeable, so worn gear is otherwise never at risk.
  */
 import {
   PROXY, sleep, gsp, move, mine, register, installStorageShim, installClaim,
@@ -61,6 +65,17 @@ const log = (m) => console.log(`[bot] ${m}`);
 log(`I am ${BOT}. Registering.`);
 await register(BOT);
 installClaim(BOT, tokens[BOT]);
+
+if (process.env.ROG_BOT_STRIP === "1") {
+  const p0 = await gsp("getplayerinfo", [BOT]);
+  for (const it of p0.inventory.filter(i => i.slot !== "bag")) {
+    await move(BOT, { uq: { rowid: it.rowid } });
+    await mine(1);
+  }
+  const p1 = await gsp("getplayerinfo", [BOT]);
+  log(`Stripped: bag now ${p1.inventory.filter(i => i.slot === "bag")
+    .map(i => `${i.quantity}x ${i.item_id}`).join(", ")}`);
+}
 
 /* --------------------------------------------- open one, or find one to take */
 
@@ -352,8 +367,15 @@ log(`Duel over after ${session.roundIndex} rounds. Winner: ` +
     `${winner < 0 ? "nobody" : names[winner]}. ` +
     `Confirmed the full log (${session.mergedLog.length} actions).`);
 
-if (winner === meIdx) {
-  log("I won. Waiting for their confirm before I settle.");
+// The client convention is that participant 0 submits the settlement, so a
+// bot that only settles when it WINS strands a human who won from the other
+// seat: both sides sit confirming forever. Settle whenever it is our job,
+// win or lose -- a loser's stake is escrowed until the duel closes anyway.
+if (winner === meIdx || meIdx === 0) {
+  log(winner === meIdx
+    ? "I won. Waiting for their confirm before I settle."
+    : "I lost, but I am participant 0 and it is my job to submit. " +
+      "Waiting for their confirm.");
   if (!await waitForTheirConfirms(total ?? session.mergedLog.length)) {
     log("They never confirmed the full log, so I cannot settle normally. " +
         "Leaving it; the void sweeper or an abandonment settle is the remedy.");
@@ -372,5 +394,6 @@ if (winner === meIdx) {
     log(`settle failed: ${e.message ?? e}`);
   }
 } else {
-  log("They won. Their client settles; my confirm is on file so it can.");
+  log("They won and they are participant 0, so their client submits. " +
+      "My confirm is on file so it can.");
 }
