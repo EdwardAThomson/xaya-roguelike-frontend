@@ -1533,6 +1533,19 @@ function noteGateArrival(): void {
       : `On the ${g.direction} gate.`,
     session.isDuel() ? "warning" : "info");
   updateSidebar();
+
+  // In a DUEL the dialog does not open itself.
+  //
+  // Duellists spawn on the gate mouth, so almost any early move arrives on
+  // a gate, and a modal that steals focus in the middle of a timed round is
+  // worse than useless -- it covers the fight, and the one button on it
+  // forfeits. It was also being replaced a moment later by the settlement
+  // modal, which is the "flash" players reported.
+  //
+  // The warning above still fires, and conceding stays available on
+  // purpose: the gate key and the sidebar's leave control both open this
+  // dialog. Deliberate, not ambushed.
+  if (session.isDuel() || coopSettling) return;
   showLeaveOptionsModal();
 }
 
