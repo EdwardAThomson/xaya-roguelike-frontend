@@ -25,7 +25,7 @@ import { FovMap } from "./render/fov.js";
 import { Connection, ConnectionState } from "./net/connection.js";
 import { PlayerInfo, SegmentInfo, SegmentRef, VisitInfo, VisitSummary,
   segKey, sameSeg, isHub, HUB } from "./net/rpc.js";
-import { Gate } from "./game/dungeon.js";
+import { Gate, Tile } from "./game/dungeon.js";
 import { MoveClient, createMoveClient, Settlement } from "./net/moves.js";
 import { layoutSegments, SegmentNode, hitTestSegment } from "./game/overworld.js";
 import { drawOverworld, NODE_SIZE, CELL, PlayerMarker, OverworldView } from "./render/overworld.js";
@@ -150,6 +150,12 @@ let strandedNoticeShown = false;
 let lobbyBuiltFor: SegmentRef | null = null;
 /** The segment a finished run's arena is being kept for, if any. */
 let keptArenaFor: SegmentRef | null = null;
+/**
+ * Where a just-finished run left the player, so the between-runs body can
+ * be rebuilt standing in the same spot rather than teleporting them to a
+ * spawn point the moment the fight ends.
+ */
+let lobbyEntryPos: { x: number; y: number } | null = null;
 /** True while the reconnect-mid-channel modal is on screen; prevents
  *  it being shown again on every poll. */
 let reconnectPromptShown = false;
@@ -323,6 +329,39 @@ function runStorageKey(): string | null {
   const name = connState?.playerName;
   return name ? `rog_run:${name}` : null;
 }
+/**
+ * Where the player is standing while BETWEEN runs, per segment.
+ *
+ * The tile has no on-chain meaning out of a run -- the chain knows only
+ * which segment you are in -- so nothing is lost if this is missing. What
+ * is lost is continuity: a refresh otherwise drops you at the segment's
+ * spawn point, which reads as being teleported across the map for no
+ * reason, especially right after winning a duel on a tile you remember.
+ */
+function lobbyPosKey(seg: SegmentRef): string | null {
+  const name = connState?.playerName;
+  return name ? `rog_lobby:${name}:${segKey(seg)}` : null;
+}
+function persistLobbyPos(): void {
+  if (channelSession || coop || coopSolo || !session || !lobbyBuiltFor) return;
+  const key = lobbyPosKey(lobbyBuiltFor);
+  if (!key) return;
+  try {
+    localStorage.setItem(key, JSON.stringify({ x: me().x, y: me().y }));
+  } catch { /* storage disabled: the spawn point is the fallback */ }
+}
+function loadLobbyPos(seg: SegmentRef): { x: number; y: number } | null {
+  const key = lobbyPosKey(seg);
+  if (!key) return null;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const d = JSON.parse(raw);
+    if (typeof d?.x === "number" && typeof d?.y === "number") return d;
+  } catch { /* corrupt entry */ }
+  return null;
+}
+
 function persistRun(): void {
   const key = runStorageKey();
   if (!key || !channelSession || !session || coop || coopSolo) return;
@@ -757,6 +796,15 @@ function ensureLobbySessionIfStanding(): void {
       constraintsFor(segInfo), "", []);
     session.monsters.length = 0;
     session.groundItems.length = 0;
+    // Stand where the run left you, not at a spawn point: a duel winner
+    // should still be on the tile they won on.
+    const stand = lobbyEntryPos ?? loadLobbyPos(p.segment);
+    const standTile = stand
+      ? session.dungeon.getTile(stand.x, stand.y) : null;
+    if (stand && standTile !== null && standTile !== Tile.Wall) {
+      session.players[0].x = stand.x;
+      session.players[0].y = stand.y;
+    }
     currentFogKey = "seg:" + segInfo.seed;
   } else {
     // Segment cache not populated yet: the plain room is better than a
@@ -769,6 +817,7 @@ function ensureLobbySessionIfStanding(): void {
   fov.update(me().x, me().y, session.dungeon);
   camera.centerOn(me().x, me().y);
   lobbyBuiltFor = segInfo ? p.segment : null;
+  lobbyEntryPos = null;
 }
 
 gspUrlInput.value = DEFAULT_GSP_URL;
@@ -1789,21 +1838,23 @@ async function finishCoop(): Promise<void> {
   // the keep-the-arena path never once ran.
   try { await connection.refreshPlayer(); } catch { /* next poll */ }
 
-  // KEEP the arena this run was fought in, but only if the chain agrees
-  // the player is still standing in it. That is true for a duel winner
-  // (banked as having survived without reaching a gate) and false for the
-  // loser, who has been knocked back and must not be shown the arena they
-  // just lost in.
+  // Drop the finished session, ALWAYS, and remember only where it left the
+  // player standing.
+  //
+  // Keeping it was the wrong mechanism twice over. It is the settled log,
+  // so walking around in it would mutate state the chain has already
+  // accepted; and handleGameInput refuses everything once `gameOver` is
+  // set, so the player got a body they could see and could not move. The
+  // between-runs body is rebuilt fresh from the segment's seed instead --
+  // the same real map, walkable, not game-over -- which is what the reload
+  // path has been doing correctly all along.
   const p0 = connState?.player;
-  const keepArena = !!session && !!p0 && !p0.in_channel
+  const stayingPut = !!session && !!p0 && !p0.in_channel
     && !!ranIn && !isHub(p0.segment) && sameSeg(ranIn, p0.segment);
-  if (keepArena) {
-    keptArenaFor = p0!.segment;
-  } else {
-    keptArenaFor = null;
-    session = null;
-    fov = null;
-  }
+  lobbyEntryPos = stayingPut ? { x: me().x, y: me().y } : null;
+  keptArenaFor = null;
+  session = null;
+  fov = null;
   lobbyBuiltFor = null;
   try { ensureHubSessionIfAtHub(); } catch { /* not fatal to the teardown */ }
   try { ensureLobbySessionIfStanding(); } catch { /* not fatal to the teardown */ }
@@ -3569,6 +3620,7 @@ function handleGameInput(action: string, dir?: Direction): void {
     render();
     updateSidebar();
     persistRun();
+    persistLobbyPos();
     saveCurrentFog();
 
     // If a "move" landed us on a gate (hub OR real dungeon), ask for
