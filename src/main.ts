@@ -737,13 +737,38 @@ function ensureLobbySessionIfStanding(): void {
     equipAttack: p.effective_stats.equip_attack,
     equipDefense: p.effective_stats.equip_defense,
   };
-  session = DungeonSession.createHub(stats, p.hp, p.max_hp, "");
+  // The REAL map of the segment you are standing in, not the hub's room.
+  //
+  // createHub draws a plain 16x12 box, and using it here told a flat lie:
+  // a duel winner is left standing in the arena, the sidebar said
+  // "Segment (1, 0)", and the screen showed something visually identical
+  // to the hub. Players read that as having been thrown back to the hub,
+  // reported it as such, and they were right to.
+  //
+  // The segment's seed generates its dungeon deterministically, so the
+  // layout, the gates and their directions are all truthful. Monsters and
+  // floor loot are cleared: this is NOT a run, nothing here can be fought
+  // or picked up, and leaving them on screen would promise a fight that
+  // the next `ec` would regenerate differently anyway.
+  const segInfo = connState?.segments.get(segKey(p.segment));
+  if (segInfo) {
+    session = new DungeonSession(
+      segInfo.seed, segInfo.depth, stats, p.hp, p.max_hp, [],
+      constraintsFor(segInfo), "", []);
+    session.monsters.length = 0;
+    session.groundItems.length = 0;
+    currentFogKey = "seg:" + segInfo.seed;
+  } else {
+    // Segment cache not populated yet: the plain room is better than a
+    // blank screen, and the next poll replaces it with the real thing.
+    session = DungeonSession.createHub(stats, p.hp, p.max_hp, "");
+    currentFogKey = "lobby:" + segKey(p.segment);
+  }
   fov = new FovMap();
-  currentFogKey = "lobby:" + segKey(p.segment);
   fov.explored = persistentExplored(currentFogKey);
   fov.update(me().x, me().y, session.dungeon);
   camera.centerOn(me().x, me().y);
-  lobbyBuiltFor = p.segment;
+  lobbyBuiltFor = segInfo ? p.segment : null;
 }
 
 gspUrlInput.value = DEFAULT_GSP_URL;
@@ -1745,18 +1770,33 @@ async function finishCoop(): Promise<void> {
   } catch { /* summary is best-effort */ }
 
   channelSession = false;
-  // KEEP the arena the run was fought in.
+  const ranIn = channelSegment;
+  hubBuiltAtHub = false;
+  coopVisit = null;
+  armedIntent = null;
+  coopSettling = false;
+  coopSettleError = null;
+
+  // Refresh BEFORE deciding anything about where the player is.
   //
-  // Throwing it away and building the generic lobby room in its place is
-  // what made winning a duel look like being teleported out of the place
-  // you won it: on-chain a duel winner is standing in the arena (banked as
-  // having survived without reaching a gate), and the client replaced that
-  // with a featureless box. The session is finished, so `channelSession` is
-  // false and nothing mistakes it for a live run -- but it is the REAL map,
-  // with the player where they actually are, and its gates are that
-  // segment's real gates. Walking onto one does an ordinary free transit.
+  // This used to come after, and the decision was made against the player
+  // state from before the settlement landed. A duellist's on-chain segment
+  // is still the one they joined FROM until settlement places them, so the
+  // check read "you are at the hub", threw the arena away, and then the
+  // refresh moved them to the arena and the lobby drew its plain box. The
+  // player was left looking at the hub's room with the sidebar insisting
+  // they were in (1, 0), which is exactly as confusing as it sounds, and
+  // the keep-the-arena path never once ran.
+  try { await connection.refreshPlayer(); } catch { /* next poll */ }
+
+  // KEEP the arena this run was fought in, but only if the chain agrees
+  // the player is still standing in it. That is true for a duel winner
+  // (banked as having survived without reaching a gate) and false for the
+  // loser, who has been knocked back and must not be shown the arena they
+  // just lost in.
   const p0 = connState?.player;
-  const keepArena = !!session && !!p0 && !p0.in_channel && !isHub(p0.segment);
+  const keepArena = !!session && !!p0 && !p0.in_channel
+    && !!ranIn && !isHub(p0.segment) && sameSeg(ranIn, p0.segment);
   if (keepArena) {
     keptArenaFor = p0!.segment;
   } else {
@@ -1764,12 +1804,6 @@ async function finishCoop(): Promise<void> {
     session = null;
     fov = null;
   }
-  hubBuiltAtHub = false;
-  coopVisit = null;
-  armedIntent = null;
-  coopSettling = false;
-  coopSettleError = null;
-  try { await connection.refreshPlayer(); } catch { /* next poll */ }
   lobbyBuiltFor = null;
   try { ensureHubSessionIfAtHub(); } catch { /* not fatal to the teardown */ }
   try { ensureLobbySessionIfStanding(); } catch { /* not fatal to the teardown */ }
