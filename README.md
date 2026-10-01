@@ -80,8 +80,8 @@ own gates, so both players have to be standing next to it first.
 
 1. Player A steps onto the gate leading to that segment and picks **Wait here for a partner** from the gate choices (equivalently: open the game modal's **Co-op** tab and click **Wait at the *dir* gate**, which lists every run reachable from where you stand). The Co-op tab then shows the open run with a **Cancel run** button
 2. Player B walks to their own gate into the same segment and picks **Join *A*'s run**, at the gate or from the Co-op tab (**Leave run** backs out again)
-3. The run starts automatically once the visit is full; both clients play the same dungeon in rounds of one action per player, each spawning at the gate they walked in through, with the partner drawn in teal
-4. When the run is over, settlement is automatic: the other player sends an `sc` confirm of the merged action log, and participant 0 (first in canonical name order, not necessarily the host) sends the `s` settle once that confirm is on chain
+3. The run starts automatically once the visit is full; both clients play the same dungeon in rounds of one action per player, each spawning at the gate they walked in through, with the partner drawn in teal and your own figure marked by a white ring and a caret above it, so telling the two apart does not rest on colour (a duel opponent is drawn in red)
+4. When the run is over, settlement is automatic: the other player sends an `sc` confirm of the merged action log, and participant 0 (first in canonical name order, not necessarily the host) sends the `s` settle once that confirm is on chain. That is a convention, not a GSP rule: if participant 0 has not settled within about 20 seconds of the other player's confirm, the other player submits the `s` settle itself. A progress modal with no dismiss names each stage until the settlement lands
 5. During the run each client also sends periodic `sc` checkpoint confirms (every `COOP_CHECKPOINT_ACTIONS` applied actions, and at least every `COOP_HEARTBEAT_MS` as a heartbeat). The sidebar shows the partner's last checkpoint and its age; once it is `ABANDON_WINDOW_BLOCKS` old, **Continue alone from their checkpoint** rebuilds the run at that checkpoint, marks the partner absent, and lets the survivor play out and settle solo (`s` with `solo_from`). All three constants live in `src/config.ts`
 
 Leaving a live run is explicit: **Leave the run…** in the sidebar and in the
@@ -143,7 +143,12 @@ segment, so both players still have to be standing next to it first.
    winner's gold includes the pot less the rake (`DUEL_RAKE_PERCENT`, 0 today)
    and their XP includes `DUEL_XP_BASE` (20) per level of the loser. Both
    constants in `src/game/settle.ts` mirror the GSP's `moveprocessor.hpp`; if
-   they drift, every duel claim is rejected
+   they drift, every duel claim is rejected. The winner is banked as having
+   survived without reaching a gate, so they are left standing in the arena:
+   the client keeps the arena's map, position and gates rather than dropping
+   to a generic room, and drops it once they leave that segment. The result
+   screen says won/lost and names the pot taken, captured before settling
+   because settlement clears the escrow
 
 Before hosting or joining anything, the client compares its rules and banking
 versions against the GSP's (`version` on the state snapshot). A **rules**
@@ -199,7 +204,7 @@ src/
     pending.ts              Post-submit watcher: applied / rejected / pending, counted in blocks
     coop.ts                 Co-op runtime: relay transport (devnet proxy) + runner that merges both players' actions; duel mode rides the same path, with commit and reveal modelled as action types
     coop_test.ts            Two-runner convergence test over an in-memory relay (`npm test`)
-    duel_test.ts            Two-client duel convergence test, each with its own secret salt (`npm test`)
+    duel_test.ts            Two-client duel convergence test, each with its own secret salt, plus a refreshed client rebuilding the duel from the relay (`npm test`)
   ui/
     modal.ts                Error/confirm/choice dialogs and the amount (stake) picker
     overlay.ts              Overlay rendering
@@ -236,7 +241,7 @@ two clients converge on one merged action log.
 
 **Overworld mode**: Fetches player info, segments, and visits from the GSP. Renders the segment graph centered on the player's current position. Sidebar shows stats, inventory, and action buttons (discover, enter dungeon, and a compact co-op status line with a shortcut into the Co-op tab, which is the lobby).
 
-**Dungeon mode**: Runs a `DungeonSession` locally. In channel mode, uses the real segment seed and player stats from the GSP. On exit, submits the action replay proof on-chain for verification; with `COMPACT_ACTIONS` on (the default) every settlement move (`xc`, the `gw` settlement, `s`) sends the proof as the GSP's compact string encoding (`settle.ts` `encodeCompactLog`, about a quarter of the JSON array's calldata) rather than the JSON array. In co-op the same session runs with two participants, each spawned at the gate they walked in through, and the merged log is settled by mutual consent (`sc` confirm, then `s` settle from participant 0); if a partner goes stale the survivor can continue alone from their last checkpoint and settle with `solo_from`. A duel visit builds the same session in duel mode (the mode is read from the visit row, never from local state), which turns each round into commit/reveal/apply with a per-round reseed from both salts, and settles with an explicit won/lost claim.
+**Dungeon mode**: Runs a `DungeonSession` locally. In channel mode, uses the real segment seed and player stats from the GSP. On exit, submits the action replay proof on-chain for verification; with `COMPACT_ACTIONS` on (the default) every settlement move (`xc`, the `gw` settlement, `s`) sends the proof as the GSP's compact string encoding (`settle.ts` `encodeCompactLog`, about a quarter of the JSON array's calldata) rather than the JSON array. In co-op the same session runs with two participants, each spawned at the gate they walked in through, and the merged log is settled by mutual consent (`sc` confirm, then `s` settle from participant 0, or from the other side if participant 0 has not sent it within about 20 seconds); if a partner goes stale the survivor can continue alone from their last checkpoint and settle with `solo_from`. A duel visit builds the same session in duel mode (the mode is read from the visit row, never from local state), which turns each round into commit/reveal/apply with a per-round reseed from both salts, and settles with an explicit won/lost claim.
 
 ## Determinism
 

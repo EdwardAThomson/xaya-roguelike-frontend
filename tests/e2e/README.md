@@ -100,8 +100,13 @@ the frontend built (`npx tsc` → `dist/`), the xayax venv at
   from their own side of the same gate putting up only that floor, and they
   bump into each other until one falls. The run fails if the on-chain pot is
   simply twice the host's stake, so a silently matched join cannot pass for
-  an uneven one. It drives the real DOM because hosting a duel has no debug
-  hook. Headed by default; env:
+  an uneven one. A second scenario walks both players back to the hub,
+  opens another duel, and closes the challenger's browser after both sides
+  have checkpointed; the host waits rather than walking (stepping on a gate
+  in a duel is a concession), abandons once the checkpoint goes stale, and
+  the run fails unless the duel resolves with the vanished side losing and
+  the host free again. It drives the real DOM because hosting a duel has no
+  debug hook. Headed by default; env:
   `ROG_HEADLESS=1`, `ROG_URL`, `ROG_MAX_MIN` (default 12), `ROG_A` /
   `ROG_B` to reuse existing characters (they need gold to stake).
 - `npm run duel:evil` — the adversarial duel suite (`duel_adversarial.mjs`):
@@ -120,12 +125,15 @@ the frontend built (`npx tsc` → `dist/`), the xayax venv at
   person can test a duel from a browser. It joins an open duel (or hosts
   one with `ROG_BOT_OPEN=1`, re-hosting until joined) and plays it by
   driving the real `CoopRunner` over the real relay, sending the checkpoint
-  confirms the browser would, so the human can settle. It closes in on its
-  opponent orthogonally so an arrow-key player can reach it. Env:
-  `ROG_BOT` (name), `ROG_HOST` (only join this player's duels),
-  `ROG_BOT_STAKE_ITEMS=0` (do not stake the bot's bag), `ROG_BOT_WAIT`
-  (seconds, default 300), `ROG_BOT_CONCEDE=1` (walk out and concede),
-  `ROG_BOT_DIR` (gate, default east). Needs a devnet and a confirmed arena.
+  confirms the browser would, so the human can settle; it submits the
+  settlement itself whenever it won or sits in seat 0, win or lose. It
+  closes in on its opponent orthogonally so an arrow-key player can reach
+  it. Env: `ROG_BOT` (name), `ROG_HOST` (only join this player's duels),
+  `ROG_BOT_STAKE_ITEMS=0` (do not stake the bot's bag), `ROG_BOT_STRIP=1`
+  (unequip the bot's gear first, so it can be staked from the bag),
+  `ROG_BOT_WAIT` (seconds, default 300), `ROG_BOT_CONCEDE=1` (walk out and
+  concede), `ROG_BOT_DIR` (gate, default east). Needs a devnet; on a fresh
+  chain with no confirmed arena it confirms (1, 0) with a real run first.
 - `npm run duel:bots`: two `duel:bot` processes fight a staked duel in one
   command (`duel_bots.mjs`), then it asserts against the chain that a duel
   completed and that exactly one bag grew while the other shrank, so escrow

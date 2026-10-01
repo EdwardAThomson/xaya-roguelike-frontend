@@ -27,7 +27,8 @@ checkpoint confirms, continue-alone and settle flow (`net/coop.ts`,
 Duels (backend `docs/SPEC_multiplayer_pvp.md`, Phase 4a) mirror the same
 way: the commit/reveal/apply round, the per-round reseed and the
 player-vs-player attack are pinned by five duel vectors in `npm test`,
-the two-client round is covered by `src/net/duel_test.ts`, and the
+the two-client round is covered by `src/net/duel_test.ts` (including a
+refreshed client rebuilding a finished duel from the relay), and the
 settlement claim is exercised against a real chain by `npm run duel` and
 the adversarial `npm run duel:evil`. A client whose rules version differs
 from the GSP's refuses to host or join at all, because such a run is only
