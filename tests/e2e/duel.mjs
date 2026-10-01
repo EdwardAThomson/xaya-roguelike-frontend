@@ -49,20 +49,30 @@ async function gsp(method, params = []) {
 
 
 /**
- * Ticks every row in the stake picker and confirms it, returning how many
- * were staked.  Returns 0 when no picker appears, which is the case for a
- * character whose bag is empty: the flow skips the step rather than showing
- * an empty dialog.
+ * Ticks every item tile in the stake dialog, returning how many there are.
+ * The dialog is one screen (gold, the item grid, and for a host the floor),
+ * so this does not confirm; the caller does once the rest is filled in.
+ * Returns 0 for a character whose bag is empty: the grid is not drawn.
  */
-async function pickAllStakeItems(page, ms = 6000) {
-  const box = await page.waitForSelector(".modal-stake-list", { timeout: ms })
-    .catch(() => null);
-  if (!box) return 0;
+async function tickAllStakeItems(page) {
   const rows = await page.$$(".modal-stake-row input[type=checkbox]");
-  for (const r of rows) if (!(await r.isChecked())) await r.check();
-  await page.click(".modal-confirm");
-  await sleep(300);
+  // The checkbox is visually hidden behind its tile, so click the tile.
+  for (const r of rows) {
+    if (await r.isChecked()) continue;
+    await (await r.evaluateHandle((e) => e.closest(".modal-stake-row"))).click();
+  }
   return rows.length;
+}
+
+/**
+ * Sets the host's floor when the dialog shows one.  It is hidden while the
+ * stake is zero, since a friendly duel has nothing to protect.
+ */
+async function setFloor(page, value) {
+  const box = await page.$(".modal-floor:not([hidden])");
+  if (!box) return false;
+  await page.fill(".modal-floor-input", String(value));
+  return true;
 }
 
 /** Mirrors page console + errors into the run log, prefixed by actor. */
@@ -222,29 +232,22 @@ try {
   await A.standOnGate(dir);
   await A.pickChoice("wait here for a duel");
   await sleep(400);
-  // Hosting is two number fields now: what you stake, then the least a
-  // challenger may put up.  Stake everything, and set a floor of 1 so the
-  // ASYMMETRIC path is what gets exercised rather than matched stakes.
+  // Hosting is one dialog: what you stake in gold, which bag items go in
+  // with it, and the least a challenger may put up.  Stake everything, and
+  // set a floor of 1 so the ASYMMETRIC path is what gets exercised rather
+  // than matched stakes.  Ticking the items is what makes the floor
+  // non-zero for a character with no gold.
   await A.page.waitForSelector(".modal-amount-input", { timeout: 10000 });
   const maxStake = await A.page.$eval(".modal-amount-input", (e) => Number(e.max));
   console.log(`   stake field offers up to ${maxStake} gold`);
   await A.page.fill(".modal-amount-input", String(maxStake));
-  await A.page.click(".modal-confirm");
-
-  // Then the item picker: a stake can be bag rows as well as gold, so
-  // hosting gained a step between the amount and the floor. Tick
-  // everything, which is what makes the floor non-zero for a character with
-  // no gold and therefore exercises the asymmetric path below.
-  const stakedItems = await pickAllStakeItems(A.page);
+  const stakedItems = await tickAllStakeItems(A.page);
   if (stakedItems > 0) console.log(`   host also staked ${stakedItems} bag row(s)`);
-
   const floor = maxStake > 0 || stakedItems > 0 ? 1 : 0;
-  if (maxStake > 0 || stakedItems > 0) {
-    await A.page.waitForSelector(".modal-amount-input", { timeout: 10000 });
-    await A.page.fill(".modal-amount-input", String(floor));
-    await A.page.click(".modal-confirm");
+  if (await setFloor(A.page, floor))
     console.log(`   host staked ${maxStake}, will accept ${floor} or more`);
-  }
+  else if (floor > 0) fail("the floor field did not appear for a non-zero stake");
+  await A.page.click(".modal-confirm");
   const hosted = await A.until((x) => !!x.player?.active_visit, 35000, "the duel to open");
   const visitId = hosted.player.active_visit.visit_id;
   const onChain = await gsp("getvisitinfo", [visitId]);
@@ -260,10 +263,12 @@ try {
   await B.page.waitForSelector(".modal-amount-input", { timeout: 10000 });
   const myMin = await B.page.$eval(".modal-amount-input", (e) => Number(e.min));
   await B.page.fill(".modal-amount-input", String(myMin));
-  await B.page.click(".modal-confirm");
-  // The challenger gets the picker too, and must clear the floor with gold
+  // The item grid is on the same screen, and the floor is cleared by gold
   // and items TOGETHER, so a player with no gold can still take the duel.
-  await pickAllStakeItems(B.page);
+  await tickAllStakeItems(B.page);
+  if (await B.page.$eval(".modal-confirm", (e) => e.disabled))
+    console.log(`   [${NAME_B} modal] ${await visibleModal(B.page)}`);
+  await B.page.click(".modal-confirm");
   try {
     await B.until((x) => x.player?.active_visit?.visit_id === visitId, 35000, "to join");
   } catch (e) {
@@ -416,10 +421,9 @@ try {
   await sleep(400);
   await A.page.waitForSelector(".modal-amount-input", { timeout: 10000 });
   await A.page.fill(".modal-amount-input", "0");
+  await tickAllStakeItems(A.page);
+  await setFloor(A.page, 0);
   await A.page.click(".modal-confirm");
-  await pickAllStakeItems(A.page);
-  const st2 = await A.page.$(".modal-amount-input");
-  if (st2) { await A.page.fill(".modal-amount-input", "0"); await A.page.click(".modal-confirm"); }
   const hosted2 = await A.until((x) => !!x.player?.active_visit, 35000, "the second duel to open");
   const visit2 = hosted2.player.active_visit.visit_id;
   ok(`duel #${visit2} open`);
@@ -430,8 +434,8 @@ try {
   await B.pickChoice("duel");
   await B.page.waitForSelector(".modal-amount-input", { timeout: 10000 });
   await B.page.fill(".modal-amount-input", "0");
+  await tickAllStakeItems(B.page);
   await B.page.click(".modal-confirm");
-  await pickAllStakeItems(B.page);
   await B.until((x) => x.player?.active_visit?.visit_id === visit2, 35000, "to join the second duel");
   await Promise.all([
     A.until((x) => !!x.coop, 45000, "the second duel to start for the host"),

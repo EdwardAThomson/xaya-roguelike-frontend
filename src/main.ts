@@ -61,7 +61,7 @@ import {
 } from "./net/validator.js";
 import { waitForMove, MoveOutcome } from "./net/pending.js";
 import { showErrorModal, showModal, showConfirmModal, showChoiceModal, showAmountModal,
-         showItemStakeModal, showProgressModal, type ItemStakeRow } from "./ui/modal.js";
+         showStakeModal, showProgressModal, type ItemStakeRow } from "./ui/modal.js";
 import { showOverlay, hideOverlay } from "./ui/overlay.js";
 import { lookupItem } from "./game/items.js";
 
@@ -1937,18 +1937,6 @@ function inCoopLobby(): boolean {
  * leaves the player standing here with the door open.  From the hub, or a
  * segment they are standing in, there is nothing to settle.
  */
-/**
- * Picks the stake for a duel this player is about to host.  Presets rather
- * than a free number: the amounts a player would actually choose are few,
- * and a preset list can be filtered to what they can afford so an
- * unaffordable stake is never offered at all.  0 is kept deliberately --
- * a friendly duel with nothing on it is a real thing to want.
- */
-/**
- * What the challenger puts up.  It must clear the host's floor and need not
- * equal their stake: the point of an uneven duel is the underdog risking
- * less, so this opens at the floor rather than at the host's ante.
- */
 /** The open visit with this id, if it is one we could join from here. */
 function visitById(visitId: number): JoinableVisit | null {
   const from = connState?.player?.segment;
@@ -1956,21 +1944,38 @@ function visitById(visitId: number): JoinableVisit | null {
   return joinableVisits(from).find(j => j.visit.id === visitId) ?? null;
 }
 
+/**
+ * What the challenger puts up, gold and bag items on one screen, and the
+ * last step before walking in.
+ *
+ * The floor is enforced here on gold plus item worth together, because that
+ * total is what the GSP compares with min_stake.  It is also where the
+ * bag-space warning belongs: what the host staked is known here, and
+ * winning it is what could overflow the bag.
+ */
 function showJoinStakeModal(visitId: number, dir: string, hostStake: number,
                             floor: number, gold: number): void {
-  showAmountModal({
+  const staked = visitById(visitId)?.visit.staked_items ?? [];
+  const incoming = staked.length;
+  const spoils = staked.length === 0
+    ? ""
+    : ` They have also put up ${staked.map(i => i.quantity > 1
+        ? `${i.quantity}x ${lookupItem(i.item_id)?.name ?? i.item_id}`
+        : (lookupItem(i.item_id)?.name ?? i.item_id)).join(", ")}, ` +
+      `which you take if you win.`;
+  showStakeModal({
     title: `Duel for how much?`,
     message:
       `They staked ${hostStake} and will accept ` +
-      `${floor === 0 ? "anything" : `${floor} or more`}. Whatever you put up ` +
-      `joins theirs in the pot and the winner takes all of it, so risking ` +
+      `${floor === 0 ? "anything" : `${floor} or more`}, in gold, items or ` +
+      `both. Whatever you put up joins theirs in the pot and the winner ` +
+      `takes all of it, so risking ` +
       `${floor === 0 ? "nothing" : String(floor)} against their ${hostStake} is a cheap shot ` +
-      `worth taking if you fancy your chances. You hold ${gold} gold.`,
-    label: "Your gold",
-    min: 0,
-    max: gold,
-    initial: Math.min(floor, gold),
-    presets: [
+      `worth taking if you fancy your chances.${spoils} Staked items are ` +
+      `locked until the duel settles.`,
+    goldMax: gold,
+    goldInitial: Math.min(floor, gold),
+    goldPresets: [
       ["Nothing", 0],
       ...(floor > 0 && floor <= gold
         ? [[`The floor (${floor})`, floor] as [string, number]] : []),
@@ -1978,61 +1983,17 @@ function showJoinStakeModal(visitId: number, dir: string, hostStake: number,
         ? [[`Match them (${hostStake})`, hostStake] as [string, number]] : []),
       ...(gold > 0 ? [[`All ${gold}`, gold] as [string, number]] : []),
     ],
-    confirmLabel: "Next",
-    cancelLabel: "Never mind",
-    onConfirm: (stake) => showJoinItemsModal(visitId, dir, stake, floor),
-  });
-}
-
-/**
- * Items the challenger puts up, and the last step before walking in.
- *
- * This is where the floor is enforced, on gold plus item worth together,
- * because that total is what the GSP compares with min_stake. It is also
- * where the bag-space warning belongs: what the host staked is known here,
- * and winning it is what could overflow the bag.
- */
-function showJoinItemsModal(visitId: number, dir: string, stake: number,
-                            floor: number): void {
-  const staked = visitById(visitId)?.visit.staked_items ?? [];
-  const rows = stakeableRows();
-  const incoming = staked.length;
-  const spoils = staked.length === 0
-    ? ""
-    : ` They have put up ${staked.map(i => i.quantity > 1
-        ? `${i.quantity}x ${lookupItem(i.item_id)?.name ?? i.item_id}`
-        : (lookupItem(i.item_id)?.name ?? i.item_id)).join(", ")}, ` +
-      `which you take if you win.`;
-
-  if (rows.length === 0) {
-    // Nothing to offer.  Gold alone has to clear the floor, and if it does
-    // not, say so plainly rather than opening an empty picker.
-    if (stake < floor) {
-      showErrorModal("Not enough to take them on",
-        `This duel asks for ${floor} and you can only put up ${stake}. ` +
-        `Your bag is empty, so there is nothing to make up the difference ` +
-        `with. ${shortfallAdvice(floor - stake)}`);
-      return;
-    }
-    const warn = bagSpaceWarning(incoming);
-    if (warn) { showErrorModal("No room to win", warn); return; }
-    void doCoopJoin(visitId, dir, stake, []);
-    return;
-  }
-
-  showItemStakeModal({
-    title: "Anything from your bag?",
-    message:
-      `You can make up the stake with items as well as gold, and they are ` +
-      `locked until the duel settles.${spoils}`,
-    rows,
-    goldWorth: stake,
+    rows: stakeableRows(),
     floor,
     warning: () => bagSpaceWarning(incoming),
     shortfall: shortfallAdvice,
+    emptyNote: "Your bag is empty, so gold is all you can put up. " +
+               "Equipped gear cannot be staked; unequip it first to wager it.",
     confirmLabel: "Walk in",
-    cancelLabel: "Back",
-    onConfirm: (rowids) => { void doCoopJoin(visitId, dir, stake, rowids); },
+    cancelLabel: "Never mind",
+    onConfirm: ({ gold: stake, rowids }) => {
+      void doCoopJoin(visitId, dir, stake, rowids);
+    },
   });
 }
 
@@ -2041,7 +2002,7 @@ function showJoinItemsModal(visitId: number, dir: string, stake: number,
  *
  * Bag rows only: the GSP refuses to escrow equipped gear, so wagering a
  * sword means unequipping it first.  Whole rows only as well, which is why
- * a stack shows as one entry worth the whole stack.
+ * a stack shows as one tile worth the whole stack.
  */
 function stakeableRows(): ItemStakeRow[] {
   const inv = connState?.player?.inventory ?? [];
@@ -2050,11 +2011,13 @@ function stakeableRows(): ItemStakeRow[] {
     const worth = (def?.value ?? 0) * i.quantity;
     return {
       rowid: i.rowid,
-      label: i.quantity > 1
-        ? `${i.quantity}x ${def?.name ?? i.item_id}`
-        : (def?.name ?? i.item_id),
-      detail: `worth ${worth}`,
+      // The stack size is a badge on the tile, so the name stands alone.
+      label: def?.name ?? i.item_id,
+      detail: i.quantity > 1 ? `${i.quantity}x, worth ${worth}` : `worth ${worth}`,
       worth,
+      icon: def?.icon,
+      color: def?.color,
+      quantity: i.quantity,
     };
   }).filter(r => r.worth > 0);
 }
@@ -2121,104 +2084,56 @@ function bagSpaceWarning(incoming: number): string | null {
 }
 
 /**
- * Bag rows to stake, between picking the gold and setting the floor.  The
- * floor is measured against gold plus item worth, so this runs before it.
+ * The host's whole stake on one screen: gold, bag items, and the floor.
+ *
+ * The floor is the least a challenger may put up.  It is the host's only
+ * protection: a duel activates the moment it is full, so they never see who
+ * joined or for how much, and without a floor someone could join a 100 gold
+ * duel for 1 and have a nearly free shot at it.  It is measured against
+ * gold and items together, because that is the sum the GSP compares with
+ * min_stake, so it follows the total as the player picks.
  */
-function showDuelItemsModal(dir: string, stake: number,
-                            armFor?: SegmentRef): void {
-  const rows = stakeableRows();
-  if (rows.length === 0) {
-    // Nothing to offer; skip the step rather than show an empty dialog.
-    showDuelFloorModal(dir, stake, [], armFor);
-    return;
-  }
-  showItemStakeModal({
-    title: "Anything from your bag?",
-    message:
-      `You can wager items as well as gold. The winner takes them, and ` +
-      `they are locked until the duel settles, so you cannot drink a ` +
-      `staked potion or equip a staked sword in the meantime. Equipped ` +
-      `gear cannot be staked; unequip it first if you want to put it up.`,
-    rows,
-    goldWorth: stake,
-    confirmLabel: "Next",
-    cancelLabel: "Back",
-    onConfirm: (rowids) => showDuelFloorModal(dir, stake, rowids, armFor),
-  });
-}
-
 function showDuelStakeModal(dir: string, armFor?: SegmentRef): void {
   const gold = connState?.player?.gold ?? 0;
-  showAmountModal({
+  showStakeModal({
     title: "Stake the duel",
     message:
-      `What you put up. Your challenger does not have to match it: you set ` +
-      `the floor next, and the winner takes the whole pot. Stake 0 for a ` +
-      `friendly duel with nothing on it. You hold ${gold} gold.`,
-    label: "Your stake",
-    min: 0,
-    max: gold,
-    initial: 0,
-    presets: stakePresets(gold),
-    confirmLabel: "Next",
-    cancelLabel: "Never mind",
-    onConfirm: (stake) => showDuelItemsModal(dir, stake, armFor),
-  });
-}
-
-/**
- * The least a challenger may put up against `stake`.  This is the host's
- * only protection: a duel activates the moment it is full, so they never
- * see who joined or for how much, and without a floor someone could join a
- * 100 gold duel for 1 and have a nearly free shot at it.  Defaulting to the
- * host's own stake reproduces matched stakes exactly.
- */
-function showDuelFloorModal(dir: string, stake: number,
-                            stakeItems: number[],
-                            armFor?: SegmentRef): void {
-  // The floor is measured against everything put up, gold and items
-  // together, because that is the sum the GSP compares with min_stake.
-  const rows = stakeableRows();
-  const itemWorth = rows.filter(r => stakeItems.includes(r.rowid))
-                        .reduce((n, r) => n + r.worth, 0);
-  const worth = stake + itemWorth;
-  if (worth === 0) {
-    // Nothing to protect: a friendly duel has no floor to set.
-    if (armFor) armIntent({ kind: "duel", dir, seg: armFor, stake, minStake: 0,
-                            stakeItems, from: connState!.player!.segment });
-    else void doCoopHost(dir, stake, 0, stakeItems);
-    return;
-  }
-  showAmountModal({
-    title: "The least they may risk",
-    message:
-      `You are putting up ${worth}${itemWorth > 0
-        ? ` (${stake} gold and ${itemWorth} in items)` : ""}. A challenger ` +
-      `must put up at least this much to take you on, in gold or items of ` +
-      `their own, and may put up more. Set it low to let an underdog take ` +
-      `a cheap shot at you; set it to ${worth} to insist they match you.` +
-      (itemWorth > 0
-        ? ` Bear in mind that items are lumpy: insisting on ${worth} may ` +
-          `mean nobody can accept without stripping their own gear, so a ` +
-          `high floor on an item duel is a duel that sits empty.`
-        : ""),
-    label: "Minimum",
-    min: 0,
-    max: worth,
-    // Gold-only duels open at "match me", exactly as they always have.  An
-    // item stake opens at half instead: matching a specific sword means the
-    // challenger needs comparable gear, and defaulting to that produces
-    // duels nobody can join (which is how this was found).
-    initial: itemWorth > 0 ? Math.floor(worth / 2) : worth,
-    presets: [
-      ["Anything (0)", 0],
-      ...(worth >= 4 ? [[`Quarter (${Math.floor(worth / 4)})`, Math.floor(worth / 4)] as [string, number]] : []),
-      ...(worth >= 2 ? [[`Half (${Math.floor(worth / 2)})`, Math.floor(worth / 2)] as [string, number]] : []),
-      [`Match me (${worth})`, worth],
-    ],
+      `What you put up, in gold, items or both. The winner takes the whole ` +
+      `pot, and staked items are locked until the duel settles, so you ` +
+      `cannot drink a staked potion or equip a staked sword in the meantime. ` +
+      `Stake nothing for a friendly duel.`,
+    goldMax: gold,
+    goldInitial: 0,
+    goldPresets: stakePresets(gold),
+    rows: stakeableRows(),
+    emptyNote: "Your bag is empty, so there are no items to stake. " +
+               "Equipped gear cannot be staked; unequip it first to wager it.",
+    floorField: {
+      label: "The least they may risk",
+      // Gold-only duels open at "match me", exactly as they always have.  An
+      // item stake opens at half instead: matching a specific sword means the
+      // challenger needs comparable gear, and defaulting to that produces
+      // duels nobody can join (which is how this was found).
+      initial: (worth, itemWorth) =>
+        itemWorth > 0 ? Math.floor(worth / 2) : worth,
+      presets: (worth) => [
+        ["Anything (0)", 0],
+        ...(worth >= 4 ? [[`Quarter (${Math.floor(worth / 4)})`, Math.floor(worth / 4)] as [string, number]] : []),
+        ...(worth >= 2 ? [[`Half (${Math.floor(worth / 2)})`, Math.floor(worth / 2)] as [string, number]] : []),
+        [`Match me (${worth})`, worth],
+      ],
+      hint: (worth, itemWorth) =>
+        `A challenger must put up at least this, in gold or items, and may ` +
+        `put up more. Set it low to let an underdog take a cheap shot at ` +
+        `you, or to ${worth} to insist they match you.` +
+        (itemWorth > 0
+          ? ` Items are lumpy: a high floor on an item duel may mean nobody ` +
+            `can accept without stripping their own gear.`
+          : ""),
+    },
     confirmLabel: "Open the duel",
-    cancelLabel: "Back",
-    onConfirm: (minStake) => {
+    cancelLabel: "Never mind",
+    onConfirm: ({ gold: stake, rowids: stakeItems, minStake }) => {
       if (armFor) armIntent({ kind: "duel", dir, seg: armFor, stake, minStake,
                               stakeItems, from: connState!.player!.segment });
       else void doCoopHost(dir, stake, minStake, stakeItems);
