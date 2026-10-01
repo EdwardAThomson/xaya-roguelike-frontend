@@ -20,7 +20,7 @@ Browser-based frontend for the [Xaya Roguelike](https://github.com/EdwardAThomso
 - **Crash-safe runs**: In-progress dungeon runs persist locally and deterministically resume on reload, and explored maps (fog of war) survive reloads too; a duel's sealed choice for the round is persisted as well, so a reload can still produce its reveal; server-side timeouts and death knock-backs auto-recover
 - **Multiplayer presence**: Other players shown as tokens on the overworld map and listed (active first) in a Players tab
 - **Two-player co-op**: Co-op is local: you meet a partner by walking into the same confirmed segment through your own gates. Step onto a gate and pick "wait here for a partner" or "join" someone already waiting, or use the Co-op tab, which lists only the runs reachable from where you stand. Each player spawns at the gate they came in through, then you play one shared dungeon in rounds of one action each; your partner is drawn in the dungeon and on the minimap, kill rewards split by damage dealt, and the run settles on-chain by mutual consent (`sc` confirm + `s` settle). Checkpoint confirms go out during the run, so if a partner vanishes the sidebar offers **Continue alone from their checkpoint** once their last checkpoint is old enough, and the survivor finishes solo and settles with `solo_from`
-- **Player-vs-player duels**: The same gate that opens a co-op run can open a **duel** instead: stake gold (or nothing), and the challenger who walks in from their own side matches it. Each round is commit / reveal / apply, so neither side can see the other's choice before making their own, and the round's RNG is reseeded from both revealed salts. You attack by bumping into your opponent, the arena shows both HP bars and the round phase, and walking out through a gate is a concession, not an escape: the last one standing takes the pot and banks XP for it
+- **Player-vs-player duels**: The same gate that opens a co-op run can open a **duel** instead: stake gold, items from your bag, or nothing, and the challenger who walks in from their own side puts up at least the host's floor. Each round is commit / reveal / apply, so neither side can see the other's choice before making their own, and the round's RNG is reseeded from both revealed salts. You attack by bumping into your opponent, the arena shows both HP bars and the round phase, and walking out through a gate is a concession, not an escape: the last one standing takes the pot and banks XP for it
 - **Account picker**: On a hosted deploy, Play opens a character chooser listing the characters this browser has already claimed, plus a "new character" form that registers on-chain; local dev keeps the name + Connect controls in the topbar
 - **Channel integration**: Enter dungeons using real on-chain player stats, exit with cryptographic replay proof
 - **Deterministic**: Dungeon generation and RNG verified identical to C++ backend (SHA-256 + MT19937)
@@ -80,8 +80,8 @@ own gates, so both players have to be standing next to it first.
 
 1. Player A steps onto the gate leading to that segment and picks **Wait here for a partner** from the gate choices (equivalently: open the game modal's **Co-op** tab and click **Wait at the *dir* gate**, which lists every run reachable from where you stand). The Co-op tab then shows the open run with a **Cancel run** button
 2. Player B walks to their own gate into the same segment and picks **Join *A*'s run**, at the gate or from the Co-op tab (**Leave run** backs out again)
-3. The run starts automatically once the visit is full; both clients play the same dungeon in rounds of one action per player, each spawning at the gate they walked in through, with the partner drawn in teal
-4. When the run is over, settlement is automatic: the other player sends an `sc` confirm of the merged action log, and participant 0 (first in canonical name order, not necessarily the host) sends the `s` settle once that confirm is on chain
+3. The run starts automatically once the visit is full; both clients play the same dungeon in rounds of one action per player, each spawning at the gate they walked in through, with the partner drawn in teal and your own figure marked by a white ring and a caret above it, so telling the two apart does not rest on colour (a duel opponent is drawn in red)
+4. When the run is over, settlement is automatic: the other player sends an `sc` confirm of the merged action log, and participant 0 (first in canonical name order, not necessarily the host) sends the `s` settle once that confirm is on chain. That is a convention, not a GSP rule: if participant 0 has not settled within about 20 seconds of the other player's confirm, the other player submits the `s` settle itself. A progress modal with no dismiss names each stage until the settlement lands
 5. During the run each client also sends periodic `sc` checkpoint confirms (every `COOP_CHECKPOINT_ACTIONS` applied actions, and at least every `COOP_HEARTBEAT_MS` as a heartbeat). The sidebar shows the partner's last checkpoint and its age; once it is `ABANDON_WINDOW_BLOCKS` old, **Continue alone from their checkpoint** rebuilds the run at that checkpoint, marks the partner absent, and lets the survivor play out and settle solo (`s` with `solo_from`). All three constants live in `src/config.ts`
 
 Leaving a live run is explicit: **Leave the run…** in the sidebar and in the
@@ -106,18 +106,35 @@ segment, so both players still have to be standing next to it first.
 
 1. Player A steps onto the gate and picks **Wait here for a duel**, then names a
    stake: a number field capped at what they actually hold, with quick picks for
-   nothing, a quarter, a half and all of it. The stake leaves the purse
-   immediately and sits in escrow
-2. Player B walks to their own gate into that segment and sees the mode and the
-   stake before joining; a stake they cannot cover is shown as a disabled choice
-   saying what they hold, rather than a move the chain would reject
+   nothing, a quarter, a half and all of it. A second field then sets the
+   **floor**, the least a challenger may put up (sent as `min_stake` on the `v`
+   move); it defaults to the host's own stake, which is the old matched-stakes
+   behaviour, and a stake of 0 skips the question. The stake leaves the purse
+   immediately and sits in escrow. Between the two, a picker offers every
+   stakeable **bag** row with what it is worth (`stake_items` on the `v` move),
+   with a running "gold + items = total" line, because the floor is measured
+   against that total. Equipped gear cannot be staked. When items are part of
+   the stake the floor defaults to half the total rather than all of it, since
+   matching a specific sword would make the duel unjoinable
+2. Player B walks to their own gate into that segment and sees the mode, the
+   host's stake and the floor before joining; if they cannot cover the floor the
+   choice is disabled and says what they hold, rather than a move the chain
+   would reject. Otherwise they name their **own** stake, from the floor up to
+   their whole purse (sent as `stake` on the `j` move), then pick bag rows to
+   add (`stake_items` on the `j` move); the floor is enforced on gold plus item
+   worth, so a player with no gold can still join with a sword. The picker names
+   what the host put up, warns when winning would overflow the bag
+   (`MAX_BAG_ROWS` in `src/config.ts`), and when short of the floor names the
+   cheapest worn piece of gear that would cover the gap. Stakes need not match,
+   and the pot is the sum of the two. Arming a duel join from inside a
+   run asks for the amount up front and seals it with the intent
 3. Each round runs commit → reveal → apply: the player chooses once, at the
    commit step, and the client emits the reveal and then the sealed action as the
    opponent's messages arrive. The round is reseeded from both revealed salts,
    so neither side can bias it. A player who stalls is carried by a fixed tick
-   that runs from the round opening. Input is only taken at the commit step, and
-   a key pressed outside it says which phase the round is in rather than being
-   dropped in silence
+   that runs from the round opening. A key pressed outside the commit step is
+   held and committed as soon as the next round opens, instead of being dropped
+   and replaced by a wait; it counts for one round only, not as a standing order
 4. Bump into your opponent to attack. Walking onto a gate opens **Leaving the
    duel**, which spells out the cost of the only route out: conceding means the
    opponent wins on the spot and takes the pot, and you take the ordinary death
@@ -126,7 +143,12 @@ segment, so both players still have to be standing next to it first.
    winner's gold includes the pot less the rake (`DUEL_RAKE_PERCENT`, 0 today)
    and their XP includes `DUEL_XP_BASE` (20) per level of the loser. Both
    constants in `src/game/settle.ts` mirror the GSP's `moveprocessor.hpp`; if
-   they drift, every duel claim is rejected
+   they drift, every duel claim is rejected. The winner is banked as having
+   survived without reaching a gate, so they are left standing in the arena:
+   the client keeps the arena's map, position and gates rather than dropping
+   to a generic room, and drops it once they leave that segment. The result
+   screen says won/lost and names the pot taken, captured before settling
+   because settlement clears the escrow
 
 Before hosting or joining anything, the client compares its rules and banking
 versions against the GSP's (`version` on the state snapshot). A **rules**
@@ -137,7 +159,10 @@ and carries on, since only the projected rewards would be wrong.
 `npm run duel` drives a full two-browser duel through the real UI, and
 `npm run duel:evil` runs the adversarial suite: two Node actors holding their own
 copy of the engine fight honestly, then take turns trying to steal the result
-over the real move path (see `tests/e2e/README.md`).
+over the real move path. `npm run duel:bot` is a headless opponent for a human
+(it joins an open duel, or hosts one with `ROG_BOT_OPEN=1`), and
+`npm run duel:bots` has two of them fight a staked duel and checks the chain
+(see `tests/e2e/README.md`).
 
 ## Project structure
 
@@ -179,7 +204,7 @@ src/
     pending.ts              Post-submit watcher: applied / rejected / pending, counted in blocks
     coop.ts                 Co-op runtime: relay transport (devnet proxy) + runner that merges both players' actions; duel mode rides the same path, with commit and reveal modelled as action types
     coop_test.ts            Two-runner convergence test over an in-memory relay (`npm test`)
-    duel_test.ts            Two-client duel convergence test, each with its own secret salt (`npm test`)
+    duel_test.ts            Two-client duel convergence test, each with its own secret salt, plus a refreshed client rebuilding the duel from the relay (`npm test`)
   ui/
     modal.ts                Error/confirm/choice dialogs and the amount (stake) picker
     overlay.ts              Overlay rendering
@@ -216,7 +241,7 @@ two clients converge on one merged action log.
 
 **Overworld mode**: Fetches player info, segments, and visits from the GSP. Renders the segment graph centered on the player's current position. Sidebar shows stats, inventory, and action buttons (discover, enter dungeon, and a compact co-op status line with a shortcut into the Co-op tab, which is the lobby).
 
-**Dungeon mode**: Runs a `DungeonSession` locally. In channel mode, uses the real segment seed and player stats from the GSP. On exit, submits the action replay proof on-chain for verification; with `COMPACT_ACTIONS` on (the default) every settlement move (`xc`, the `gw` settlement, `s`) sends the proof as the GSP's compact string encoding (`settle.ts` `encodeCompactLog`, about a quarter of the JSON array's calldata) rather than the JSON array. In co-op the same session runs with two participants, each spawned at the gate they walked in through, and the merged log is settled by mutual consent (`sc` confirm, then `s` settle from participant 0); if a partner goes stale the survivor can continue alone from their last checkpoint and settle with `solo_from`. A duel visit builds the same session in duel mode (the mode is read from the visit row, never from local state), which turns each round into commit/reveal/apply with a per-round reseed from both salts, and settles with an explicit won/lost claim.
+**Dungeon mode**: Runs a `DungeonSession` locally. In channel mode, uses the real segment seed and player stats from the GSP. On exit, submits the action replay proof on-chain for verification; with `COMPACT_ACTIONS` on (the default) every settlement move (`xc`, the `gw` settlement, `s`) sends the proof as the GSP's compact string encoding (`settle.ts` `encodeCompactLog`, about a quarter of the JSON array's calldata) rather than the JSON array. In co-op the same session runs with two participants, each spawned at the gate they walked in through, and the merged log is settled by mutual consent (`sc` confirm, then `s` settle from participant 0, or from the other side if participant 0 has not sent it within about 20 seconds); if a partner goes stale the survivor can continue alone from their last checkpoint and settle with `solo_from`. A duel visit builds the same session in duel mode (the mode is read from the visit row, never from local state), which turns each round into commit/reveal/apply with a per-round reseed from both salts, and settles with an explicit won/lost claim.
 
 ## Determinism
 

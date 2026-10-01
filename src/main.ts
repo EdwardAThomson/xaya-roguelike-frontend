@@ -25,7 +25,7 @@ import { FovMap } from "./render/fov.js";
 import { Connection, ConnectionState } from "./net/connection.js";
 import { PlayerInfo, SegmentInfo, SegmentRef, VisitInfo, VisitSummary,
   segKey, sameSeg, isHub, HUB } from "./net/rpc.js";
-import { Gate } from "./game/dungeon.js";
+import { Gate, Tile } from "./game/dungeon.js";
 import { MoveClient, createMoveClient, Settlement } from "./net/moves.js";
 import { layoutSegments, SegmentNode, hitTestSegment } from "./game/overworld.js";
 import { drawOverworld, NODE_SIZE, CELL, PlayerMarker, OverworldView } from "./render/overworld.js";
@@ -33,7 +33,7 @@ import { drawDungeonMap } from "./render/dungeonmap.js";
 import {
   DEFAULT_GSP_URL, DEFAULT_PROXY_URL, isHostedOrigin,
   ABANDON_WINDOW_BLOCKS, COOP_CHECKPOINT_ACTIONS, COOP_HEARTBEAT_MS,
-  COMPACT_ACTIONS,
+  COMPACT_ACTIONS, MAX_BAG_ROWS,
 } from "./config.js";
 
 /** A solo action proof for xc / gw: compact string or the JSON array. */
@@ -60,7 +60,8 @@ import {
   discoveryCooldownRemaining, neighbour, segName,
 } from "./net/validator.js";
 import { waitForMove, MoveOutcome } from "./net/pending.js";
-import { showErrorModal, showModal, showConfirmModal, showChoiceModal, showAmountModal } from "./ui/modal.js";
+import { showErrorModal, showModal, showConfirmModal, showChoiceModal, showAmountModal,
+         showItemStakeModal, showProgressModal, type ItemStakeRow } from "./ui/modal.js";
 import { showOverlay, hideOverlay } from "./ui/overlay.js";
 import { lookupItem } from "./game/items.js";
 
@@ -143,6 +144,18 @@ let channelVisitId = -1;
 /** Snapshot of player.segment the last time we built a hub session,
  *  so we know to rebuild if it changes (e.g. on death respawn). */
 let hubBuiltAtHub = false;
+/** Only announce the between-runs state once per arrival, not every poll. */
+let strandedNoticeShown = false;
+/** The segment a between-runs lobby room was built for, if any. */
+let lobbyBuiltFor: SegmentRef | null = null;
+/** The segment a finished run's arena is being kept for, if any. */
+let keptArenaFor: SegmentRef | null = null;
+/**
+ * Where a just-finished run left the player, so the between-runs body can
+ * be rebuilt standing in the same spot rather than teleporting them to a
+ * spawn point the moment the fight ends.
+ */
+let lobbyEntryPos: { x: number; y: number } | null = null;
 /** True while the reconnect-mid-channel modal is on screen; prevents
  *  it being shown again on every poll. */
 let reconnectPromptShown = false;
@@ -251,8 +264,18 @@ const CLIENT_RULES_VERSION = 1;
 /** What settlement awards; see BANKING_VERSION in rules.hpp.
  *  2: asymmetric duel stakes (the host posts a floor, each side escrows its
  *  own amount, the pot is the sum, a void refunds each exactly what they
- *  put in).  This client sends and displays those, so it is a 2. */
-const CLIENT_BANKING_VERSION = 2;
+ *  put in).
+ *  3: item stakes.  A duellist may put up bag rows as well as gold, valued
+ *  at ItemDef.value times quantity against the floor; the winner receives
+ *  them before the run's own loot is banked, and a join is refused when
+ *  either side lacks the bag space to receive what the other put up.  This
+ *  client picks and displays those, so it is a 3.
+ *  4: opening confirms. Activating a visit records a length-0 confirm for
+ *  every participant, so someone who joins and never runs a client can
+ *  still be abandoned normally instead of freezing their opponent until
+ *  the void timeout. This client's own opening confirm is unchanged and
+ *  becomes a duplicate. */
+const CLIENT_BANKING_VERSION = 4;
 
 /**
  * Null while the versions agree (or the GSP is too old to say), otherwise
@@ -306,6 +329,39 @@ function runStorageKey(): string | null {
   const name = connState?.playerName;
   return name ? `rog_run:${name}` : null;
 }
+/**
+ * Where the player is standing while BETWEEN runs, per segment.
+ *
+ * The tile has no on-chain meaning out of a run -- the chain knows only
+ * which segment you are in -- so nothing is lost if this is missing. What
+ * is lost is continuity: a refresh otherwise drops you at the segment's
+ * spawn point, which reads as being teleported across the map for no
+ * reason, especially right after winning a duel on a tile you remember.
+ */
+function lobbyPosKey(seg: SegmentRef): string | null {
+  const name = connState?.playerName;
+  return name ? `rog_lobby:${name}:${segKey(seg)}` : null;
+}
+function persistLobbyPos(): void {
+  if (channelSession || coop || coopSolo || !session || !lobbyBuiltFor) return;
+  const key = lobbyPosKey(lobbyBuiltFor);
+  if (!key) return;
+  try {
+    localStorage.setItem(key, JSON.stringify({ x: me().x, y: me().y }));
+  } catch { /* storage disabled: the spawn point is the fallback */ }
+}
+function loadLobbyPos(seg: SegmentRef): { x: number; y: number } | null {
+  const key = lobbyPosKey(seg);
+  if (!key) return null;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const d = JSON.parse(raw);
+    if (typeof d?.x === "number" && typeof d?.y === "number") return d;
+  } catch { /* corrupt entry */ }
+  return null;
+}
+
 function persistRun(): void {
   const key = runStorageKey();
   if (!key || !channelSession || !session || coop || coopSolo) return;
@@ -399,6 +455,17 @@ function ensureSessionFromChainState(): void {
     return;
   }
 
+  // A kept arena belongs to ONE segment. Walking away from it must drop it,
+  // or the player carries a stale map into wherever they went: after
+  // travelling back to the hub they were still looking at the arena, and
+  // its gates are not the hub's gates.
+  if (!channelSession && session && keptArenaFor
+      && !sameSeg(keptArenaFor, p.segment)) {
+    keptArenaFor = null;
+    session = null;
+    fov = null;
+  }
+
   if (channelSession || session) return;  // already have something
 
   if (p.in_channel && p.active_visit) {
@@ -432,6 +499,26 @@ function ensureSessionFromChainState(): void {
   }
 
   ensureHubSessionIfAtHub();
+  ensureLobbySessionIfStanding();
+
+  // Standing in a real segment, out of any run. There is no world to draw
+  // here: the overworld is a meta-view, not a place, and the only session
+  // the client builds outside a run is the hub's safe room. Saying nothing
+  // leaves a blank game and a Map, which reads as a hang -- and this is no
+  // longer a rare state, because a duel winner is banked as having survived
+  // without reaching a gate and lands here every time they win.
+  if (!p.in_channel && !isHub(p.segment) && !session && !strandedNoticeShown) {
+    strandedNoticeShown = true;
+    setMode("overworld");
+    setMapTab("world");
+    selectedSegment = p.segment;
+    addOverworldMessage(
+      `You are standing in ${segName(p.segment)}, between runs. ` +
+      `Enter the dungeon here, or walk to a neighbouring segment ` +
+      `(travelling can run into trouble on the way).`, "info");
+    updateSidebar();
+    render();
+  }
 }
 
 /**
@@ -609,6 +696,9 @@ function ensureHubSessionIfAtHub(entryDirection: string = ""): void {
   if (!p) return;
   if (channelSession) return;  // real session takes precedence
   if (p.in_channel) return;     // about to load a real session
+  // As in ensureLobbySessionIfStanding: a multiplayer participant is not
+  // in_channel, so in_channel alone is not "has no run".
+  if (p.active_visit) return;
   if (!isHub(p.segment)) return;
 
   if (hubBuiltAtHub && session !== null) return;  // already built
@@ -630,6 +720,9 @@ function ensureHubSessionIfAtHub(entryDirection: string = ""): void {
     equipAttack: p.effective_stats.equip_attack,
     equipDefense: p.effective_stats.equip_defense,
   };
+  strandedNoticeShown = false;
+  lobbyBuiltFor = null;
+  keptArenaFor = null;
   session = DungeonSession.createHub(stats, p.hp, p.max_hp, entryDirection);
   fov = new FovMap();
   currentFogKey = "hub";
@@ -637,6 +730,94 @@ function ensureHubSessionIfAtHub(entryDirection: string = ""): void {
   fov.update(me().x, me().y, session.dungeon);
   camera.centerOn(me().x, me().y);
   hubBuiltAtHub = true;
+}
+
+/**
+ * A body to stand in while between runs on a real segment.
+ *
+ * The hub is a room you can walk around; every other segment, out of a run,
+ * was a map and some buttons and no character at all. That is not a view of
+ * anything -- the player reasonably reads it as the game having lost them,
+ * and a duel winner lands there every single time they win, because they are
+ * banked as having survived without ever walking out of a gate.
+ *
+ * So: the same safe room the hub uses, anchored at this segment. It is
+ * cosmetic exactly as the hub's is (depth 0, no monsters, no loot, never
+ * replayed, `channelSession` stays false so nothing mistakes it for a run).
+ * What it buys is the interaction the player already knows: walk to a gate,
+ * step through, and doGateWalk does a free transit to the neighbour.
+ */
+function ensureLobbySessionIfStanding(): void {
+  const p = connState?.player;
+  if (!p) return;
+  if (channelSession || coop || coopSolo) return;
+  // `in_channel` is FALSE for a multiplayer participant: a duellist is in an
+  // active VISIT, not a channel. Checking only in_channel built this room on
+  // top of a live duel whenever `coop` was briefly null -- which is exactly
+  // the window after a reload, before syncCoopFromChain restores the run.
+  // The player then walked around a phantom room while their duel was still
+  // being fought, and stepping on one of its gates fired a real gate-walk
+  // that discovered a new segment mid-duel. Never build a body for someone
+  // the chain says is already in a visit.
+  if (p.in_channel || p.active_visit || isHub(p.segment)) return;
+  if (session && lobbyBuiltFor && sameSeg(lobbyBuiltFor, p.segment)) return;
+  // A session we are already holding is the real arena kept after a run
+  // (see finishCoop). Replacing it with the generic room would undo the
+  // whole point of keeping it.
+  if (session && !lobbyBuiltFor
+      && (!keptArenaFor || sameSeg(keptArenaFor, p.segment))) return;
+
+  const stats: PlayerStats = {
+    level: p.level,
+    strength: p.effective_stats.strength,
+    dexterity: p.effective_stats.dexterity,
+    constitution: p.effective_stats.constitution,
+    intelligence: p.effective_stats.intelligence,
+    equipAttack: p.effective_stats.equip_attack,
+    equipDefense: p.effective_stats.equip_defense,
+  };
+  // The REAL map of the segment you are standing in, not the hub's room.
+  //
+  // createHub draws a plain 16x12 box, and using it here told a flat lie:
+  // a duel winner is left standing in the arena, the sidebar said
+  // "Segment (1, 0)", and the screen showed something visually identical
+  // to the hub. Players read that as having been thrown back to the hub,
+  // reported it as such, and they were right to.
+  //
+  // The segment's seed generates its dungeon deterministically, so the
+  // layout, the gates and their directions are all truthful. Monsters and
+  // floor loot are cleared: this is NOT a run, nothing here can be fought
+  // or picked up, and leaving them on screen would promise a fight that
+  // the next `ec` would regenerate differently anyway.
+  const segInfo = connState?.segments.get(segKey(p.segment));
+  if (segInfo) {
+    session = new DungeonSession(
+      segInfo.seed, segInfo.depth, stats, p.hp, p.max_hp, [],
+      constraintsFor(segInfo), "", []);
+    session.monsters.length = 0;
+    session.groundItems.length = 0;
+    // Stand where the run left you, not at a spawn point: a duel winner
+    // should still be on the tile they won on.
+    const stand = lobbyEntryPos ?? loadLobbyPos(p.segment);
+    const standTile = stand
+      ? session.dungeon.getTile(stand.x, stand.y) : null;
+    if (stand && standTile !== null && standTile !== Tile.Wall) {
+      session.players[0].x = stand.x;
+      session.players[0].y = stand.y;
+    }
+    currentFogKey = "seg:" + segInfo.seed;
+  } else {
+    // Segment cache not populated yet: the plain room is better than a
+    // blank screen, and the next poll replaces it with the real thing.
+    session = DungeonSession.createHub(stats, p.hp, p.max_hp, "");
+    currentFogKey = "lobby:" + segKey(p.segment);
+  }
+  fov = new FovMap();
+  fov.explored = persistentExplored(currentFogKey);
+  fov.update(me().x, me().y, session.dungeon);
+  camera.centerOn(me().x, me().y);
+  lobbyBuiltFor = segInfo ? p.segment : null;
+  lobbyEntryPos = null;
 }
 
 gspUrlInput.value = DEFAULT_GSP_URL;
@@ -1525,6 +1706,14 @@ async function coopSettle(): Promise<void> {
   const myName = connState!.playerName;
   coopSettling = true;
   coopSettleError = null;
+  // Snapshot the pot NOW. Settlement hands the escrowed rows to the winner
+  // and clears them, so by the time the summary is built the visit reports
+  // no staked items and the one thing the winner cares about has vanished
+  // from the only screen that reports the result.
+  lastDuelPot = coopVisit?.staked_items ?? [];
+  const progress = showProgressModal(
+    "Settling the run",
+    "Writing the result to the chain. This takes a few blocks.");
 
   const hash = settleLogHash(visitId, s.mergedLog);
   const results = toWireResults(s, runner.names, coopVisit?.pot ?? 0);
@@ -1536,6 +1725,7 @@ async function coopSettle(): Promise<void> {
   try {
     if (runner.me === 0) {
       s.addMessage("Run over. Waiting for your partner's confirmation...", "info");
+      progress.update("Waiting for the other side to confirm the log.");
       updateSidebar();
       const deadline = Date.now() + 180000;
       let done = false;
@@ -1553,6 +1743,7 @@ async function coopSettle(): Promise<void> {
         }
         if (others.every(n => v.confirms[n]?.h === hash && v.confirms[n]?.n === total)) {
           s.addMessage("Confirmation received. Settling on-chain...", "info");
+          progress.update("Confirmed. Writing the settlement to the chain...");
           updateSidebar();
           await moves.settle(myName, visitId, results, actions);
           const ok = await waitForVisitStatus(visitId, st => st !== "active", 60000);
@@ -1568,9 +1759,23 @@ async function coopSettle(): Promise<void> {
       updateSidebar();
       await moves.settleConfirm(myName, visitId, hash, s.mergedLog.length);
       s.addMessage("Confirmed. Waiting for the host to settle...", "info");
+      progress.update("Your confirmation is in. Waiting for them to submit.");
       updateSidebar();
-      const ok = await waitForVisitStatus(visitId, st => st !== "active", 180000);
-      if (!ok) throw new Error("Timed out waiting for the settlement. Retry to re-send your confirmation.");
+      // Participant 0 submitting is a convention to save a duplicate move,
+      // not a rule the GSP enforces: it accepts a settle from anyone whose
+      // opponents have confirmed the whole log. Waiting forever on that
+      // convention strands the WINNER when the host is the one who lost and
+      // has no reason to hurry, which is a duel decided and then frozen.
+      // So wait a short while for them, then settle it ourselves.
+      const theirs = await waitForVisitStatus(visitId, st => st !== "active", 20000);
+      if (!theirs) {
+        s.addMessage("They have not settled it. Doing it myself...", "info");
+        progress.update("They have not submitted it. Settling it myself...");
+        updateSidebar();
+        await moves.settle(myName, visitId, results, actions);
+        const ok = await waitForVisitStatus(visitId, st => st !== "active", 60000);
+        if (!ok) throw new Error("The GSP did not settle the run in time. Retry the settlement.");
+      }
     }
     busy = false;
     coopSettling = false;
@@ -1586,6 +1791,9 @@ async function coopSettle(): Promise<void> {
 }
 
 /** Tears down a finished co-op run and re-syncs the view to the chain. */
+/** The items staked on the duel being settled, captured before payout. */
+let lastDuelPot: Array<{ item_id: string; quantity: number; worth: number }> = [];
+
 async function finishCoop(): Promise<void> {
   if (!coop && !coopSolo) return;
   coop?.stop();
@@ -1600,22 +1808,56 @@ async function finishCoop(): Promise<void> {
   try {
     const v = await connection.rpc?.getvisitinfo(visitId);
     if (v?.results) {
+      const duel = v.mode === "duel";
       summary = v.results.map(r =>
-        `${r.name}: ${r.survived ? "survived" : "died"}, +${r.xp_gained} XP, ` +
-        `+${r.gold_gained} gold, ${r.kills} kill${r.kills === 1 ? "" : "s"}`).join("\n");
+        `${r.name}: ${duel ? (r.survived ? "won" : "lost") : (r.survived ? "survived" : "died")}` +
+        `, +${r.xp_gained} XP, +${r.gold_gained} gold` +
+        // `kills` counts MONSTERS. Printing "0 kills" beside a duel a player
+        // just won by killing someone reads as nothing having happened.
+        (duel ? "" : `, ${r.kills} kill${r.kills === 1 ? "" : "s"}`)).join("\n");
     }
   } catch { /* summary is best-effort */ }
 
   channelSession = false;
-  session = null;
-  fov = null;
+  const ranIn = channelSegment;
   hubBuiltAtHub = false;
   coopVisit = null;
   armedIntent = null;
   coopSettling = false;
   coopSettleError = null;
+
+  // Refresh BEFORE deciding anything about where the player is.
+  //
+  // This used to come after, and the decision was made against the player
+  // state from before the settlement landed. A duellist's on-chain segment
+  // is still the one they joined FROM until settlement places them, so the
+  // check read "you are at the hub", threw the arena away, and then the
+  // refresh moved them to the arena and the lobby drew its plain box. The
+  // player was left looking at the hub's room with the sidebar insisting
+  // they were in (1, 0), which is exactly as confusing as it sounds, and
+  // the keep-the-arena path never once ran.
   try { await connection.refreshPlayer(); } catch { /* next poll */ }
+
+  // Drop the finished session, ALWAYS, and remember only where it left the
+  // player standing.
+  //
+  // Keeping it was the wrong mechanism twice over. It is the settled log,
+  // so walking around in it would mutate state the chain has already
+  // accepted; and handleGameInput refuses everything once `gameOver` is
+  // set, so the player got a body they could see and could not move. The
+  // between-runs body is rebuilt fresh from the segment's seed instead --
+  // the same real map, walkable, not game-over -- which is what the reload
+  // path has been doing correctly all along.
+  const p0 = connState?.player;
+  const stayingPut = !!session && !!p0 && !p0.in_channel
+    && !!ranIn && !isHub(p0.segment) && sameSeg(ranIn, p0.segment);
+  lobbyEntryPos = stayingPut ? { x: me().x, y: me().y } : null;
+  keptArenaFor = null;
+  session = null;
+  fov = null;
+  lobbyBuiltFor = null;
   try { ensureHubSessionIfAtHub(); } catch { /* not fatal to the teardown */ }
+  try { ensureLobbySessionIfStanding(); } catch { /* not fatal to the teardown */ }
   if (!session) setMode("overworld");
   // Where the player is left standing is the first thing they need, and
   // nothing used to say it.  A duel winner in particular is banked without
@@ -1634,7 +1876,25 @@ async function finishCoop(): Promise<void> {
       whereLine = `You are in ${segName(now.segment)}.`;
     }
   }
+  // What changed hands. The winner's whole reason for taking the duel, and
+  // the summary said nothing about it.
+  let potLine = "";
+  if (wasDuel && lastDuelPot.length > 0 && now) {
+    const iWon = !!(await connection.rpc?.getvisitinfo(visitId)
+      .then(v => v?.results?.find(r => r.name === now.name)?.survived)
+      .catch(() => undefined));
+    const list = lastDuelPot.map(i => i.quantity > 1
+      ? `${i.quantity}x ${lookupItem(i.item_id)?.name ?? i.item_id}`
+      : (lookupItem(i.item_id)?.name ?? i.item_id)).join(", ");
+    const worth = lastDuelPot.reduce((n, i) => n + i.worth, 0);
+    potLine = iWon
+      ? `You won the pot: ${list} (worth ${worth}). It is in your bag.`
+      : `You lost the pot: ${list} (worth ${worth}).`;
+  }
+  lastDuelPot = [];
+
   addOverworldMessage(wasDuel ? "Duel settled." : "Co-op run settled.", "info");
+  if (potLine) addOverworldMessage(potLine, wasDuel ? "info" : "info");
   if (whereLine) addOverworldMessage(whereLine, "info");
   // The redraw must happen even if the summary dialog throws.  Anything that
   // skips updateSidebar here leaves the page showing the mid-run sidebar for
@@ -1643,7 +1903,7 @@ async function finishCoop(): Promise<void> {
   try {
     showModal({
       title: wasDuel ? "Duel settled" : "Co-op run settled",
-      message: [summary || "The run has settled on-chain.", whereLine]
+      message: [summary || "The run has settled on-chain.", potLine, whereLine]
         .filter(Boolean).join("\n\n"),
       variant: "info",
     });
@@ -1689,6 +1949,13 @@ function inCoopLobby(): boolean {
  * equal their stake: the point of an uneven duel is the underdog risking
  * less, so this opens at the floor rather than at the host's ante.
  */
+/** The open visit with this id, if it is one we could join from here. */
+function visitById(visitId: number): JoinableVisit | null {
+  const from = connState?.player?.segment;
+  if (!from) return null;
+  return joinableVisits(from).find(j => j.visit.id === visitId) ?? null;
+}
+
 function showJoinStakeModal(visitId: number, dir: string, hostStake: number,
                             floor: number, gold: number): void {
   showAmountModal({
@@ -1699,19 +1966,184 @@ function showJoinStakeModal(visitId: number, dir: string, hostStake: number,
       `joins theirs in the pot and the winner takes all of it, so risking ` +
       `${floor === 0 ? "nothing" : String(floor)} against their ${hostStake} is a cheap shot ` +
       `worth taking if you fancy your chances. You hold ${gold} gold.`,
-    label: "Your stake",
-    min: floor,
+    label: "Your gold",
+    min: 0,
     max: gold,
-    initial: floor,
+    initial: Math.min(floor, gold),
     presets: [
-      [`Least (${floor})`, floor],
-      ...(hostStake >= floor && hostStake <= gold
+      ["Nothing", 0],
+      ...(floor > 0 && floor <= gold
+        ? [[`The floor (${floor})`, floor] as [string, number]] : []),
+      ...(hostStake > 0 && hostStake <= gold && hostStake !== floor
         ? [[`Match them (${hostStake})`, hostStake] as [string, number]] : []),
-      ...(gold > floor ? [[`All ${gold}`, gold] as [string, number]] : []),
+      ...(gold > 0 ? [[`All ${gold}`, gold] as [string, number]] : []),
     ],
-    confirmLabel: "Walk in",
+    confirmLabel: "Next",
     cancelLabel: "Never mind",
-    onConfirm: (stake) => { void doCoopJoin(visitId, dir, stake); },
+    onConfirm: (stake) => showJoinItemsModal(visitId, dir, stake, floor),
+  });
+}
+
+/**
+ * Items the challenger puts up, and the last step before walking in.
+ *
+ * This is where the floor is enforced, on gold plus item worth together,
+ * because that total is what the GSP compares with min_stake. It is also
+ * where the bag-space warning belongs: what the host staked is known here,
+ * and winning it is what could overflow the bag.
+ */
+function showJoinItemsModal(visitId: number, dir: string, stake: number,
+                            floor: number): void {
+  const staked = visitById(visitId)?.visit.staked_items ?? [];
+  const rows = stakeableRows();
+  const incoming = staked.length;
+  const spoils = staked.length === 0
+    ? ""
+    : ` They have put up ${staked.map(i => i.quantity > 1
+        ? `${i.quantity}x ${lookupItem(i.item_id)?.name ?? i.item_id}`
+        : (lookupItem(i.item_id)?.name ?? i.item_id)).join(", ")}, ` +
+      `which you take if you win.`;
+
+  if (rows.length === 0) {
+    // Nothing to offer.  Gold alone has to clear the floor, and if it does
+    // not, say so plainly rather than opening an empty picker.
+    if (stake < floor) {
+      showErrorModal("Not enough to take them on",
+        `This duel asks for ${floor} and you can only put up ${stake}. ` +
+        `Your bag is empty, so there is nothing to make up the difference ` +
+        `with. ${shortfallAdvice(floor - stake)}`);
+      return;
+    }
+    const warn = bagSpaceWarning(incoming);
+    if (warn) { showErrorModal("No room to win", warn); return; }
+    void doCoopJoin(visitId, dir, stake, []);
+    return;
+  }
+
+  showItemStakeModal({
+    title: "Anything from your bag?",
+    message:
+      `You can make up the stake with items as well as gold, and they are ` +
+      `locked until the duel settles.${spoils}`,
+    rows,
+    goldWorth: stake,
+    floor,
+    warning: () => bagSpaceWarning(incoming),
+    shortfall: shortfallAdvice,
+    confirmLabel: "Walk in",
+    cancelLabel: "Back",
+    onConfirm: (rowids) => { void doCoopJoin(visitId, dir, stake, rowids); },
+  });
+}
+
+/**
+ * The bag rows this player could stake, with what each is worth.
+ *
+ * Bag rows only: the GSP refuses to escrow equipped gear, so wagering a
+ * sword means unequipping it first.  Whole rows only as well, which is why
+ * a stack shows as one entry worth the whole stack.
+ */
+function stakeableRows(): ItemStakeRow[] {
+  const inv = connState?.player?.inventory ?? [];
+  return inv.filter(i => i.slot === "bag").map(i => {
+    const def = lookupItem(i.item_id);
+    const worth = (def?.value ?? 0) * i.quantity;
+    return {
+      rowid: i.rowid,
+      label: i.quantity > 1
+        ? `${i.quantity}x ${def?.name ?? i.item_id}`
+        : (def?.name ?? i.item_id),
+      detail: `worth ${worth}`,
+      worth,
+    };
+  }).filter(r => r.worth > 0);
+}
+
+/**
+ * Equipped rows that could be unequipped and then staked, cheapest first.
+ *
+ * Only bag rows are stakeable, so a player short of a duel's floor is very
+ * often short only because their value is worn rather than carried. Telling
+ * them that is the difference between a dialog that refuses them and one
+ * that shows them the way through.
+ */
+function unequippableWorth(): Array<{ name: string; worth: number }> {
+  const inv = connState?.player?.inventory ?? [];
+  return inv
+    .filter(i => i.slot !== "bag")
+    .map(i => {
+      const def = lookupItem(i.item_id);
+      return { name: def?.name ?? i.item_id,
+               worth: (def?.value ?? 0) * i.quantity };
+    })
+    .filter(i => i.worth > 0)
+    .sort((a, b) => a.worth - b.worth);
+}
+
+/**
+ * Says how to close a shortfall of `short`, naming the gear that would do
+ * it.  Falls back to the bare fact when nothing they own would help.
+ */
+function shortfallAdvice(short: number): string {
+  const worn = unequippableWorth();
+  const enough = worn.filter(w => w.worth >= short);
+  if (enough.length > 0) {
+    const pick = enough[0];
+    return `Short by ${short}. Unequipping your ${pick.name} (worth ` +
+           `${pick.worth}) would cover it, then stake it here.`;
+  }
+  const all = worn.reduce((n, w) => n + w.worth, 0);
+  if (all >= short) {
+    return `Short by ${short}. Unequipping your gear (${worn.map(
+      w => `${w.name} ${w.worth}`).join(", ")}) would get you there.`;
+  }
+  return `Short by ${short}, and everything you own would not cover it. ` +
+         `This duel is out of your reach.`;
+}
+
+/** Bag rows free, for the warning about winning more than will fit. */
+function freeBagRows(): number {
+  const inv = connState?.player?.inventory ?? [];
+  return MAX_BAG_ROWS - inv.filter(i => i.slot === "bag").length;
+}
+
+/**
+ * Warns when what the OPPONENT put up would not fit if we won it.  The GSP
+ * refuses such a join outright (it will not let a duel reach a settlement
+ * it cannot pay out), so this only explains it before the move is sent.
+ * `incoming` is the number of rows we would receive.
+ */
+function bagSpaceWarning(incoming: number): string | null {
+  const free = freeBagRows();
+  if (incoming <= free) return null;
+  return `Your bag has ${free} free row${free === 1 ? "" : "s"} and winning ` +
+         `would hand you ${incoming}. Make room first or the duel will be refused.`;
+}
+
+/**
+ * Bag rows to stake, between picking the gold and setting the floor.  The
+ * floor is measured against gold plus item worth, so this runs before it.
+ */
+function showDuelItemsModal(dir: string, stake: number,
+                            armFor?: SegmentRef): void {
+  const rows = stakeableRows();
+  if (rows.length === 0) {
+    // Nothing to offer; skip the step rather than show an empty dialog.
+    showDuelFloorModal(dir, stake, [], armFor);
+    return;
+  }
+  showItemStakeModal({
+    title: "Anything from your bag?",
+    message:
+      `You can wager items as well as gold. The winner takes them, and ` +
+      `they are locked until the duel settles, so you cannot drink a ` +
+      `staked potion or equip a staked sword in the meantime. Equipped ` +
+      `gear cannot be staked; unequip it first if you want to put it up.`,
+    rows,
+    goldWorth: stake,
+    confirmLabel: "Next",
+    cancelLabel: "Back",
+    onConfirm: (rowids) => showDuelFloorModal(dir, stake, rowids, armFor),
   });
 }
 
@@ -1730,7 +2162,7 @@ function showDuelStakeModal(dir: string, armFor?: SegmentRef): void {
     presets: stakePresets(gold),
     confirmLabel: "Next",
     cancelLabel: "Never mind",
-    onConfirm: (stake) => showDuelFloorModal(dir, stake, armFor),
+    onConfirm: (stake) => showDuelItemsModal(dir, stake, armFor),
   });
 }
 
@@ -1742,37 +2174,54 @@ function showDuelStakeModal(dir: string, armFor?: SegmentRef): void {
  * host's own stake reproduces matched stakes exactly.
  */
 function showDuelFloorModal(dir: string, stake: number,
+                            stakeItems: number[],
                             armFor?: SegmentRef): void {
-  if (stake === 0) {
+  // The floor is measured against everything put up, gold and items
+  // together, because that is the sum the GSP compares with min_stake.
+  const rows = stakeableRows();
+  const itemWorth = rows.filter(r => stakeItems.includes(r.rowid))
+                        .reduce((n, r) => n + r.worth, 0);
+  const worth = stake + itemWorth;
+  if (worth === 0) {
     // Nothing to protect: a friendly duel has no floor to set.
     if (armFor) armIntent({ kind: "duel", dir, seg: armFor, stake, minStake: 0,
-                            from: connState!.player!.segment });
-    else void doCoopHost(dir, stake, 0);
+                            stakeItems, from: connState!.player!.segment });
+    else void doCoopHost(dir, stake, 0, stakeItems);
     return;
   }
   showAmountModal({
     title: "The least they may risk",
     message:
-      `You are staking ${stake}. A challenger must put up at least this ` +
-      `much to take you on, and may put up more. Set it low to let an ` +
-      `underdog take a cheap shot at you; set it to ${stake} to insist they ` +
-      `match you, which is how duels worked before.`,
+      `You are putting up ${worth}${itemWorth > 0
+        ? ` (${stake} gold and ${itemWorth} in items)` : ""}. A challenger ` +
+      `must put up at least this much to take you on, in gold or items of ` +
+      `their own, and may put up more. Set it low to let an underdog take ` +
+      `a cheap shot at you; set it to ${worth} to insist they match you.` +
+      (itemWorth > 0
+        ? ` Bear in mind that items are lumpy: insisting on ${worth} may ` +
+          `mean nobody can accept without stripping their own gear, so a ` +
+          `high floor on an item duel is a duel that sits empty.`
+        : ""),
     label: "Minimum",
     min: 0,
-    max: stake,
-    initial: stake,
+    max: worth,
+    // Gold-only duels open at "match me", exactly as they always have.  An
+    // item stake opens at half instead: matching a specific sword means the
+    // challenger needs comparable gear, and defaulting to that produces
+    // duels nobody can join (which is how this was found).
+    initial: itemWorth > 0 ? Math.floor(worth / 2) : worth,
     presets: [
       ["Anything (0)", 0],
-      ...(stake >= 4 ? [[`Quarter (${Math.floor(stake / 4)})`, Math.floor(stake / 4)] as [string, number]] : []),
-      ...(stake >= 2 ? [[`Half (${Math.floor(stake / 2)})`, Math.floor(stake / 2)] as [string, number]] : []),
-      [`Match me (${stake})`, stake],
+      ...(worth >= 4 ? [[`Quarter (${Math.floor(worth / 4)})`, Math.floor(worth / 4)] as [string, number]] : []),
+      ...(worth >= 2 ? [[`Half (${Math.floor(worth / 2)})`, Math.floor(worth / 2)] as [string, number]] : []),
+      [`Match me (${worth})`, worth],
     ],
     confirmLabel: "Open the duel",
     cancelLabel: "Back",
     onConfirm: (minStake) => {
       if (armFor) armIntent({ kind: "duel", dir, seg: armFor, stake, minStake,
-                              from: connState!.player!.segment });
-      else void doCoopHost(dir, stake, minStake);
+                              stakeItems, from: connState!.player!.segment });
+      else void doCoopHost(dir, stake, minStake, stakeItems);
     },
   });
 }
@@ -1812,7 +2261,8 @@ function inCoopVisitNow(): boolean {
 }
 
 async function doCoopHost(dir: string, duelStake?: number,
-                          duelMinStake?: number): Promise<void> {
+                          duelMinStake?: number,
+                          duelStakeItems?: number[]): Promise<void> {
   if (busy || !moves || !connState?.playerName) return;
   if (rulesMismatch) { showErrorModal("Client out of date", rulesMismatch); return; }
   const p = connState.player;
@@ -1841,7 +2291,8 @@ async function doCoopHost(dir: string, duelStake?: number,
     await moves.visit(connState.playerName, dir, settlement ?? undefined,
                       duelStake === undefined
                         ? undefined
-                        : { stake: duelStake, minStake: duelMinStake });
+                        : { stake: duelStake, minStake: duelMinStake,
+                            stakeItems: duelStakeItems });
     const outcome = await waitForMove(connection, ({ player }) =>
       !!player?.active_visit && sameSeg(player.active_visit.segment, target));
     if (outcome === "applied") {
@@ -1888,7 +2339,8 @@ async function doCoopHost(dir: string, duelStake?: number,
  * rules as hosting.
  */
 async function doCoopJoin(visitId: number, dir: string,
-                          stake?: number): Promise<void> {
+                          stake?: number,
+                          stakeItems?: number[]): Promise<void> {
   if (rulesMismatch) { showErrorModal("Client out of date", rulesMismatch); return; }
   if (busy || !moves || !connState?.playerName) return;
   const p = connState.player;
@@ -1910,7 +2362,7 @@ async function doCoopJoin(visitId: number, dir: string,
   updateSidebar();
   try {
     await moves.join(connState.playerName, visitId, dir, settlement ?? undefined,
-                     stake);
+                     stake, stakeItems);
     const outcome = await waitForMove(connection, ({ player }) =>
       player?.active_visit?.visit_id === visitId);
     if (outcome === "applied") {
@@ -2024,23 +2476,33 @@ function handleCoopInput(action: string, dir?: Direction): void {
     }
     return;
   }
+  const held = coop.heldIntent;
   if (!coop.submitLocal(a)) {
-    // A duel only takes input during the commit phase of a round, and only
-    // once: every other key press was dropped in silence, which is why
-    // drinking a potion mid-duel looked broken.
     if (session.isDuel()) {
       const now = Date.now();
       if (now - lastInputFullNote > 2500) {
         lastInputFullNote = now;
         session.addMessage(
-          coop.phaseLabel === "choose"
-            ? "You have already sealed your move for this round."
-            : `Not now: the round is ${coop.phaseLabel}. Your next choice opens when it resolves.`,
+          "Not now: this round cannot take a choice. It will open again.",
           "info");
         updateSidebar();
       }
     }
     return;
+  }
+  // A duel press outside the commit window is HELD for the next round
+  // rather than dropped (see CoopRunner.intent). Say so, or the player
+  // sees nothing happen and presses again, which is how a duel ended up
+  // feeling like it ignored you while the tick committed waits for you.
+  if (session.isDuel() && coop.heldIntent !== null && coop.heldIntent !== held) {
+    const now = Date.now();
+    if (now - lastInputFullNote > 1200) {
+      lastInputFullNote = now;
+      session.addMessage(
+        "Standing order: that is what you will do each round until you " +
+        "press something else.", "info");
+      updateSidebar();
+    }
   }
 
   // Arrival on a gate is announced from coopOnChange, once the move has
@@ -2964,9 +3426,20 @@ resize();
 
 function render(): void {
   if (mode === "overworld") {
+    // The Dungeon tab reflects a real dungeon run only. With no run it drew
+    // an empty canvas and said nothing, which is indistinguishable from the
+    // game having died -- and a duel winner is left in exactly that state
+    // every time, because they are banked without walking out of a gate.
+    // Fall back to the World map, which always has something true to show.
+    // Switch the tab without going back through setMapTab, which calls
+    // render() and would re-enter this function.
+    if (mapTab === "dungeon" && !channelSession) {
+      mapTab = "world";
+      mapTabWorldBtn.classList.add("active");
+      mapTabDungeonBtn.classList.remove("active");
+      applyMapTabControls();
+    }
     if (mapTab === "dungeon") {
-      // The Dungeon tab reflects a real dungeon run only; the hub and the
-      // no-session state fall through to the renderer's placeholder.
       drawDungeonMap(ctx, channelSession ? session : null,
         channelSession ? fov : null, canvas.width, canvas.height,
         coop ? coop.me : 0);
@@ -3067,7 +3540,7 @@ function renderDungeon(): void {
       if (i === coop.me) continue;
       const q = session.players[i];
       if (q.dead || q.exited || !fov.isVisible(q.x, q.y)) continue;
-      drawPartner(ctx, camera, q.x, q.y);
+      drawPartner(ctx, camera, q.x, q.y, session.isDuel());
     }
   }
   drawPlayer(ctx, camera, me().x, me().y);
@@ -3147,6 +3620,7 @@ function handleGameInput(action: string, dir?: Direction): void {
     render();
     updateSidebar();
     persistRun();
+    persistLobbyPos();
     saveCurrentFog();
 
     // If a "move" landed us on a gate (hub OR real dungeon), ask for
@@ -3245,7 +3719,14 @@ function confirmGateWalk(dir: string): void {
       // bar is their floor, not their own ante.
       const floor = j.visit.min_stake ?? stake;
       const gold = connState?.player?.gold ?? 0;
-      const affordable = !duel || gold >= floor;
+      // What you can put up is gold PLUS the worth of your bag. Judging
+      // affordability on gold alone locked a challenger out of the very
+      // duels item stakes exist for: a fresh character has no gold and a
+      // bag worth 45, and was told "they will not take less than 1 and you
+      // hold 0" with the button greyed out.
+      const bagWorth = stakeableRows().reduce((n, r) => n + r.worth, 0);
+      const canPutUp = gold + bagWorth;
+      const affordable = !duel || canPutUp >= floor;
       return {
         label: duel
           ? `Duel ${j.visit.initiator}`
@@ -3258,8 +3739,10 @@ function confirmGateWalk(dir: string): void {
               ? `A fight, not a run. They staked ${stake} and will accept ` +
                 `${floor === 0 ? "any stake at all" : `${floor} or more`}; ` +
                 `the winner takes the whole pot and walking out through a ` +
-                `gate concedes. You hold ${gold} gold.`
-              : `They will not take less than ${floor} and you hold ${gold}.`)
+                `gate concedes. You can put up ${canPutUp} ` +
+                `(${gold} gold${bagWorth > 0 ? ` and ${bagWorth} in items` : ""}).`
+              : `They will not take less than ${floor}, and everything you ` +
+                `could stake comes to ${canPutUp}.`)
           : `${j.visit.players} of ${j.visit.max_players} waiting to go into ${segName(target)}.`,
         disabled: !affordable,
         onPick: () => {
@@ -3853,6 +4336,8 @@ interface ArmedIntent {
   stake?: number;
   /** Duel host only: the least a challenger may put up. */
   minStake?: number;
+  /** Duel only: bag rowids to escrow alongside the gold. */
+  stakeItems?: number[];
   who?: string;
 }
 let armedIntent: ArmedIntent | null = null;
@@ -3917,8 +4402,9 @@ function fireArmedIntent(dir: string): boolean {
   if (!a || a.dir !== dir) return false;
   armedIntent = null;
   if (a.kind === "join" && a.visitId !== undefined)
-    void doCoopJoin(a.visitId, dir, a.stake);
-  else if (a.kind === "duel") void doCoopHost(dir, a.stake ?? 0, a.minStake);
+    void doCoopJoin(a.visitId, dir, a.stake, a.stakeItems);
+  else if (a.kind === "duel")
+    void doCoopHost(dir, a.stake ?? 0, a.minStake, a.stakeItems);
   else void doCoopHost(dir);
   updateSidebar();
   return true;
@@ -4576,16 +5062,27 @@ function updateOverworldStats(): void {
     }
   }
 
-  // Recovery: if we are out-of-channel on a real (non-hub) segment, offer a
-  // one-click way into that segment's dungeon.  Normal play never lands here
-  // (gate-walk always enters a channel; the hub is the only out-of-channel
-  // spot), so this only appears after an odd state and lets the player get
-  // moving again (walk to a gate and step through to travel onward).
+  // Out-of-channel on a real (non-hub) segment: offer a one-click way into
+  // that segment's dungeon.  This used to be a recovery path for an odd
+  // state, and is now a ROUTINE one: a duel winner is banked as having
+  // survived without reaching a gate, so they are left standing inside the
+  // arena with no run every single time they win.
   let enterHereBtn = "";
   if (!p.in_channel && !isHub(p.segment) && hasProxy) {
     enterHereBtn = `<button data-action="enter-channel"
       data-seg-x="${p.segment.x}" data-seg-y="${p.segment.y}"
       class="action-btn action-enter" ${busy ? "disabled" : ""}>Enter Dungeon Here</button>`;
+    // And the way OUT. Entering the dungeon was the only thing offered
+    // here, which is the riskier option for someone who has just won a
+    // duel on a sliver of health and wants to bank it.
+    const node = connState?.segments.get(segKey(p.segment));
+    for (const dir of ["north", "south", "east", "west"]) {
+      const link = node?.links?.[dir];
+      if (!link) continue;
+      const to = `(${link.to.x}, ${link.to.y})`;
+      enterHereBtn += `<button data-action="travel" data-dir="${dir}"
+        class="action-btn" ${busy ? "disabled" : ""}>Walk ${dir} to ${to}</button>`;
+    }
   }
 
   el.innerHTML = `

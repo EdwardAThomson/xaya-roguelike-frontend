@@ -192,9 +192,277 @@ function countRun(log: { action: GameAction }[], from: number, type: string): nu
   return n;
 }
 
+/**
+ * A press per round must fight, and a press mid-round must not be lost.
+ *
+ * Two bugs live here, both of which a player felt as "I cannot hit him":
+ *
+ *  1. A press has to REACH the runner. main.ts refuses a key when
+ *     `inputFull` says so and never calls submitLocal, and a duel reported
+ *     full for most of every round, so a press landing mid-round was gone.
+ *
+ *  2. A press must be ONE round's choice. Repeating it as a standing order
+ *     was worse than losing it: a player who pressed east once committed
+ *     `move 1,0` for eleven straight rounds while their opponent circled
+ *     and killed them, never landing a blow, with the client cheerfully
+ *     reporting that they were acting.
+ *
+ * So: press toward the opponent once per round, through the same guard the
+ * UI uses, and require real damage. Acting is not fighting.
+ */
+async function pressingEachRoundLandsBlows(): Promise<void> {
+  const rng = new Lcg(99);
+  const names = ["alice", "bob"];
+  const relay = new MemoryRelay(rng, 12);
+  const sessions = names.map(() =>
+    DungeonSession.createDuel("duel-held-intent", 3, setups(), VISIT_ID));
+  const runners = names.map((n, i) => new CoopRunner({
+    session: sessions[i],
+    me: i,
+    names,
+    transport: relay.transport(n),
+    tickMs: 120,
+    pollMs: 15,
+    onChange: () => {},
+  }));
+  for (const r of runners) r.start();
+
+  /** Exactly what main.ts does with a keypress, guard and all. */
+  const press = (i: number, a: GameAction): boolean => {
+    if (runners[i].inputFull) return false;
+    return runners[i].submitLocal(a);
+  };
+
+  // alice presses once per round, always freshly aimed at bob. Crucially
+  // she presses whether or not the window is open, which is what a person
+  // does: a press that arrives mid-round must be held, not dropped.
+  let presses = 0;
+  const deadline = Date.now() + 6000;
+  while (Date.now() < deadline && !sessions.every(s => s.gameOver)) {
+    if (runners[1].myChoicePending) press(1, towardOpponent(sessions[1], 1));
+    if (!sessions[0].gameOver && press(0, towardOpponent(sessions[0], 0))) presses++;
+    await sleep(40);
+  }
+  const quiet = Date.now() + 800;
+  while (Date.now() < quiet) await sleep(20);
+  for (const r of runners) r.stop();
+
+  const mine = sessions[0].mergedLog.filter(e => e.actor === 0);
+  const moves = mine.filter(e => e.action.type === "move").length;
+  const waits = mine.filter(e => e.action.type === "wait").length;
+  const dealt = sessions[0].players[0].pvpDamage;
+  console.log(`[duel-input] ${presses} presses -> ${moves} moves, ${waits} ` +
+              `tick-waits, ${dealt} damage over ${sessions[0].roundIndex} rounds`);
+  if (moves === 0)
+    throw new Error("[duel-input] no action of the player's own reached the log");
+  if (waits > moves)
+    throw new Error(`[duel-input] more tick-waits (${waits}) than the ` +
+                    `player's own moves (${moves}): presses are being eaten`);
+  if (dealt === 0)
+    throw new Error("[duel-input] the player acted but dealt no damage: " +
+                    "acting is not fighting");
+
+  console.log("[duel-input] ✓ OK");
+}
+
+/**
+ * One press is ONE round's choice, and must not repeat itself.
+ *
+ * Direction alone cannot show this: two duellists standing adjacent and
+ * trading blows correctly aim the same way every round. So press exactly
+ * once and then never again, and count. A standing order gave eleven
+ * actions from one press and marched the player into a wall; a consumed
+ * buffer gives one.
+ */
+async function onePressIsOneRound(): Promise<void> {
+  const rng = new Lcg(7);
+  const names = ["alice", "bob"];
+  const relay = new MemoryRelay(rng, 12);
+  const sessions = names.map(() =>
+    DungeonSession.createDuel("duel-one-press", 3, setups(), VISIT_ID));
+  const runners = names.map((n, i) => new CoopRunner({
+    session: sessions[i],
+    me: i,
+    names,
+    transport: relay.transport(n),
+    tickMs: 120,
+    pollMs: 15,
+    onChange: () => {},
+  }));
+  for (const r of runners) r.start();
+
+  const first = towardOpponent(sessions[0], 0);
+  if (runners[0].inputFull || !runners[0].submitLocal(first))
+    throw new Error("[duel-one-press] the UI path refused the first press");
+
+  // bob keeps the rounds turning; alice never presses again.
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline && !sessions.every(s => s.gameOver)) {
+    if (runners[1].myChoicePending) runners[1].submitLocal(towardOpponent(sessions[1], 1));
+    await sleep(8);
+  }
+  const quiet = Date.now() + 600;
+  while (Date.now() < quiet) await sleep(20);
+  for (const r of runners) r.stop();
+
+  const mine = sessions[0].mergedLog.filter(e => e.actor === 0);
+  const own = mine.filter(e => e.action.type === first.type).length;
+  const waits = mine.filter(e => e.action.type === "wait").length;
+  console.log(`[duel-one-press] 1 press -> ${own} own action(s), ${waits} ` +
+              `tick-wait(s) over ${sessions[0].roundIndex} rounds`);
+  if (own !== 1)
+    throw new Error(`[duel-one-press] one press produced ${own} actions; a ` +
+                    `choice is repeating into rounds the player never chose`);
+  if (runners[0].heldIntent !== null)
+    throw new Error("[duel-one-press] the buffer still holds the press after " +
+                    "it was committed");
+  console.log("[duel-one-press] ✓ OK");
+}
+
+/**
+ * A player with only arrow keys must be able to fight back.
+ *
+ * Every other test here aims with towardOpponent, which returns a DIAGONAL
+ * step, and so does the obvious greedy bot. Two diagonal fighters meet and
+ * trade blows, which is why bot versus bot passed while a real player could
+ * not land a single hit in four separate duels: the bot sat diagonally
+ * adjacent and the player's arrow keys swung into empty floor every round.
+ * Diagonals are Q/E/Z/C and nobody finds them mid-fight.
+ *
+ * So: alice may only move orthogonally, like the arrow keys and WASD. She
+ * must still deal damage.
+ */
+async function arrowKeysCanFight(): Promise<void> {
+  const rng = new Lcg(5);
+  const names = ["alice", "bob"];
+  const relay = new MemoryRelay(rng, 12);
+  const sessions = names.map(() =>
+    DungeonSession.createDuel("duel-orthogonal", 3, setups(), VISIT_ID));
+  const runners = names.map((n, i) => new CoopRunner({
+    session: sessions[i],
+    me: i,
+    names,
+    transport: relay.transport(n),
+    tickMs: 120,
+    pollMs: 15,
+    onChange: () => {},
+  }));
+  for (const r of runners) r.start();
+
+  /** Orthogonal only: what an arrow key or WASD can express. */
+  const orthogonalAt = (me: number): GameAction => {
+    const p = sessions[me].players[me];
+    const q = sessions[me].players[me === 0 ? 1 : 0];
+    const dx = q.x - p.x, dy = q.y - p.y;
+    if (dx === 0 && dy === 0) return { type: "wait" };
+    if (Math.abs(dx) >= Math.abs(dy))
+      return { type: "move", dx: Math.sign(dx), dy: 0 };
+    return { type: "move", dx: 0, dy: Math.sign(dy) };
+  };
+
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline && !sessions.every(s => s.gameOver)) {
+    if (runners[1].myChoicePending) runners[1].submitLocal(orthogonalAt(1));
+    if (!runners[0].inputFull && !sessions[0].gameOver)
+      runners[0].submitLocal(orthogonalAt(0));
+    await sleep(40);
+  }
+  const quiet = Date.now() + 800;
+  while (Date.now() < quiet) await sleep(20);
+  for (const r of runners) r.stop();
+
+  const dealt = sessions[0].players[0].pvpDamage;
+  const taken = sessions[0].players[1].pvpDamage;
+  console.log(`[duel-orthogonal] arrow-key player dealt ${dealt}, took ${taken}, ` +
+              `over ${sessions[0].roundIndex} rounds`);
+  if (dealt === 0)
+    throw new Error("[duel-orthogonal] a player restricted to arrow keys " +
+                    "never landed a blow: the opponent is unreachable from " +
+                    "an orthogonal keyboard");
+  console.log("[duel-orthogonal] ✓ OK");
+}
+
+/**
+ * A refreshed client rebuilds a duel from the relay alone.
+ *
+ * This is the path a page reload takes. Nothing about a multiplayer run is
+ * persisted locally on purpose -- persistRun skips when `coop` is set --
+ * because the relay holds every message for the visit and replaying it from
+ * cursor 0 reconstructs the merged log exactly. co_op_test covers that for
+ * a co-op run; a duel was never covered, and a duel is the harder case: its
+ * log carries commit and reveal entries, and the round protocol has to come
+ * back up in the right phase rather than mid-round.
+ *
+ * A rebuilt client that disagrees about the log cannot settle, because a
+ * settle needs the opponents' confirms to match its own hash exactly.
+ */
+async function reloadRebuildsTheDuel(): Promise<void> {
+  const rng = new Lcg(11);
+  const names = ["alice", "bob"];
+  const relay = new MemoryRelay(rng, 12);
+  const sessions = names.map(() =>
+    DungeonSession.createDuel("duel-reload", 3, setups(), VISIT_ID));
+  const runners = names.map((n, i) => new CoopRunner({
+    session: sessions[i], me: i, names, transport: relay.transport(n),
+    tickMs: 120, pollMs: 15, onChange: () => {},
+  }));
+  for (const r of runners) r.start();
+
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline && !sessions.every(s => s.gameOver)) {
+    for (let i = 0; i < 2; i++)
+      if (runners[i].myChoicePending) runners[i].submitLocal(towardOpponent(sessions[i], i));
+    await sleep(20);
+  }
+  const quiet = Date.now() + 800;
+  while (Date.now() < quiet) await sleep(20);
+  for (const r of runners) r.stop();
+  if (!sessions[0].gameOver)
+    throw new Error("[duel-reload] the duel did not finish; nothing to rebuild");
+
+  const original = settleLogHash(VISIT_ID, sessions[0].mergedLog);
+  const winner = sessions[0].duelWinner;
+
+  // The refresh: a brand new client for bob, no local state at all.
+  const rebuilt = DungeonSession.createDuel("duel-reload", 3, setups(), VISIT_ID);
+  const late = new CoopRunner({
+    session: rebuilt, me: 1, names, transport: relay.transport("bob"),
+    tickMs: 100000, pollMs: 20, onChange: () => {},
+  });
+  late.start();
+  const until = Date.now() + 3000;
+  while (Date.now() < until
+         && rebuilt.mergedLog.length < sessions[0].mergedLog.length) await sleep(20);
+  late.stop();
+
+  const rebuiltHash = settleLogHash(VISIT_ID, rebuilt.mergedLog);
+  console.log(`[duel-reload] rebuilt ${rebuilt.mergedLog.length}/` +
+              `${sessions[0].mergedLog.length} entries, winner ` +
+              `${rebuilt.duelWinner}/${winner}, hash ` +
+              `${rebuiltHash === original ? "matches" : "DIFFERS"}`);
+  if (rebuilt.mergedLog.length !== sessions[0].mergedLog.length)
+    throw new Error(`[duel-reload] rebuilt ${rebuilt.mergedLog.length} of ` +
+                    `${sessions[0].mergedLog.length} entries: a refreshed ` +
+                    `client cannot reconstruct the run`);
+  if (rebuiltHash !== original)
+    throw new Error("[duel-reload] the rebuilt log hashes differently, so a " +
+                    "refreshed client could never settle");
+  if (rebuilt.duelWinner !== winner)
+    throw new Error(`[duel-reload] rebuilt winner ${rebuilt.duelWinner} but ` +
+                    `the duel was won by ${winner}`);
+  if (!rebuilt.gameOver)
+    throw new Error("[duel-reload] the rebuilt session does not know the " +
+                    "duel is over, so it will never settle");
+  console.log("[duel-reload] ✓ OK");
+}
+
 async function main(): Promise<void> {
   for (const seed of [1, 2, 3]) await runScenario(seed);
   console.log("[duel-runtime] ✓ OK");
+  await pressingEachRoundLandsBlows();
+  await onePressIsOneRound();
+  await arrowKeysCanFight();
+  await reloadRebuildsTheDuel();
 }
 
 // An unhandled rejection makes `node dist/net/duel_test.js` exit non-zero,

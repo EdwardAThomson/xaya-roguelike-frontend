@@ -76,6 +76,14 @@ the frontend built (`npx tsc` → `dist/`), the xayax venv at
   competing in the same world (`multi.mjs`), plus a referee that polls the
   global GSP state and asserts cross-player invariants (coordinate
   uniqueness, player/segment sanity). Env: `ROG_AGENTS` (default 3).
+- `npm run persist` — a long-lived bot population (`persist.mjs`): keeps N
+  paced self-playing agents alive in the shared world indefinitely, each
+  starting a fresh play cycle when its last one ends or errors, while a
+  referee logs any cross-player invariant violation (coordinate uniqueness,
+  no segment on the hub, players on valid segments, HP in range) and a
+  periodic world-size heartbeat. Runs until Ctrl-C. Env: `ROG_AGENTS`
+  (default 4), `ROG_OUTBOUND` (default 8), `ROG_TICKS` (per cycle, default
+  1200), `ROG_URL`, `ROG_PROXY`, `ROG_HEADED`.
 - `npm run coop` — two-player co-op run (`coop.mjs`): one player confirms
   a segment neighbouring the hub and hosts a run through the hub gate that
   leads to it (co-op is local, so hosting and joining are by direction),
@@ -95,10 +103,18 @@ the frontend built (`npx tsc` → `dist/`), the xayax venv at
   proof well past anything the tests cover.
 - `npm run duel` — a full two-player duel through the real UI
   (`duel.mjs`): one player walks onto a gate, picks "Wait here for a
-  duel" and types the largest stake the character can cover into the stake
-  field, the challenger joins from their own side of the same
-  gate, and they bump into each other until one falls. It drives the real
-  DOM because hosting a duel has no debug hook. Headed by default; env:
+  duel", types the largest stake the character can cover into the stake
+  field and then a floor of 1 into the minimum field, the challenger joins
+  from their own side of the same gate putting up only that floor, and they
+  bump into each other until one falls. The run fails if the on-chain pot is
+  simply twice the host's stake, so a silently matched join cannot pass for
+  an uneven one. A second scenario walks both players back to the hub,
+  opens another duel, and closes the challenger's browser after both sides
+  have checkpointed; the host waits rather than walking (stepping on a gate
+  in a duel is a concession), abandons once the checkpoint goes stale, and
+  the run fails unless the duel resolves with the vanished side losing and
+  the host free again. It drives the real DOM because hosting a duel has no
+  debug hook. Headed by default; env:
   `ROG_HEADLESS=1`, `ROG_URL`, `ROG_MAX_MIN` (default 12), `ROG_A` /
   `ROG_B` to reuse existing characters (they need gold to stake).
 - `npm run duel:evil` — the adversarial duel suite (`duel_adversarial.mjs`):
@@ -113,6 +129,24 @@ the frontend built (`npx tsc` → `dist/`), the xayax venv at
   refusals would prove nothing. The wrong-token relay case reports itself
   as skipped on a devnet with claim tokens off, and the script says how to
   turn them on. Needs a devnet; the static server is not required.
+- `npm run duel:bot`: a headless duel opponent (`duel_bot.mjs`), so one
+  person can test a duel from a browser. It joins an open duel (or hosts
+  one with `ROG_BOT_OPEN=1`, re-hosting until joined) and plays it by
+  driving the real `CoopRunner` over the real relay, sending the checkpoint
+  confirms the browser would, so the human can settle; it submits the
+  settlement itself whenever it won or sits in seat 0, win or lose. It
+  closes in on its opponent orthogonally so an arrow-key player can reach
+  it. Env: `ROG_BOT` (name), `ROG_HOST` (only join this player's duels),
+  `ROG_BOT_STAKE_ITEMS=0` (do not stake the bot's bag), `ROG_BOT_STRIP=1`
+  (unequip the bot's gear first, so it can be staked from the bag),
+  `ROG_BOT_WAIT` (seconds, default 300), `ROG_BOT_CONCEDE=1` (walk out and
+  concede), `ROG_BOT_DIR` (gate, default east). Needs a devnet; on a fresh
+  chain with no confirmed arena it confirms (1, 0) with a real run first.
+- `npm run duel:bots`: two `duel:bot` processes fight a staked duel in one
+  command (`duel_bots.mjs`), then it asserts against the chain that a duel
+  completed and that exactly one bag grew while the other shrank, so escrow
+  and the item transfer run live. Env: `ROG_BOTS_STAKE=0` (fight for
+  nothing), `ROG_BOTS_TIMEOUT` (seconds, default 300). Needs a devnet.
 - `npm run compete` — scripted competition tests with hard assertions
   (`compete.mjs`): coordinate race (one winner), provisional access +
   confirm-unlocks-others, concurrent reward/ownership isolation. Needs a

@@ -141,10 +141,11 @@ export class MoveClient {
    * from the hub or a segment you are standing in, pass nothing.
    */
   async visit(name: string, dir: string, settlement?: Settlement,
-              duel?: { stake: number; minStake?: number }): Promise<void> {
+              duel?: { stake: number; minStake?: number;
+                       stakeItems?: number[] }): Promise<void> {
     const op: {
       dir: string; settlement?: Settlement; mode?: string;
-      stake?: number; min_stake?: number;
+      stake?: number; min_stake?: number; stake_items?: number[];
     } = { dir };
     if (settlement) op.settlement = settlement;
     // Absent `mode` is a co-op run, exactly as before duels existed; the
@@ -156,6 +157,14 @@ export class MoveClient {
       op.mode = "duel";
       op.stake = duel.stake;
       if (duel.minStake !== undefined) op.min_stake = duel.minStake;
+      // Bag rows put up alongside (or instead of) the gold.  Worth is
+      // ItemDef.value times quantity and counts toward the floor, so a
+      // player with no gold can still stake something real.  Omitted
+      // entirely when nothing is picked, which is every move that
+      // existed before item stakes.
+      if (duel.stakeItems && duel.stakeItems.length > 0) {
+        op.stake_items = duel.stakeItems;
+      }
     }
     await this.transport.submitMove(name, { v: op });
     await this.transport.mine();
@@ -166,14 +175,17 @@ export class MoveClient {
    * that visit's segment.  The visit activates when it reaches max_players.
    */
   async join(name: string, visitId: number, dir: string,
-             settlement?: Settlement, stake?: number): Promise<void> {
+             settlement?: Settlement, stake?: number,
+             stakeItems?: number[]): Promise<void> {
     const op: {
       id: number; dir: string; settlement?: Settlement; stake?: number;
+      stake_items?: number[];
     } = { id: visitId, dir };
     if (settlement) op.settlement = settlement;
     // What THIS joiner puts up, which need not equal the host's stake; it
     // must clear the visit's min_stake.  Omitted means match the host.
     if (stake !== undefined) op.stake = stake;
+    if (stakeItems && stakeItems.length > 0) op.stake_items = stakeItems;
     await this.transport.submitMove(name, { j: op });
     await this.transport.mine();
   }

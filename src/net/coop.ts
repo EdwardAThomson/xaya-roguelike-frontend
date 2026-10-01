@@ -188,6 +188,23 @@ export class CoopRunner {
   /** Round the commit tick is timing, and when that round opened. */
   private tickRound = -1;
   private tickStartedAt = 0;
+  /**
+   * A duel keypress that arrived outside its round's commit window.
+   *
+   * Throwing it away is what made a duel feel unplayable: a round only
+   * takes input while it is in the commit phase, an opponent that commits
+   * in milliseconds closes that window almost at once, and every press
+   * after it was answered with "Not now" and dropped.  A player who then
+   * missed the next window got a WAIT committed for them by the tick
+   * below, so they stood still while their opponent hit them.
+   *
+   * Buffering is NOT pre-committing: the commitment is still formed when
+   * the next round opens, on public state, and the player can change their
+   * mind until then by pressing something else.  What it removes is the
+   * requirement to press a key inside a window they cannot see.
+   *
+   */
+  private intent: GameAction | null = null;
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private graceTimer: ReturnType<typeof setInterval> | null = null;
@@ -220,6 +237,7 @@ export class CoopRunner {
 
   stop(): void {
     this.stopped = true;
+    this.intent = null;
     if (this.pollTimer) clearInterval(this.pollTimer);
     if (this.graceTimer) clearInterval(this.graceTimer);
     this.pollTimer = null;
@@ -239,6 +257,9 @@ export class CoopRunner {
     } catch { /* storage unavailable */ }
   }
 
+  /** A duel keypress held for the next round's commit window, if any. */
+  get heldIntent(): GameAction | null { return this.intent; }
+
   /** True while an own action is queued but not yet applied by the engine. */
   get hasPendingOwn(): boolean {
     return this.mySent > this.consumed[this.me];
@@ -246,8 +267,13 @@ export class CoopRunner {
 
   /** True when no further input can be accepted: the queue ahead is full. */
   get inputFull(): boolean {
-    const depth = this.session.isDuel() ? 1 : CoopRunner.INPUT_QUEUE_DEPTH;
-    return this.mySent - this.consumed[this.me] >= depth;
+    // A duel is never "full": a press either seals this round or replaces
+    // the held intent for the next one. Reporting full here is what made
+    // the fix for dropped presses useless -- main.ts refuses the key on
+    // this answer and never reaches submitLocal, so the buffer stayed
+    // empty and the tick kept committing waits.
+    if (this.session.isDuel()) return false;
+    return this.mySent - this.consumed[this.me] >= CoopRunner.INPUT_QUEUE_DEPTH;
   }
 
   /** Whose action the engine is waiting for, by name. */
@@ -282,7 +308,23 @@ export class CoopRunner {
     // than taking it: what goes on the wire now is the COMMITMENT, and the
     // reveal and the action follow automatically once the opponent's
     // commit is in (spec §2).
-    if (s.isDuel()) return this.commitChoice(action);
+    if (s.isDuel()) {
+      // The standing order is set whether or not the press also seals this
+      // round. Setting it only when the commit FAILED was the subtler half
+      // of the same bug: a press that landed inside the window acted once
+      // and left nothing behind, so the next round had no answer and the
+      // tick committed a wait over it. One press, one hit, then fifteen
+      // rounds of standing still.
+      // Sealed right now if the window is open, and that is the whole of
+      // it: retaining the press as well made it fire again next round,
+      // which is the standing order by another route.
+      if (this.commitChoice(action)) { this.onChange(); return true; }
+      // Outside the window: hold it for the next one rather than dropping
+      // it. pumpIntent consumes it.
+      this.intent = action;
+      this.onChange();
+      return true;
+    }
 
     const n = this.mySent;
     // Applying straight away is only correct when this action is the NEXT one
@@ -391,6 +433,7 @@ export class CoopRunner {
       this.afterApplied(actor);
     }
     // The engine may now be waiting on this client's reveal or action.
+    this.pumpIntent();
     this.pumpDuel();
   }
 
@@ -454,6 +497,28 @@ export class CoopRunner {
    * Called after every drain, so it fires as soon as the opponent's message
    * lands rather than on a timer.
    */
+  /**
+   * Commits a buffered keypress the moment its round opens.  Called from
+   * the same drain the opponent's messages arrive on, so the wait between
+   * pressing and being committed is one round, not one window.
+   */
+  private pumpIntent(): void {
+    const s = this.session;
+    if (!s.isDuel() || s.gameOver || this.intent === null) return;
+    if (s.phase !== "commit" || this.choiceRound === s.roundIndex) return;
+    if (!s.isPlayerActive(this.me)) { this.intent = null; return; }
+
+    // CONSUMED, not kept. A standing order was a fixed compass heading: a
+    // player who pressed east once walked east for eleven rounds while
+    // their opponent circled and killed them, committing `move 1,0` every
+    // single round and never landing a blow. One press is one round's
+    // choice; the buffer exists only so a press that arrives mid-round is
+    // not thrown away.
+    const a = this.intent;
+    this.intent = null;
+    this.commitChoice(a);
+  }
+
   private pumpDuel(): void {
     const s = this.session;
     if (!s.isDuel() || s.gameOver) return;
@@ -536,6 +601,9 @@ export class CoopRunner {
       return;
     }
     if (!this.myChoicePending) return;
+    // A buffered press is an answer; commit that rather than waiting for
+    // the deadline and then committing a wait over the top of it.
+    if (this.intent !== null) { this.pumpIntent(); return; }
     if (Date.now() - this.tickStartedAt < this.tickMs) return;
     this.submitLocal({ type: "wait" });
   }

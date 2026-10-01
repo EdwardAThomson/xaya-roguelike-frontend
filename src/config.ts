@@ -102,3 +102,12 @@ export const COOP_HEARTBEAT_MS = 30000;
  * instead of the JSON array.  Roughly a quarter of the calldata.
  */
 export const COMPACT_ACTIONS = true;
+
+/**
+ * Bag rows a player may hold; equipped gear does not count against it.
+ * Mirrors MAX_INVENTORY in the GSP's items.hpp, and is only used to warn
+ * before a duel that winning would overflow the bag. The GSP refuses such
+ * a join outright, so this exists to explain it before the move is sent
+ * rather than to enforce anything.
+ */
+export const MAX_BAG_ROWS = 50;
