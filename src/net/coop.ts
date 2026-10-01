@@ -90,10 +90,21 @@ export class ProxyRelayTransport implements CoopTransport {
   }
 
   async poll(): Promise<CoopMessage[]> {
+    // `wait` asks the relay to HOLD the connection until something arrives
+    // instead of answering "nothing yet" at once. A duel round is two
+    // message exchanges, and under plain polling each one spent up to the
+    // poll interval doing nothing at all -- dead time, not network time,
+    // was most of what made a duel feel sluggish.
+    //
+    // An expiry returns empty and the next poll asks from the same cursor,
+    // so nothing is lost if the hold times out or the connection drops. An
+    // older relay ignores the flag and answers immediately, which is the
+    // behaviour we had before.
     const resp = (await this.post({
       action: "relay_recv",
       visit: this.visitId,
       since: this.cursor,
+      wait: true,
     })) as { messages?: Array<{ from?: string; n?: number; action?: GameAction }>; next?: number };
     const out: CoopMessage[] = [];
     for (const m of resp.messages ?? []) {
@@ -105,11 +116,21 @@ export class ProxyRelayTransport implements CoopTransport {
   }
 
   private async post(body: object): Promise<unknown> {
-    const resp = await fetch(this.proxyUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    // Longer than the relay's hold, or the browser aborts its own held
+    // read and the push never gets a chance to arrive.
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 30000);
+    let resp: Response;
+    try {
+      resp = await fetch(this.proxyUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ctl.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!resp.ok) throw new Error(`Relay error ${resp.status}: ${await resp.text()}`);
     return resp.json();
   }
@@ -124,6 +145,8 @@ export interface CoopRunnerOptions {
   transport: CoopTransport;
   /** Idle time after the partner acted before this client auto-waits. */
   graceMs?: number;
+  /** Deadline once the OPPONENT has sealed and is waiting on you. */
+  foeGraceMs?: number;
   /**
    * Duel only: the fixed tick that bounds the COMMIT step (spec §2c).  A
    * duel round cannot open on "someone acted", because a commit is opaque
@@ -187,7 +210,10 @@ export class CoopRunner {
   private choiceRound = -1;
   /** Round the commit tick is timing, and when that round opened. */
   private tickRound = -1;
+  private readonly foeGraceMs: number;
   private tickStartedAt = 0;
+  /** When the opponent's commit for THIS round landed, if it has. */
+  private foeCommittedAt: number | null = null;
   /**
    * A duel keypress that arrived outside its round's commit window.
    *
@@ -220,6 +246,7 @@ export class CoopRunner {
     this.transport = opts.transport;
     this.graceMs = opts.graceMs ?? 700;
     this.tickMs = opts.tickMs ?? 3000;
+    this.foeGraceMs = opts.foeGraceMs ?? 600;
     this.pollMs = opts.pollMs ?? 300;
     this.onChange = opts.onChange;
     this.onNote = opts.onNote ?? (() => {});
@@ -229,8 +256,7 @@ export class CoopRunner {
 
   start(): void {
     this.stopped = false;
-    void this.pollOnce();
-    this.pollTimer = setInterval(() => void this.pollOnce(), this.pollMs);
+    void this.pollLoop();
     this.graceTimer = setInterval(
       () => (this.session.isDuel() ? this.commitTick() : this.graceTick()), 100);
   }
@@ -238,7 +264,7 @@ export class CoopRunner {
   stop(): void {
     this.stopped = true;
     this.intent = null;
-    if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.pollTimer) clearInterval(this.pollTimer);   // legacy, unused
     if (this.graceTimer) clearInterval(this.graceTimer);
     this.pollTimer = null;
     this.graceTimer = null;
@@ -255,6 +281,17 @@ export class CoopRunner {
         if (k && k.startsWith(prefix)) localStorage.removeItem(k);
       }
     } catch { /* storage unavailable */ }
+  }
+
+  /** True when every other active participant has sealed this round. */
+  private foeHasCommitted(): boolean {
+    const s = this.session;
+    const commits = s.roundCommits ?? [];
+    for (let i = 0; i < this.names.length; i++) {
+      if (i === this.me || !s.isPlayerActive(i)) continue;
+      if (!commits[i]) return false;
+    }
+    return true;
   }
 
   /** A duel keypress held for the next round's commit window, if any. */
@@ -372,16 +409,51 @@ export class CoopRunner {
     }
   }
 
-  private async pollOnce(): Promise<void> {
-    if (this.polling || this.stopped) return;
+  /**
+   * Listen, continuously.
+   *
+   * This used to be setInterval(pollOnce, pollMs) with a re-entry guard,
+   * which quietly undid most of the benefit of a relay that pushes: a held
+   * read would return with the opponent's message, and the client then
+   * STOPPED LISTENING until the next interval tick. A duel round carries
+   * several exchanges -- their commit, their reveal, their action -- so
+   * that dead time was paid two or three times per round.
+   *
+   * Chaining instead means the next listen starts the instant the last one
+   * returns. The relay holds the connection when it has nothing, so this
+   * does not spin; the floor below only applies when a read comes back
+   * fast AND empty, which means an error or a relay too old to hold.
+   */
+  private async pollLoop(): Promise<void> {
+    while (!this.stopped) {
+      const t0 = Date.now();
+      const got = await this.pollOnce();
+      if (this.stopped) break;
+      if (got === 0 && Date.now() - t0 < this.pollMs) {
+        await new Promise(r => setTimeout(r, this.pollMs - (Date.now() - t0)));
+      }
+    }
+  }
+
+  /** Returns how many messages arrived, or 0 on error. */
+  private async pollOnce(): Promise<number> {
+    if (this.polling || this.stopped) return 0;
     this.polling = true;
     try {
       const msgs = await this.transport.poll();
+      // Stopped while this was in flight: drop what came back rather than
+      // mutating a session that is being torn down. Harmless in the app,
+      // where the session is discarded straight after, but it made the
+      // tests read as a divergence -- a late message landing between the
+      // hash being taken and the entry count being read.
+      if (this.stopped) return 0;
       this.transportError = null;
       if (msgs.length > 0) this.onMessages(msgs);
+      return msgs.length;
     } catch (e) {
       this.transportError = e instanceof Error ? e.message : String(e);
       this.onChange();
+      return 0;
     } finally {
       this.polling = false;
     }
@@ -598,13 +670,33 @@ export class CoopRunner {
     if (this.tickRound !== s.roundIndex) {
       this.tickRound = s.roundIndex;
       this.tickStartedAt = Date.now();
+      this.foeCommittedAt = null;
       return;
     }
     if (!this.myChoicePending) return;
     // A buffered press is an answer; commit that rather than waiting for
     // the deadline and then committing a wait over the top of it.
     if (this.intent !== null) { this.pumpIntent(); return; }
-    if (Date.now() - this.tickStartedAt < this.tickMs) return;
+
+    // TWO deadlines, because one number cannot serve both cases.
+    //
+    // A single flat timer either acts for a player who is still thinking,
+    // or leaves them waiting on an idle opponent. But the opponent's
+    // commit ARRIVES over the relay, so the client knows which case it is
+    // in. If they have not committed either, nobody is waiting on you and
+    // there is no reason to rush you: only the long fallback applies, and
+    // it exists solely so two clients each waiting for the other cannot
+    // wait forever. Once their commit has landed you are the one holding
+    // the round up, and a short grace is fair.
+    if (this.foeCommittedAt === null && this.foeHasCommitted()) {
+      this.foeCommittedAt = Date.now();
+    }
+    const waited = Date.now();
+    if (this.foeCommittedAt !== null) {
+      if (waited - this.foeCommittedAt < this.foeGraceMs) return;
+    } else if (waited - this.tickStartedAt < this.tickMs) {
+      return;
+    }
     this.submitLocal({ type: "wait" });
   }
 
