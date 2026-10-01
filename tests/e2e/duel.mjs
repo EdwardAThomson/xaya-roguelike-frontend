@@ -137,11 +137,26 @@ function driver(page, name) {
 
   /** Walk onto the gate in `dir` of the current room and open its dialog. */
   async function standOnGate(dir) {
-    const walls = (await map()).walls;
+    // Re-read the walls as we go. Reading them ONCE before the loop is a
+    // trap: this is called straight after the arena-confirming run, so it
+    // captured the ARENA's geometry and then the hub session replaced the
+    // session underneath it -- leaving the walk pathfinding across one map
+    // while standing in another. It failed one step from the gate, and only
+    // on a fresh world, because a world that already has its arena skips
+    // the run that causes the swap.
+    let walls = (await map()).walls;
+    let wallsFor = null;
     for (let i = 0; i < 300; i++) {
       const s = await state();
       const sess = s.session;
       if (!sess) { await sleep(200); continue; }
+      // Cheap identity for "the map changed under us": the gate layout of
+      // the session we are actually standing in.
+      const sig = sess.gates.map((g) => `${g.direction}:${g.x},${g.y}`).join("|");
+      if (sig !== wallsFor) {
+        walls = (await map()).walls;
+        wallsFor = sig;
+      }
       const gate = sess.gates.find((g) => g.direction === dir);
       if (!gate) throw new Error(`[${name}] no ${dir} gate here`);
       const onGate = sess.playerX === gate.x && sess.playerY === gate.y;
@@ -159,7 +174,15 @@ function driver(page, name) {
       else await call("input", "move", step[0], step[1]);
       await sleep(70);
     }
-    throw new Error(`[${name}] could not reach the ${dir} gate`);
+    // Say WHY. "Could not reach the gate" is true of a player who is
+    // walking and blocked, and equally of one whose keys are being
+    // swallowed because the client is in the wrong mode -- and those need
+    // completely different fixes.
+    const s = await state();
+    throw new Error(`[${name}] could not reach the ${dir} gate ` +
+      `(mode=${s.mode} channelSession=${s.channelSession} ` +
+      `session=${s.session ? `at ${s.session.playerX},${s.session.playerY}` : "none"} ` +
+      `modal=${s.modal ? "up" : "none"} busy=${s.busy})`);
   }
 
   async function start() {
