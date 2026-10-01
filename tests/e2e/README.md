@@ -76,6 +76,14 @@ the frontend built (`npx tsc` → `dist/`), the xayax venv at
   competing in the same world (`multi.mjs`), plus a referee that polls the
   global GSP state and asserts cross-player invariants (coordinate
   uniqueness, player/segment sanity). Env: `ROG_AGENTS` (default 3).
+- `npm run persist` — a long-lived bot population (`persist.mjs`): keeps N
+  paced self-playing agents alive in the shared world indefinitely, each
+  starting a fresh play cycle when its last one ends or errors, while a
+  referee logs any cross-player invariant violation (coordinate uniqueness,
+  no segment on the hub, players on valid segments, HP in range) and a
+  periodic world-size heartbeat. Runs until Ctrl-C. Env: `ROG_AGENTS`
+  (default 4), `ROG_OUTBOUND` (default 8), `ROG_TICKS` (per cycle, default
+  1200), `ROG_URL`, `ROG_PROXY`, `ROG_HEADED`.
 - `npm run coop` — two-player co-op run (`coop.mjs`): one player confirms
   a segment neighbouring the hub and hosts a run through the hub gate that
   leads to it (co-op is local, so hosting and joining are by direction),
