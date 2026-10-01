@@ -897,13 +897,13 @@ body {
   display: flex; align-items: center; gap: 8px;
   font-size: 12px; color: #bbb; margin-bottom: 8px;
 }
-.modal-amount-input {
+.modal-amount-input, .modal-floor-input {
   flex: 1 1 auto; min-width: 0;
   background: #101014; color: #eee; border: 1px solid #555;
   border-radius: 4px; padding: 6px 8px;
   font-family: monospace; font-size: 13px;
 }
-.modal-amount-input:focus { outline: 1px solid #4a8; border-color: #4a8; }
+.modal-amount-input:focus, .modal-floor-input:focus { outline: 1px solid #4a8; border-color: #4a8; }
 .modal-amount-max { color: #777; font-size: 11px; white-space: nowrap; }
 .modal-amount-error { color: #f88; font-size: 11px; margin-bottom: 8px; }
 
@@ -926,3 +926,64 @@ body {
 .action-duel { border-color: #a55; color: #f99; }
 .action-duel:hover:not(:disabled) { background: #3a2020; }
 .coop-panel .action-btn + .action-btn { margin-left: 6px; }
+
+/* --- Duel stake dialog: gold, a grid of bag items, and the host's floor --- */
+
+.modal-stake { max-width: 560px; }
+.modal-stake .modal-body { margin-bottom: 10px; }
+.stake-section-title {
+  color: #9aa; font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+  margin: 10px 0 6px;
+}
+.stake-section-note { color: #666; text-transform: none; letter-spacing: 0; margin-left: 6px; }
+.modal-stake-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+  gap: 6px;
+  max-height: 15.5em;
+  overflow-y: auto;
+  padding: 2px;
+}
+.modal-stake-row {
+  --tile-accent: #556;
+  position: relative;
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 8px 4px 6px;
+  background: #1f1f2a;
+  border: 1px solid #333;
+  border-top: 2px solid var(--tile-accent);
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.1s, border-color 0.1s;
+}
+.modal-stake-row:hover { background: #262634; border-color: #556; border-top-color: var(--tile-accent); }
+.modal-stake-row.picked {
+  background: #1d3330;
+  border-color: #4a8;
+  box-shadow: inset 0 0 0 1px #4a8;
+}
+.modal-stake-row.picked::after {
+  content: "✓"; position: absolute; top: 3px; left: 6px;
+  color: #8ec; font-size: 12px; font-weight: bold;
+}
+/* The checkbox stays for keyboard and accessibility; the tile is the visual. */
+.modal-stake-row input {
+  position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none;
+}
+.modal-stake-row:focus-within { outline: 1px solid #88a; outline-offset: 1px; }
+.stake-tile-icon { font-size: 24px; line-height: 1.2; }
+.stake-tile-qty {
+  position: absolute; top: 3px; right: 5px;
+  font-size: 10px; color: #ccc; background: #333; border-radius: 3px; padding: 0 3px;
+}
+.stake-tile-name {
+  font-size: 10px; color: #ccc; text-align: center; line-height: 1.2;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.stake-tile-worth { font-size: 10px; color: gold; }
+.stake-tile-worth::before { content: "◆ "; font-size: 8px; }
+.stake-empty { color: #777; font-size: 12px; font-style: italic; margin-bottom: 6px; }
+.modal-stake-total { font-weight: 600; font-size: 13px; margin: 10px 0 4px; color: #ddd; }
+.modal-floor-hint { color: #888; font-size: 11px; line-height: 1.4; margin-bottom: 8px; }
+.modal-confirm:disabled { opacity: 0.4; cursor: default; background: #333; }
