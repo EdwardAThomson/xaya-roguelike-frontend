@@ -1629,6 +1629,7 @@ function handleSoloSuffixInput(action: string, dir?: Direction): void {
   let a: GameAction | null = null;
   switch (action) {
     case "move": if (dir) a = { type: "move", dx: dir.dx, dy: dir.dy }; break;
+    case "travel": if (dir) a = { type: "travel", dx: dir.dx, dy: dir.dy }; break;
     case "pickup": a = { type: "pickup" }; break;
     case "wait": a = { type: "wait" }; break;
     case "use_potion": a = { type: "use", itemId: "health_potion" }; break;
@@ -1650,7 +1651,7 @@ function handleSoloSuffixInput(action: string, dir?: Direction): void {
   updateSidebar();
   saveCurrentFog();
   if (session.gameOver) void coopSoloSettle();
-  else if (action === "move") {
+  else if (action === "move" || action === "travel") {
     const g = gateAtPlayer();
     if (g) {
       session.addMessage(`On the ${g.direction} gate.`, "info");
@@ -2368,6 +2369,9 @@ function handleCoopInput(action: string, dir?: Direction): void {
   switch (action) {
     case "move":
       if (dir) a = { type: "move", dx: dir.dx, dy: dir.dy };
+      break;
+    case "travel":
+      if (dir) a = { type: "travel", dx: dir.dx, dy: dir.dy };
       break;
     case "pickup":
       a = { type: "pickup" };
@@ -3517,6 +3521,9 @@ function handleGameInput(action: string, dir?: Direction): void {
     case "move":
       if (dir) gameAction = { type: "move", dx: dir.dx, dy: dir.dy };
       break;
+    case "travel":
+      if (dir) gameAction = { type: "travel", dx: dir.dx, dy: dir.dy };
+      break;
     case "pickup":
       // Pickup is a no-op in the hub (no items there).
       if (!channelSession) return;
@@ -3551,10 +3558,10 @@ function handleGameInput(action: string, dir?: Direction): void {
     persistLobbyPos();
     saveCurrentFog();
 
-    // If a "move" landed us on a gate (hub OR real dungeon), ask for
-    // confirmation before settling/transiting.  Easy to step on a gate
-    // by accident.  (Enter-on-a-gate is handled directly above.)
-    if (action === "move") {
+    // If a "move" (or a travel) landed us on a gate (hub OR real dungeon),
+    // ask for confirmation before settling/transiting.  Easy to step on a
+    // gate by accident.  (Enter-on-a-gate is handled directly above.)
+    if (action === "move" || action === "travel") {
       const gate = gateAtPlayer();
       // An armed intent takes precedence over the confirmation dialog: the
       // player already decided, back when they armed it.
@@ -4651,6 +4658,7 @@ function renderHelpBody(): string {
           <div class="help-section-title">In a Dungeon</div>
           <div class="help-row"><span class="help-keys"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></span><span>or Arrow keys: move</span></div>
           <div class="help-row"><span class="help-keys"><kbd>Q</kbd><kbd>E</kbd><kbd>Z</kbd><kbd>C</kbd></span><span>Move diagonally</span></div>
+          <div class="help-row"><span class="help-keys"><kbd>Shift</kbd><span class="help-key-text">+ move</span></span><span>Travel: walk up to 8 tiles, stopping when something comes into view</span></div>
           <div class="help-row"><span class="help-keys"><kbd>G</kbd></span><span>Pick up item</span></div>
           <div class="help-row"><span class="help-keys"><kbd>P</kbd></span><span>Drink health potion</span></div>
           <div class="help-row"><span class="help-keys"><kbd>Space</kbd></span><span>Wait a turn</span></div>
@@ -5316,8 +5324,8 @@ function duelOutcomeLine(): string {
     ${armedBannerHtml()}
     ${busy ? '<div style="margin-top:6px;color:#aa8">Submitting...</div>' : ""}
     <div style="margin-top:8px;font-size:11px;color:#888">
-      WASD/Arrows: Move &nbsp; G: Pickup<br>
-      P: Potion &nbsp; Space: Wait &nbsp; Enter: ${coop || coopSolo ? "Exit run (on a gate)" : "Gate"}
+      WASD/Arrows: Move &nbsp; Shift+Move: Travel<br>
+      G: Pickup &nbsp; P: Potion &nbsp; Space: Wait &nbsp; Enter: ${coop || coopSolo ? "Exit run (on a gate)" : "Gate"}
       ${!channelSession ? "<br>N: New Dungeon" : ""}
     </div>
   `;

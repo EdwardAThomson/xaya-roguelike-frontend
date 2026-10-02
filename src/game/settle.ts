@@ -18,6 +18,7 @@ export function toWireAction(la: LoggedAction): object {
   const a = la.action;
   switch (a.type) {
     case "move":    return { i: la.actor, type: "move", dx: a.dx ?? 0, dy: a.dy ?? 0 };
+    case "travel":  return { i: la.actor, type: "travel", dx: a.dx ?? 0, dy: a.dy ?? 0 };
     case "use":     return { i: la.actor, type: "use", item: a.itemId ?? "" };
     case "equip":   return { i: la.actor, type: "equip", rowid: a.rowid ?? 0, slot: a.slot ?? "" };
     case "unequip": return { i: la.actor, type: "unequip", rowid: a.rowid ?? 0 };
@@ -64,6 +65,7 @@ export function parseCanonicalLog(text: string): LoggedAction[] {
     let action: GameAction;
     switch (parts[1]) {
       case "move":    action = { type: "move", dx: Number(parts[2]), dy: Number(parts[3]) }; break;
+      case "travel":  action = { type: "travel", dx: Number(parts[2]), dy: Number(parts[3]) }; break;
       case "pickup":  action = { type: "pickup" }; break;
       case "use":     action = { type: "use", itemId: parts[2] }; break;
       case "gate":    action = { type: "gate" }; break;
@@ -190,7 +192,7 @@ export function toWireResults(
  * Compact settlement encoding (backend docs/STRATEGY_action_proofs.md
  * option A, parsed by ParseCompactActions in moveprocessor.cpp): entries
  * separated by ";", each "[<i>:]<code><args>[*<count>]" with codes
- * m<numpad digit> (move), p (pickup), w (wait), g (gate), u<item> (use),
+ * m<numpad digit> (move), t<numpad digit> (travel), p (pickup), w (wait), g (gate), u<item> (use),
  * e<rowid>,<slot> (equip), q<rowid> (unequip).  The actor prefix is used
  * for merged (multiplayer) logs only.  Maximal runs of identical entries
  * collapse to "*<n>": the GSP expands them before anything else sees the
@@ -214,6 +216,11 @@ function compactEntry(a: GameAction): string {
       const code = NUMPAD[`${a.dx ?? 0},${a.dy ?? 0}`];
       if (!code) throw new Error(`bad move delta ${a.dx},${a.dy}`);
       return "m" + code;
+    }
+    case "travel": {
+      const code = NUMPAD[`${a.dx ?? 0},${a.dy ?? 0}`];
+      if (!code) throw new Error(`bad travel delta ${a.dx},${a.dy}`);
+      return "t" + code;
     }
     case "pickup":  return "p";
     case "wait":    return "w";
@@ -276,6 +283,12 @@ export function decodeCompactLog(text: string, withActor: boolean): LoggedAction
         const d = NUMPAD_INV[arg];
         if (arg.length !== 1 || !d) throw new Error("bad move: " + entry);
         action = { type: "move", dx: d[0], dy: d[1] };
+        break;
+      }
+      case "t": {
+        const d = NUMPAD_INV[arg];
+        if (arg.length !== 1 || !d) throw new Error("bad travel: " + entry);
+        action = { type: "travel", dx: d[0], dy: d[1] };
         break;
       }
       case "p": if (arg) throw new Error("bad pickup"); action = { type: "pickup" }; break;
