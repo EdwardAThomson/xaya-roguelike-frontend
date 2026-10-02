@@ -15,7 +15,19 @@
  *
  * Every case asserts a REJECTION, so a pass means the chain refused. The
  * last case is the honest control: it must be accepted, otherwise the
- * rejections prove nothing.
+ * rejections prove nothing, and once it settles the staked rows must be in
+ * the winner's bag.
+ *
+ * Two groups of cheats. The stake cheats come first, against the duel as it
+ * opens (a row you do not own, one row counted twice, equipped gear, gold
+ * you do not have, a row already in escrow, a stake below the floor, and a
+ * challenger with no room for what they would win). Then the settlement
+ * cheats, against the finished fight.
+ *
+ * The full-bag case needs a third player with 50 bag rows, filled the
+ * honest way by running the arena about a dozen times, which is most of
+ * this script's running time. ROG_SKIP_FULL_BAG=1 skips it; ROG_C names a
+ * character to reuse (one already full skips the runs).
  *
  * Prerequisites: a devnet running (the static server is not needed).
  * Run:  npm run duel:evil
@@ -23,12 +35,18 @@
 import { DungeonSession, duelCommitHash } from "../../dist/game/session.js";
 import { settleLogHash, toWireResults, toWireAction, computeClaims }
   from "../../dist/game/settle.js";
+import { lookupItem } from "../../dist/game/items.js";
+import { MAX_BAG_ROWS } from "../../dist/config.js";
 import { sleep } from "./agentcore.mjs";
+import { setupFromPlayer, constraintsFor, planLootRun } from "./bagfill.mjs";
+import { bagTotals, potTotals, minus, describe, stakeTransferFailures }
+  from "./stakes.mjs";
 
 const PROXY = process.env.ROG_PROXY || "http://localhost:18380";
 const STAMP = Date.now().toString(36).slice(-4);
 const A = process.env.ROG_A || `evilA${STAMP}`;
 const B = process.env.ROG_B || `evilB${STAMP}`;
+const C = process.env.ROG_C || `evilC${STAMP}`;
 
 const findings = [];
 const fail = (m) => { findings.push(m); console.log("  ✗ " + m); };
@@ -73,38 +91,78 @@ async function visitUntil(id, pred, ms = 30000) {
   }
   return null;
 }
-const height = async () => (await gsp("getcurrentstate", []), (await (await fetch(`${PROXY}/gsp`, {
-  method: "POST", headers: { "content-type": "application/json" },
-  body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getcurrentstate", params: [] }),
-})).json()).result.height);
-
-/** Rebuilds a participant's engine setup from chain state, as the GSP does. */
-function setupFromPlayer(p, entryDir) {
-  return {
-    name: p.name,
-    stats: {
-      level: p.level,
-      strength: p.effective_stats.strength,
-      dexterity: p.effective_stats.dexterity,
-      constitution: p.effective_stats.constitution,
-      intelligence: p.effective_stats.intelligence,
-      equipAttack: p.effective_stats.equip_attack,
-      equipDefense: p.effective_stats.equip_defense,
-    },
-    hp: p.hp, maxHp: p.max_hp,
-    potions: p.inventory
-      .filter((i) => i.slot === "bag" && /health_potion/.test(i.item_id))
-      .map((i) => ({ itemId: i.item_id, quantity: i.quantity })),
-    inventory: p.inventory
-      .map((i) => ({ rowid: i.rowid, itemId: i.item_id, slot: i.slot }))
-      .sort((x, y) => x.rowid - y.rowid),
-    entryDir,
-  };
+/** The GSP's own view of where it is: `{state, height}`. */
+async function gspTip() {
+  const r = await fetch(`${PROXY}/gsp`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getcurrentstate", params: [] }),
+  });
+  const res = (await r.json()).result ?? {};
+  return { state: res.state, height: res.height ?? 0 };
 }
-function constraintsFor(seg) {
-  if (!seg.constraint_dir) return [];
-  const g = seg.gates?.[seg.constraint_dir];
-  return g ? [{ x: g.x, y: g.y, direction: seg.constraint_dir }] : [];
+
+/**
+ * Submits a move and waits until the GSP has processed the block holding
+ * it, so a refusal can be read off the state rather than timed out. The
+ * proxy mines the move's own block before answering; one more block and an
+ * up-to-date GSP past both means the move has been seen.
+ */
+async function moveSeen(name, data) {
+  const h0 = (await gspTip()).height;
+  await move(name, data);
+  await proxy({ action: "mine", blocks: 1 });
+  for (let i = 0; i < 60; i++) {
+    const t = await gspTip();
+    if ((t.state ?? "up-to-date") === "up-to-date" && t.height >= h0 + 2) return;
+    await sleep(300);
+  }
+  throw new Error(`the GSP never caught up after ${name}'s ${Object.keys(data)[0]} move`);
+}
+
+const player = (n) => gsp("getplayerinfo", [n]);
+const bagRow = (p, id) => p.inventory.find((i) => i.slot === "bag" && i.item_id === id);
+const bagRows = (p) => p.inventory.filter((i) => i.slot === "bag").length;
+const worthOf = (row) => (lookupItem(row.item_id)?.value ?? 0) * row.quantity;
+
+/** Moves `id` from its equipment slot to the bag, where it can be staked. */
+async function unequip(name, id) {
+  const p = await player(name);
+  if (bagRow(p, id)) return bagRow(p, id).rowid;
+  const row = p.inventory.find((i) => i.item_id === id && i.slot !== "bag");
+  if (!row) throw new Error(`${name} has no ${id} to unequip`);
+  await moveSeen(name, { uq: { rowid: row.rowid } });
+  const after = bagRow(await player(name), id);
+  if (!after) throw new Error(`${name}'s ${id} never reached the bag`);
+  return after.rowid;
+}
+
+/**
+ * Fills `name`'s bag to MAX_BAG_ROWS by running the arena east of the hub
+ * and walking out with everything on its floor. Throws if the arena gives
+ * nothing to keep, or if a run the planner believed in is refused.
+ */
+async function fillBag(name) {
+  for (let run = 1; run <= 40; run++) {
+    let p = await player(name);
+    if (bagRows(p) >= MAX_BAG_ROWS) return bagRows(p);
+    if (!p.in_channel) {
+      await move(name, { gw: { dir: "east" } });
+      for (let i = 0; i < 40 && !p.in_channel; i++) { await sleep(500); p = await player(name); }
+      if (!p.in_channel) throw new Error(`${name} could not enter the arena (run ${run})`);
+    }
+    const seg = await gsp("getsegmentinfo", [1, 0]);
+    const plan = planLootRun(seg, p, p.active_visit.entry_direction);
+    if (!plan) throw new Error(`no run through the arena survives for ${name}`);
+    const rowsBefore = bagRows(p);
+    await move(name, { gw: { dir: plan.gate.direction,
+                             settlement: { results: plan.results, actions: plan.actions } } });
+    for (let i = 0; i < 40 && p.in_channel; i++) { await sleep(500); p = await player(name); }
+    if (p.in_channel)
+      throw new Error(`the GSP refused ${name}'s loot run ${run} (${plan.actions.length} actions)`);
+    console.log(`   run ${run}: ${rowsBefore} -> ${bagRows(p)} bag rows, hp ${p.hp}/${p.max_hp}`);
+    if (plan.rows === 0) throw new Error("the arena's floor holds nothing that takes a bag row");
+  }
+  throw new Error(`${name}'s bag was still not full after 40 runs`);
 }
 
 /** Ensures a confirmed segment east of the hub, walking a run in and out. */
@@ -168,21 +226,137 @@ for (let i = 0; i < 40; i++) {
 }
 ok(`${A} and ${B} registered, arena (1, 0) confirmed`);
 
-console.log("open a staked duel and play it out honestly, in process");
-const STAKE = 0;
-await move(A, { v: { dir: "east", mode: "duel", stake: STAKE } });
-const opened = await visitUntil(null ?? 0, () => false, 0) ?? null;
-let visitId = null;
-for (let i = 0; i < 40 && visitId === null; i++) {
-  const p = await gsp("getplayerinfo", [A]);
-  if (p?.active_visit) visitId = p.active_visit.visit_id;
-  await sleep(500);
+// A third player whose bag is full, for the one stake cheat that needs a
+// winner with nowhere to put the winnings. Their sword comes off first: it
+// is their stake, and once the bag is full there is no room to unequip it.
+let bagFull = false;
+if (process.env.ROG_SKIP_FULL_BAG) {
+  console.log("  - full bag: SKIPPED (ROG_SKIP_FULL_BAG is set)");
+} else {
+  console.log(`filling ${C}'s bag by running the arena (a few dozen blocks)`);
+  try {
+    await register(C);
+    await unequip(C, "short_sword");
+    const rows = await fillBag(C);
+    bagFull = true;
+    ok(`${C} holds ${rows} bag rows, the most a bag can`);
+  } catch (e) {
+    fail(`setup: could not fill a bag, so the full-bag cheat went untested: ${e.message}`);
+  }
 }
-if (visitId === null) { fail("the duel never opened"); process.exit(1); }
-await move(B, { j: { id: visitId, dir: "east" } });
+
+// ---------------------------------------------------------------- stakes
+// Each cheat below must be refused, and refused WHOLE: a stake that named
+// one bad row and escrowed the rest would lock those rows to a visit that
+// never opened. So every case checks the pot as well as the refusal.
+console.log("\nstake cheats");
+
+// Something non-stackable on each side, so a won row needs a bag row of
+// its own (a won potion merges into a stack and needs none).
+const swordA = await unequip(A, "short_sword");
+const swordB = await unequip(B, "short_sword");
+const pa = await player(A), pb = await player(B);
+const potA = bagRow(pa, "health_potion")?.rowid;
+const potB = bagRow(pb, "health_potion")?.rowid;
+const armorA = pa.inventory.find((i) => i.slot !== "bag")?.rowid;
+if (!potA || !potB || !armorA) {
+  fail(`fresh characters should carry potions and wear armour ` +
+       `(potA=${potA} potB=${potB} armorA=${armorA}); use fresh names`);
+  process.exit(1);
+}
+// One more than B's potion stack is worth: the potions alone fall short,
+// the potions and the sword clear it, and the potions counted twice would.
+const FLOOR = worthOf(bagRow(pb, "health_potion")) + 1;
+ok(`swords unequipped; the host will ask for at least ${FLOOR}`);
+
+/** A host move that must open nothing. */
+async function hostRefused(label, v) {
+  await moveSeen(A, { v: { dir: "east", mode: "duel", ...v } });
+  const p = await player(A);
+  if (p.active_visit) {
+    fail(`${label}: the chain OPENED duel #${p.active_visit.visit_id}`);
+    console.log(findings.length ? `\nFAIL (${findings.length})` : "");
+    for (const f of findings) console.log(" - " + f);
+    process.exit(1);
+  }
+  ok(`${label}: refused`);
+}
+
+await hostRefused("host stakes a row they do not own", { stake: 0, stake_items: [potB] });
+await hostRefused("host stakes the same row twice", { stake: 0, stake_items: [potA, potA] });
+await hostRefused("host stakes the armour they are wearing", { stake: 0, stake_items: [armorA] });
+await hostRefused("host stakes gold they do not have", { stake: (pa.gold ?? 0) + 1000 });
+
+// The honest host: sword and potions, with the floor above.
+await moveSeen(A, { v: { dir: "east", mode: "duel", stake: 0, min_stake: FLOOR,
+                         stake_items: [swordA, potA] } });
+const visitId = (await player(A)).active_visit?.visit_id ?? null;
+if (visitId === null) { fail("the honest duel never opened"); process.exit(1); }
+const hostPot = potTotals((await gsp("getvisitinfo", [visitId]))?.staked_items);
+const bagsBefore = { [A]: bagTotals(await player(A)), [B]: bagTotals(await player(B)) };
+ok(`duel #${visitId} open with ${describe(hostPot)} in the pot`);
+
+// A row can only be in escrow while its owner sits in the duel holding it,
+// so the one way to stake it again is from inside that duel. The visit
+// guard refuses before the escrow check is reached; what is asserted is
+// the property, that the row does not end up behind a second duel.
+await moveSeen(A, { v: { dir: "east", mode: "duel", stake: 0, stake_items: [swordA] } });
+{
+  const p = await player(A);
+  const pot = potTotals((await gsp("getvisitinfo", [visitId]))?.staked_items);
+  if (p.active_visit?.visit_id !== visitId)
+    fail(`host re-stakes an escrowed row: now in visit ${p.active_visit?.visit_id}`);
+  else if (describe(pot) !== describe(hostPot))
+    fail(`host re-stakes an escrowed row: the pot became ${describe(pot)}`);
+  else ok("host re-stakes a row already in escrow: refused");
+}
+
+/** A join that must leave the duel open, with the host alone and the pot as it was. */
+async function joinRefused(label, who, j) {
+  await moveSeen(who, { j: { id: visitId, dir: "east", ...j } });
+  const v = await gsp("getvisitinfo", [visitId]);
+  const pot = potTotals(v?.staked_items);
+  if (v?.status !== "open" || (v.participants ?? []).length !== 1) {
+    fail(`${label}: the chain let ${who} in (status ${v?.status}, ` +
+         `participants ${JSON.stringify(v?.participants)})`);
+    console.log(`\nFAIL (${findings.length})`);
+    for (const f of findings) console.log(" - " + f);
+    process.exit(1);
+  }
+  if (describe(pot) !== describe(hostPot)) fail(`${label}: refused, but the pot became ${describe(pot)}`);
+  else ok(`${label}: refused, pot untouched`);
+}
+
+await joinRefused("challenger stakes below the floor", B,
+                  { stake: 0, stake_items: [potB] });
+// Their own potions and sword clear the floor, so ownership is the only
+// thing wrong; and it must not escrow the two rows that were fine.
+await joinRefused("challenger stakes the host's escrowed sword", B,
+                  { stake: 0, stake_items: [potB, swordB, swordA] });
+await joinRefused("challenger counts one row twice to clear the floor", B,
+                  { stake: 0, stake_items: [potB, potB] });
+await joinRefused("challenger stakes gold they do not have", B,
+                  { stake: (pb.gold ?? 0) + 1000, stake_items: [potB, swordB] });
+if (bagFull) {
+  // Their stake clears the floor; winning would hand them the host's sword
+  // and they have no row to put it in. Settlement must never have to drop
+  // won property, so the join is where it stops.
+  const pc = await player(C);
+  await joinRefused("a challenger with no room for the winnings", C,
+                    { stake: 0, stake_items: [bagRow(pc, "health_potion").rowid,
+                                              bagRow(pc, "short_sword").rowid] });
+}
+
+console.log("\nthe honest duel, played out in process");
+await moveSeen(B, { j: { id: visitId, dir: "east", stake: 0, stake_items: [swordB, potB] } });
 const active = await visitUntil(visitId, (v) => v?.status === "active", 40000);
 if (!active) { fail("the duel never activated"); process.exit(1); }
-ok(`duel #${visitId} active, mode ${active.mode}, pot ${active.pot ?? 0}`);
+const stakes = {
+  [A]: hostPot,
+  [B]: minus(potTotals(active.staked_items), hostPot),
+};
+ok(`duel #${visitId} active, mode ${active.mode}; pot: ${A} ${describe(stakes[A])}, ` +
+   `${B} ${describe(stakes[B])}`);
 
 // Build the same session the GSP will replay, and fight it to a finish.
 const names = [...active.participants].sort();
@@ -343,6 +517,15 @@ if (await assertStillOpen("control")) {
     ok("control: the honest settlement was accepted");
     for (const r of v.results ?? [])
       console.log(`     ${r.name}: survived=${r.survived} xp=${r.xp_gained} gold=${r.gold_gained}`);
+    const w = names[winner], l = names[loser];
+    const problems = stakeTransferFailures({
+      winner: w, loser: l, before: bagsBefore,
+      after: { [w]: bagTotals(await player(w)), [l]: bagTotals(await player(l)) },
+      loserStake: stakes[l], settledPot: v.staked_items,
+    });
+    for (const m of problems) fail(`stakes: ${m}`);
+    if (!problems.length)
+      ok(`stakes: ${w} won ${describe(stakes[l])} from ${l}, and the escrow is empty`);
   }
 }
 

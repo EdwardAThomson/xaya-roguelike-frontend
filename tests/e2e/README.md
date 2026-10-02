@@ -113,20 +113,34 @@ the frontend built (`npx tsc` → `dist/`), the xayax venv at
   have checkpointed; the host waits rather than walking (stepping on a gate
   in a duel is a concession), abandons once the checkpoint goes stale, and
   the run fails unless the duel resolves with the vanished side losing and
-  the host free again. It drives the real DOM because hosting a duel has no
+  the host free again. Both sides stake every bag row the picker offers,
+  and each scenario then checks against the chain that the loser's rows
+  are in the winner's bag, the loser's are gone, and the escrow is empty
+  (by item and quantity, since a won potion merges into the winner's
+  stack). It drives the real DOM because hosting a duel has no
   debug hook. Headed by default; env:
   `ROG_HEADLESS=1`, `ROG_URL`, `ROG_MAX_MIN` (default 12), `ROG_A` /
   `ROG_B` to reuse existing characters (they need gold to stake).
 - `npm run duel:evil` — the adversarial duel suite (`duel_adversarial.mjs`):
   no browser, because a Playwright page runs honest code and cannot be made
-  to lie. Both duellists are Node actors holding their own copy of the
+  to lie. It opens with the stake cheats, each of which must open or join
+  nothing and leave the pot untouched: a host staking a row they do not
+  own, one row twice, the armour they are wearing, gold they do not have,
+  or a row already in escrow; a challenger staking below the floor, the
+  host's escrowed sword, one row counted twice to clear the floor, gold
+  they do not have, or (a third player, `evilC`) a stake that would win
+  them a sword with no bag row to put it in. That last one needs a full
+  bag, which it fills honestly by running the arena about a dozen times
+  (`bagfill.mjs` plans each run in process); `ROG_SKIP_FULL_BAG=1` skips
+  it and `ROG_C` reuses a character. Both duellists are Node actors holding their own copy of the
   engine; they fight an honest duel in process, then take turns trying to
   steal the result over the real move path — settling with no confirm on
   file, abandoning a live opponent, claiming a win over a consented log, a
   truncated log, a reveal that does not open its commitment, and a
   commitment lifted from another round. Every case must be REJECTED, and
   the last case is the honest control that must be accepted, or the
-  refusals would prove nothing. The wrong-token relay case reports itself
+  refusals would prove nothing; once it settles, the staked rows must be
+  in the winner's bag. The wrong-token relay case reports itself
   as skipped on a devnet with claim tokens off, and the script says how to
   turn them on. Needs a devnet; the static server is not required.
 - `npm run duel:bot`: a headless duel opponent (`duel_bot.mjs`), so one

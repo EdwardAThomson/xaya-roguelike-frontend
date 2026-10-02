@@ -6,6 +6,8 @@
  * duel" from the gate dialog, and chooses a stake from the modal that
  * follows. The challenger walks onto their own side of the same gate and
  * takes the join choice. Both then bump into each other until one falls.
+ * Both stake every bag row the picker offers, and once the duel settles the
+ * run checks that the loser's rows really moved to the winner.
  *
  * Prerequisites: a devnet and the static server already running.
  * Run:  npm run duel
@@ -14,6 +16,8 @@
  */
 import { chromium } from "playwright";
 import { bfsStep, sleep } from "./agentcore.mjs";
+import { bagTotals, potTotals, minus, describe, stakeTransferFailures }
+  from "./stakes.mjs";
 
 const URL = `${process.env.ROG_URL || "http://localhost:8000"}/?e2e=1`;
 const PROXY = process.env.ROG_PROXY || "http://localhost:18380";
@@ -28,6 +32,9 @@ const findings = [];
 /** Set once the fight loop is reached; drives one actor's duel move. */
 let duelStep = null;
 const fail = (m) => { findings.push(m); console.log("  ✗ " + m); };
+// Fresh characters always carry a stack of health potions in the bag, so
+// the picker has something to offer and an item stake is not optional.
+const FRESH = !process.env.ROG_A && !process.env.ROG_B;
 const ok = (m) => console.log("  ✓ " + m);
 
 /** Mines blocks on the devnet: the staleness window counts in blocks. */
@@ -47,6 +54,36 @@ async function gsp(method, params = []) {
   return res && typeof res === "object" && "data" in res ? res.data : res;
 }
 
+/** Every bag total for each named player, read from the chain. */
+async function bags(...names) {
+  const out = {};
+  for (const n of names) out[n] = bagTotals(await gsp("getplayerinfo", [n]));
+  return out;
+}
+
+/**
+ * Checks a settled duel's stakes moved: `stakes` is `{name: {item: qty}}`
+ * as read off the pot, `before` the bags as they were before the host
+ * opened it. Returns how many item kinds were checked.
+ */
+async function checkStakesMoved(label, visit, stakes, before) {
+  const winner = (visit.results ?? []).find((r) => r.survived)?.name;
+  const loser = (visit.results ?? []).find((r) => !r.survived)?.name;
+  if (!winner || !loser) {
+    fail(`${label}: no single winner in ${JSON.stringify(visit.results)}`);
+    return 0;
+  }
+  const after = await bags(winner, loser);
+  const problems = stakeTransferFailures({
+    winner, loser, before, after,
+    loserStake: stakes[loser], settledPot: visit.staked_items,
+  });
+  for (const m of problems) fail(`${label}: ${m}`);
+  if (!problems.length)
+    ok(`${label}: ${winner} won ${describe(stakes[loser])} from ${loser}, ` +
+       `and the escrow is empty`);
+  return Object.keys(stakes[loser]).length;
+}
 
 /**
  * Ticks every item tile in the stake dialog, returning how many there are.
@@ -229,6 +266,9 @@ try {
   else ok(`arena (${arena.x}, ${arena.y}) confirmed, through the hub's ${dir} gate`);
 
   console.log("3. host a duel from the gate dialog");
+  const bagsBefore = await bags(A.name, B.name);
+  console.log(`   bags: ${A.name} ${describe(bagsBefore[A.name])}; ` +
+              `${B.name} ${describe(bagsBefore[B.name])}`);
   await A.standOnGate(dir);
   await A.pickChoice("wait here for a duel");
   await sleep(400);
@@ -253,6 +293,9 @@ try {
   const onChain = await gsp("getvisitinfo", [visitId]);
   if (onChain?.mode !== "duel") fail(`visit ${visitId} mode is ${onChain?.mode}, not duel`);
   else ok(`duel #${visitId} open, stake ${onChain.stake ?? 0}, pot ${onChain.pot ?? 0}`);
+  const hostPot = potTotals(onChain?.staked_items);
+  if (stakedItems > 0 && !Object.keys(hostPot).length)
+    fail(`the host ticked ${stakedItems} row(s) but the pot holds no items`);
 
   console.log("4. challenger walks in from their own side");
   await B.until((x) => (x.joinable ?? []).some((j) => j.visit.id === visitId), 25000,
@@ -283,6 +326,12 @@ try {
     fail(`pot ${joined.pot} looks like matched stakes; the uneven join did not take`);
   else ok(`both in, status ${joined.status}, pot ${joined.pot ?? 0} ` +
           `(host ${maxStake} + challenger ${myMin})`);
+  const stakes = {
+    [A.name]: hostPot,
+    [B.name]: minus(potTotals(joined.staked_items), hostPot),
+  };
+  console.log(`   items in the pot: ${A.name} ${describe(stakes[A.name])}; ` +
+              `${B.name} ${describe(stakes[B.name])}`);
 
   console.log("5. both clients open the arena");
   await Promise.all([
@@ -382,6 +431,12 @@ try {
     ok(`duel #${visitId} completed on-chain`);
     for (const r of v.results ?? [])
       console.log(`   ${r.name}: survived=${r.survived} xp=${r.xp_gained} gold=${r.gold_gained}`);
+    // The one consensus path in 4a that only ever ran in unit tests: the
+    // pot's ROWS, not just its gold, land in the winner's bag.
+    const checked = await checkStakesMoved(`duel #${visitId}`, v, stakes, bagsBefore);
+    if (!checked && FRESH)
+      fail("the loser staked no items, so the transfer went unchecked " +
+           "(fresh characters carry potions: did the picker offer nothing?)");
   }
   for (const d of [A, B]) {
     const p = await gsp("getplayerinfo", [d.name]);
@@ -416,6 +471,7 @@ try {
   }
   ok("both back at the hub");
 
+  const bagsBefore2 = await bags(A.name, B.name);
   await A.standOnGate(dir);
   await A.pickChoice("wait here for a duel");
   await sleep(400);
@@ -427,6 +483,7 @@ try {
   const hosted2 = await A.until((x) => !!x.player?.active_visit, 35000, "the second duel to open");
   const visit2 = hosted2.player.active_visit.visit_id;
   ok(`duel #${visit2} open`);
+  const hostPot2 = potTotals((await gsp("getvisitinfo", [visit2]))?.staked_items);
 
   await B.until((x) => (x.joinable ?? []).some((j) => j.visit.id === visit2), 25000,
                 "the second duel to reach the challenger");
@@ -437,6 +494,10 @@ try {
   await tickAllStakeItems(B.page);
   await B.page.click(".modal-confirm");
   await B.until((x) => x.player?.active_visit?.visit_id === visit2, 35000, "to join the second duel");
+  const stakes2 = {
+    [A.name]: hostPot2,
+    [B.name]: minus(potTotals((await gsp("getvisitinfo", [visit2]))?.staked_items), hostPot2),
+  };
   await Promise.all([
     A.until((x) => !!x.coop, 45000, "the second duel to start for the host"),
     B.until((x) => !!x.coop, 45000, "the second duel to start for the challenger"),
@@ -514,8 +575,12 @@ try {
       const gone = (v2.results ?? []).find((r) => r.name === B.name);
       if (gone?.survived && !host?.survived)
         fail(`${B.name} vanished and still won: an absent duellist must lose`);
-      else if (host?.survived)
+      else if (host?.survived) {
         ok(`${A.name} took the duel the challenger walked out of`);
+        // Walking out forfeits the stake as surely as falling does.
+        if (Object.keys(stakes2[B.name]).length)
+          await checkStakesMoved(`stalled duel #${visit2}`, v2, stakes2, bagsBefore2);
+      }
     }
   }
   const pa = await gsp("getplayerinfo", [A.name]);
