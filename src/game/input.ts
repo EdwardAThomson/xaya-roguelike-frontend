@@ -54,6 +54,19 @@ export class InputHandler {
     // Don't drive the dungeon while the inventory modal is open.
     if (document.body.classList.contains("inv-open")) return;
 
+    // Travel: Shift + a movement key walks up to eight tiles that way in
+    // one action, stopping early when something comes into view (backend
+    // SPEC_multiplayer_pvp.md section 2e).  Checked before plain movement
+    // because Shift turns "w" into "W", which plain movement ignores.
+    if (e.shiftKey) {
+      const tdir = keyMap[e.key] ?? keyMap[e.key.toLowerCase()];
+      if (tdir) {
+        e.preventDefault();
+        this.callback("travel", tdir);
+        return;
+      }
+    }
+
     // Movement.
     const dir = keyMap[e.key];
     if (dir) {

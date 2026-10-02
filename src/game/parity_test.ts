@@ -11,7 +11,7 @@
  * Run:  npx tsc && node dist/game/parity_test.js
  */
 import { hashSeedSync } from "./hash.js";
-import { Dungeon, Gate, WIDTH, HEIGHT } from "./dungeon.js";
+import { Dungeon, Gate, Tile, WIDTH, HEIGHT } from "./dungeon.js";
 import { DungeonSession, GameAction, EntryInvItem, PlayerSetup,
          LoggedAction, duelCommitHash, duelCommitPreimage } from "./session.js";
 import { PlayerStats } from "./combat.js";
@@ -381,15 +381,35 @@ export function runDuelClaimVector(): boolean {
   const salt = (i: number, r: number) =>
     (i.toString(16) + r.toString(16)).padStart(32, "0");
 
-  // Walk them into each other until one falls.  Fixed salts, so the whole
-  // run is reproducible.
+  // Walk them into each other until one falls: each takes the first step
+  // of a shortest floor path to the other (they spawn eight steps apart,
+  // pvp spec §2d, so a straight line can hit a wall), and stepping onto the
+  // foe's tile is the attack.  Fixed salts, so the whole run is
+  // reproducible.
+  const stepToward = (i: number): GameAction => {
+    const me = s.players[i], foe = s.players[1 - i];
+    const prev = new Map<number, number>();
+    const key = (x: number, y: number) => y * WIDTH + x;
+    const queue: [number, number][] = [[foe.x, foe.y]];
+    prev.set(key(foe.x, foe.y), -1);
+    for (let h = 0; h < queue.length; h++) {
+      const [x, y] = queue[h];
+      if (Math.max(Math.abs(x - me.x), Math.abs(y - me.y)) === 1)
+        return { type: "move", dx: x - me.x, dy: y - me.y };
+      for (let dy = -1; dy <= 1; dy++)
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || nx >= WIDTH || ny < 0 || ny >= HEIGHT) continue;
+          if (s.dungeon.getTile(nx, ny) === Tile.Wall || prev.has(key(nx, ny))) continue;
+          prev.set(key(nx, ny), key(x, y));
+          queue.push([nx, ny]);
+        }
+    }
+    return { type: "wait" };
+  };
   for (let round = 0; round < 400 && !s.gameOver; round++) {
     const r = s.roundIndex;
-    const acts: GameAction[] = [0, 1].map(i => {
-      const me = s.players[i], foe = s.players[1 - i];
-      const dx = Math.sign(foe.x - me.x), dy = Math.sign(foe.y - me.y);
-      return (dx || dy) ? { type: "move", dx, dy } : { type: "wait" };
-    });
+    const acts: GameAction[] = [0, 1].map(stepToward);
     for (const i of [0, 1])
       if (s.isPlayerActive(i))
         s.processActionBy(i, { type: "commit", hex: duelCommitHash(7, r, i, acts[i], salt(i, r)) });
@@ -520,29 +540,41 @@ const DUEL_FIXTURE_SEED = "duel-parity-1";
 const DUEL_FIXTURE_DEPTH = 3;
 const DUEL_FIXTURE_VISIT_ID = 11;
 
-/* A fought-out duel: both walk in through the SAME gate, so they spawn one
-   tile apart and trade blows every round.  Generated once on the C++ side by
-   a scripted mutual-attack policy searched over salt nonces until the run
+/* A fought-out duel.  Both walk in through the SAME gate, so they spawn
+   DUEL_SPAWN_SPACING steps apart (pvp spec §2d): participant 0 on the gate
+   mouth, participant 1 eight steps in.  The first six rounds walk them into
+   contact, one directly above the other, and from then on they trade blows
+   every round.  Generated once on the C++ side by a scripted
+   approach-then-mutual-attack policy searched over salt nonces until the run
    covered every player-vs-player outcome the spec requires a vector for -- a
-   hit, a miss, a dodge and a critical -- and ended in a death.  Round 3
-   drinks participant 1's only potion; round 4 commits to drinking another it
-   no longer holds, which the duel applies as a wait while the log keeps the
-   action the commitment covers. */
+   hit, a miss, a dodge and a critical -- and ended in a death.  Fight round 3
+   drinks participant 1's only potion; fight round 4 commits to drinking
+   another it no longer holds, which the duel applies as a wait while the log
+   keeps the action the commitment covers. */
+const DUEL_APPROACH_ROUNDS = 6;
+
 const DUEL_FIXTURE_ROUNDS: string[] = [
-  "move 0 -1,46fe29bd55091bac1f585e9361040b60|move 0 1,505b34f6f400bb66c1e6575e3381ae98",
-  "move 0 -1,24a4f60012bc28931beaf295e8afc0d5|move 0 1,f30ac68cf470f7aa149551476f12fe59",
-  "move 0 -1,b6fb3ceade09780b8cbe23823372c8da|move 0 1,4828070ebb765574dc2421c459fbfee3",
-  "move 0 -1,d1be09e4055c76bf0f0c62408908a51e|use health_potion,2d75ca6c55176aaf48d360498dc64c22",
-  "move 0 -1,2a09226e39f3009bb3f3a3cede8c5d76|use health_potion,144f587a3222c320763b64abdada5753",
-  "move 0 -1,c56982aa6abb747bc31a9952393698fc|move 0 1,e02ce7a7cc372690d870c5429abc8db4",
-  "move 0 -1,1900b6e92fb00dee570004971afa8eba|move 0 1,28426d0d232c3f62d536cc7e79f6c1e2",
-  "move 0 -1,417bd4cd0528ae7ac0b085aaf9b22feb|move 0 1,ddc0231256211c53de48480cf21e0b0d",
-  "move 0 -1,1a24b03a4ae3f9e69c3c21e5436c89b0|move 0 1,62430b8ec12b2c2c7b8cbb154cd294aa",
-  "move 0 -1,8a962e81c7ee23d1321eb8abe87f0fee|move 0 1,5a3d1d71d010a2ab19230fa04f706c0b",
-  "move 0 -1,ec759f88c6c13b83f843e4ef88198a22|move 0 1,9713c120118acda4aebcd908583ed8fb",
-  "move 0 -1,2fcc9a2378f4d83813354b92a76cc9aa|move 0 1,a18f8a943e79ef26e4138a1073cd7a50",
-  "move 0 -1,f3b27594550b419515aa46eea5a8bc08|move 0 1,449f379e39f4f25a2f90849248297619",
-  "move 0 -1,5d7ae7e5edd453caf4c60b2eb1ddf9f6|move 0 1,e2176b074dc1ca94edcb10bf9f6e5a49",
+  "wait,fc5d7a839386676dd0c58055ece5208c|move 1 0,9654e83d8875fa311d18dbf8115b07e0",
+  "wait,c323b541f00b5529a937ca6e7b5bfb53|move 1 0,a06788e181760df52fc1fc4291f705ef",
+  "wait,4c2bd63f7be9768707b91079437508f4|move 1 0,6d9f6bf1d0ac322e2d38be59350a2879",
+  "wait,e0491abff255bd0a042c5d1eef5d62ad|move 1 0,0146d92af24025c7271044eb1cc722c2",
+  "wait,cefdcababe10e13b5ac69cccb0d41b51|move 1 1,f5b13083572cc50c9ef519d0b919b6fa",
+  "move 0 -1,90bea0e3a280e9a5e3a3af00d9da04f9|move 0 1,2c3722144e0ca78bd16640dbf7748124",
+  "move 0 -1,cd8fb474934abe696cfd9a2df81fb0f2|move 0 1,9c5685a8ac9746bdb40b434c1b70af38",
+  "move 0 -1,ed2e07dbec1a3bbed0620a28de675198|move 0 1,3c110d1a041ba11d206aea77855edc3e",
+  "move 0 -1,3b1989140a5e24eeaaf1eb4703bf8fb3|move 0 1,8fa56e0903b601c920d159afd405c8e0",
+  "move 0 -1,93416a7965d501ac646f5b1ee5c07081|use health_potion,fc0a2d428db1037b4830479cde083109",
+  "move 0 -1,f8748e80e29e70aa9969525487ecc2dd|use health_potion,5275e2da674cef9bb1cf25db4d21c22c",
+  "move 0 -1,ed97cbb182f248ff0efdc714119063b0|move 0 1,c3b95a91bb371cdb20617e69f35d9e1e",
+  "move 0 -1,67b30f9a2d20c6a798c16accaafe98e0|move 0 1,f2f5bed8c33465f1e17c729c333d7d78",
+  "move 0 -1,83d8db1411753e20a459ceb58b4a430c|move 0 1,dfde49e71bb194ae75a5bfd89649a9d0",
+  "move 0 -1,0572e2d77f3b5fa5516e15b2437e7381|move 0 1,b5f06366a1761206b24d6864644f0f17",
+  "move 0 -1,d88d2dcd5562c859adb918017f601a95|move 0 1,c0db836e308c99b812677a0f372c1d54",
+  "move 0 -1,7c449d071d5ad6c7c5178140d0bd8f37|move 0 1,80786f26f49fc31a1a731b8cb0e168cf",
+  "move 0 -1,a0234ce30f044a1e1d2f1e5ea26a50e3|move 0 1,17f6bdbb6c24ab8225ac7f171844f8fe",
+  "move 0 -1,8eb0a3c974631890b9250440b9a2cbd6|move 0 1,63c1c7106b6f2b0ea49f8c86ba785d6d",
+  "move 0 -1,9b996b762013fbc1a3e3a7f900427744|move 0 1,214cdb680040cac8f6f400c8cf1f070a",
+  "move 0 -1,9d8114f58bae15a65e7160949b2c081c|move 0 1,dc830de521263594af9daf59c5bea594",
 ];
 
 const DUEL_CONCEDE_ROUNDS: string[] = [
@@ -563,6 +595,7 @@ function parseDuelRound(row: string): DuelChoice[] {
     let action: GameAction;
     switch (parts[0]) {
       case "move":    action = { type: "move", dx: Number(parts[1]), dy: Number(parts[2]) }; break;
+      case "travel":  action = { type: "travel", dx: Number(parts[1]), dy: Number(parts[2]) }; break;
       case "pickup":  action = { type: "pickup" }; break;
       case "use":     action = { type: "use", itemId: parts[1] }; break;
       case "gate":    action = { type: "gate" }; break;
@@ -663,10 +696,11 @@ export function runDuelParityVector(): boolean {
     DUEL_FIXTURE_SEED, DUEL_FIXTURE_DEPTH, duelFixtureSetups(),
     DUEL_FIXTURE_VISIT_ID);
 
-  // Both walk in through the south gate, so the ring scan puts them one
-  // tile apart: a duel starts in contact.
+  // Both walk in through the south gate.  Participant 0 takes the mouth,
+  // participant 1 is placed eight walking steps further in (pvp spec §2d):
+  // a duel no longer starts in contact.
   let ok = s.players[0].x === 56 && s.players[0].y === 38
-        && s.players[1].x === 56 && s.players[1].y === 37;
+        && s.players[1].x === 51 && s.players[1].y === 34;
   if (!ok) console.log(`[duel-parity] ✗ FAIL spawn ${s.players[0].x},${s.players[0].y} ` +
                        `${s.players[1].x},${s.players[1].y}`);
 
@@ -692,12 +726,12 @@ export function runDuelParityVector(): boolean {
 
   const expected =
     "PARITY-DUEL" +
-    " p0[dead=1 exited=0 absent=0 xp=0 gold=0 kills=0 hp=0 dmg=0" +
-    " pvp=107 death=1 exit=]" +
-    " p1[dead=0 exited=0 absent=0 xp=0 gold=0 kills=0 hp=17 dmg=0" +
-    " pvp=100 death=0 exit=]" +
-    " winner=1 rounds=13 entries=84" +
-    " hash=63712921fdf060e8cb3c29a4a9c14ff2e4b34a9eb2a538885a3518beb647448a";
+    " p0[dead=0 exited=0 absent=0 xp=0 gold=0 kills=0 hp=6 dmg=0" +
+    " pvp=130 death=0 exit=]" +
+    " p1[dead=1 exited=0 absent=0 xp=0 gold=0 kills=0 hp=0 dmg=0" +
+    " pvp=94 death=1 exit=]" +
+    " winner=0 rounds=20 entries=125" +
+    " hash=7f48c5429e10b8a85bd241fcfec80fbb456026ab0fa94eb4f5bde495b099208c";
   if (line !== expected) ok = false;
   console.log(`[duel-parity] ${ok ? "✓ OK" : "✗ FAIL — C++/TS duel engine diverged"}`);
   return ok;
@@ -737,7 +771,7 @@ export function runDuelConcessionVector(): boolean {
    marked absent, and an absent duellist loses.  The unrevealed round is
    simply not in the settled log, which is why the prefix ends on a round
    boundary. */
-const STALL_PREFIX_ROUNDS = 5;
+const STALL_PREFIX_ROUNDS = DUEL_APPROACH_ROUNDS + 5;
 
 export function runDuelStallVector(): boolean {
   const rounds = DUEL_FIXTURE_ROUNDS.slice(0, STALL_PREFIX_ROUNDS)
@@ -758,12 +792,12 @@ export function runDuelStallVector(): boolean {
   console.log(line);
   const expected =
     "PARITY-DUEL-STALL" +
-    " p0[dead=0 exited=0 absent=0 xp=0 gold=0 kills=0 hp=80 dmg=0" +
-    " pvp=27 death=0 exit=]" +
-    " p1[dead=0 exited=0 absent=1 xp=0 gold=0 kills=0 hp=97 dmg=0" +
-    " pvp=20 death=0 exit=]" +
-    " winner=0 rounds=5 entries=30" +
-    " hash=89297c9ba2febf01df5ba39fae36c835cb589d17d44a10df0a1359aa6fa4f510";
+    " p0[dead=0 exited=0 absent=0 xp=0 gold=0 kills=0 hp=68 dmg=0" +
+    " pvp=40 death=0 exit=]" +
+    " p1[dead=0 exited=0 absent=1 xp=0 gold=0 kills=0 hp=90 dmg=0" +
+    " pvp=32 death=0 exit=]" +
+    " winner=0 rounds=11 entries=66" +
+    " hash=29c70ce3a9035bc01dd6875f89a6c22415cd8011fe01df9c9585a359da12dce1";
   if (line !== expected) ok = false;
   console.log(`[duel-stall] ${ok ? "✓ OK" : "✗ FAIL — abandonment diverged"}`);
   return ok;
@@ -827,6 +861,145 @@ export function runDuelEntryEncodingVectors(): boolean {
   return ok;
 }
 
+/**
+ * Duel spawn spacing (pvp spec §2d), pinned on its own so a mismatch in the
+ * breadth-first placement reports itself directly rather than as a
+ * settle-hash difference.  Three participants through one gate land 0, 8
+ * and 16 walking steps in.
+ */
+export function runDuelSpawnVector(): boolean {
+  const setups = duelFixtureSetups();
+  setups.push({ ...setups[1] });
+  const s = DungeonSession.createDuel(
+    DUEL_FIXTURE_SEED, DUEL_FIXTURE_DEPTH, setups, DUEL_FIXTURE_VISIT_ID);
+  const pos = s.players.map((p, i) => `p${i}[${p.x},${p.y}]`).join(" ");
+  const line = `PARITY-DUEL-SPAWN ${pos} monsters=${s.monsters.length}`;
+  console.log(line);
+  const ok = line === "PARITY-DUEL-SPAWN p0[56,38] p1[51,34] p2[43,34] monsters=13";
+  console.log(`[duel-spawn] ${ok ? "✓ OK" : "✗ FAIL — duel spawn spacing diverged"}`);
+  return ok;
+}
+
+/* Closing the gap with travel (pvp spec §2e).  Participant 1 walks east
+   along its corridor and stops the moment participant 0 is in view, five
+   steps in rather than eight; participant 0 then walks up its own corridor
+   one tile per round, because its opponent never leaves view.  In round 3
+   participant 1 commits to travelling into a tile participant 0 takes first,
+   which the duel applies as a wait (travel never attacks), and then they
+   fight with plain moves. */
+const DUEL_TRAVEL_ROUNDS: string[] = [
+  "wait,00000000000000000000000000000001|travel 1 0,10000000000000000000000000000001",
+  "travel 0 -1,00000000000000000000000000000002|wait,10000000000000000000000000000002",
+  "travel 0 -1,00000000000000000000000000000003|wait,10000000000000000000000000000003",
+  "travel 0 -1,00000000000000000000000000000004|travel 0 1,10000000000000000000000000000004",
+  "move 0 -1,00000000000000000000000000000005|move 0 1,10000000000000000000000000000005",
+  "move 0 -1,00000000000000000000000000000006|move 0 1,10000000000000000000000000000006",
+];
+
+export function runDuelTravelVector(): boolean {
+  const s = DungeonSession.createDuel(
+    DUEL_FIXTURE_SEED, DUEL_FIXTURE_DEPTH, duelFixtureSetups(),
+    DUEL_FIXTURE_VISIT_ID);
+  const log: LoggedAction[] = [];
+  let stops = "";
+  for (const row of DUEL_TRAVEL_ROUNDS) {
+    log.push(...driveDuel(s, DUEL_FIXTURE_VISIT_ID, [parseDuelRound(row)]));
+    stops += ` ${s.players[0].x},${s.players[0].y}/${s.players[1].x},${s.players[1].y}`;
+  }
+
+  let ok = true;
+  const replay = DungeonSession.replayDuel(
+    DUEL_FIXTURE_SEED, DUEL_FIXTURE_DEPTH, duelFixtureSetups(),
+    DUEL_FIXTURE_VISIT_ID, log);
+  if (replay.mergedLog.length !== log.length
+      || duelParityLine("", replay, log) !== duelParityLine("", s, log)) {
+    console.log("[duel-travel] ✗ FAIL live run and replay disagree");
+    ok = false;
+  }
+
+  const line = duelParityLine("PARITY-DUEL-TRAVEL" + stops, s, log);
+  console.log(line);
+  const expected =
+    "PARITY-DUEL-TRAVEL 56,38/56,34 56,37/56,34 56,36/56,34" +
+    " 56,35/56,34 56,35/56,34 56,35/56,34" +
+    " p0[dead=0 exited=0 absent=0 xp=0 gold=0 kills=0 hp=79 dmg=0" +
+    " pvp=11 death=0 exit=]" +
+    " p1[dead=0 exited=0 absent=0 xp=0 gold=0 kills=0 hp=84 dmg=0" +
+    " pvp=21 death=0 exit=]" +
+    " winner=-1 rounds=6 entries=36" +
+    " hash=3e90e1a28d025a2c6966a856468c510ee6e9d76a4e2fd065233874824ce26535";
+  if (line !== expected) ok = false;
+  console.log(`[duel-travel] ${ok ? "✓ OK" : "✗ FAIL — duel travel diverged"}`);
+  return ok;
+}
+
+/* ============================================================
+ * Travel vectors (pvp spec §2e).  The C++ twin is tests/travel_tests.cpp
+ * in the backend repo.  Each line lists where the player stood after every
+ * action, so a disagreement says which stop rule the engines read
+ * differently, then the outcome and the log's consent hash.
+ * ============================================================ */
+
+const TRAVEL_FIXTURE_STATS: PlayerStats = {
+  level: 3, strength: 12, dexterity: 11, constitution: 10, intelligence: 10,
+  equipAttack: 0, equipDefense: 0,
+};
+
+function soloTravelLine(tag: string, seed: string, depth: number,
+                        entryDir: string, actions: GameAction[]): string | null {
+  const s = new DungeonSession(seed, depth, TRAVEL_FIXTURE_STATS, 80, 100,
+                               [], [], entryDir);
+  let stops = "";
+  const log: LoggedAction[] = [];
+  for (const a of actions) {
+    if (!s.processAction(a)) {
+      console.log(`[${tag}] ✗ FAIL action ${log.length} rejected`);
+      return null;
+    }
+    log.push({ actor: 0, action: a });
+    stops += ` ${s.playerX},${s.playerY}`;
+  }
+  return `${tag}${stops} hp=${s.playerHp} xp=${s.totalXp}` +
+         ` gold=${s.totalGold} kills=${s.totalKills} turns=${s.turnCount}` +
+         ` hash=${settleLogHash(0, log)}`;
+}
+
+export function runTravelVectors(): boolean {
+  const t = (dx: number, dy: number): GameAction => ({ type: "travel", dx, dy });
+  const m = (dx: number, dy: number): GameAction => ({ type: "move", dx, dy });
+
+  const a = soloTravelLine("PARITY-TRAVEL", "parity-equip", 3, "south",
+    [t(-1, -1), t(0, -1), t(0, -1), t(0, -1), t(1, 0),
+     m(1, 0), m(1, 0), m(1, 0), m(1, 0), t(-1, 0)]);
+  console.log(a);
+  const b = soloTravelLine("PARITY-TRAVEL-ITEM", "travel-36", 2, "south",
+    [t(0, -1), { type: "pickup" }, t(0, -1)]);
+  console.log(b);
+
+  let ok = a ===
+    "PARITY-TRAVEL 13,37 13,29 13,21 13,17 14,17 14,17 14,17" +
+    " 14,17 14,17 13,17 hp=44 xp=0 gold=0 kills=0 turns=10" +
+    " hash=9b8c4c22bb48ec923c1b9230e71e17107d9bb706c72e17013552466e2b22a8dc"
+    && b ===
+    "PARITY-TRAVEL-ITEM 42,31 42,31 42,29 hp=80 xp=0 gold=0 kills=0" +
+    " turns=3 hash=a5721c8f8748755a20a32864732194e4bef0340ba1e39dfe26147094f90154c6";
+
+  // Encodings: canonical body and the compact t<numpad> code, which must
+  // round-trip and hash like the verbose form.
+  if (canonicalActionLine(1, t(0, -1)) !== "1 travel 0 -1\n") ok = false;
+  const travelLog: LoggedAction[] = [
+    { actor: 0, action: t(-1, -1) }, { actor: 0, action: t(1, 1) },
+    { actor: 0, action: t(1, 1) },
+  ];
+  const compact = encodeCompactLog(travelLog, false);
+  if (compact !== "t7;t3*2") { console.log("[travel] ✗ FAIL compact: " + compact); ok = false; }
+  if (settleLogHash(3, decodeCompactLog(compact, false)) !== settleLogHash(3, travelLog))
+    ok = false;
+
+  console.log(`[travel] ${ok ? "✓ OK" : "✗ FAIL — travel diverged"}`);
+  return ok;
+}
+
 const results = [
   runParityTest(),
   runSettleHashVector(),
@@ -837,6 +1010,9 @@ const results = [
   runSpawnParityVectors(),
   runDuelClaimVector(),
   runDuelParityVector(),
+  runDuelSpawnVector(),
+  runDuelTravelVector(),
+  runTravelVectors(),
   runDuelConcessionVector(),
   runDuelStallVector(),
   runDuelCommitHashVector(),

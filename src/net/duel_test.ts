@@ -16,6 +16,7 @@
  * Run:  npx tsc && node dist/net/duel_test.js
  */
 import { DungeonSession, GameAction, PlayerSetup } from "../game/session.js";
+import { Tile, WIDTH, HEIGHT } from "../game/dungeon.js";
 import { settleLogHash } from "../game/settle.js";
 import { CoopMessage, CoopRunner, CoopTransport } from "./coop.js";
 
@@ -52,7 +53,8 @@ function sleep(ms: number): Promise<void> { return new Promise(r => setTimeout(r
 
 const VISIT_ID = 4242;
 
-/** Two duellists who spawn one tile apart (same entry gate). */
+/** Two duellists through the same entry gate: they spawn eight walking
+    steps apart (pvp spec §2d), so every test first walks them together. */
 function setups(): PlayerSetup[] {
   const base = {
     level: 3, strength: 13, dexterity: 11, constitution: 12,
@@ -68,15 +70,33 @@ function setups(): PlayerSetup[] {
   ];
 }
 
-/** Step toward the opponent: adjacent means the move lands as an attack. */
+/**
+ * Step toward the opponent: the first step of a shortest floor path, so
+ * the walls between two spaced-out spawns do not stall it.  Adjacent means
+ * the move lands as an attack.
+ */
 function towardOpponent(s: DungeonSession, me: number): GameAction {
   const p = s.players[me];
   const o = s.players[1 - me];
-  const sign = (v: number) => (v > 0 ? 1 : v < 0 ? -1 : 0);
-  const dx = sign(o.x - p.x);
-  const dy = sign(o.y - p.y);
-  if (dx === 0 && dy === 0) return { type: "wait" };
-  return { type: "move", dx, dy };
+  if (p.x === o.x && p.y === o.y) return { type: "wait" };
+  // Breadth-first from the opponent; the first tile found next to us is a
+  // step along a shortest path (a monster in the way is just attacked).
+  const seen = new Set<number>([o.y * WIDTH + o.x]);
+  const queue: [number, number][] = [[o.x, o.y]];
+  for (let h = 0; h < queue.length; h++) {
+    const [x, y] = queue[h];
+    if (Math.max(Math.abs(x - p.x), Math.abs(y - p.y)) === 1)
+      return { type: "move", dx: x - p.x, dy: y - p.y };
+    for (let dy = -1; dy <= 1; dy++)
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || nx >= WIDTH || ny < 0 || ny >= HEIGHT) continue;
+        if (s.dungeon.getTile(nx, ny) === Tile.Wall || seen.has(ny * WIDTH + nx)) continue;
+        seen.add(ny * WIDTH + nx);
+        queue.push([nx, ny]);
+      }
+  }
+  return { type: "wait" };
 }
 
 async function runScenario(seed: number): Promise<void> {

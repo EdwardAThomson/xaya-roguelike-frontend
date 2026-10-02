@@ -56,7 +56,25 @@ export interface BagItem {
 export type ActionType =
   "move" | "pickup" | "use" | "gate" | "wait" | "equip" | "unequip"
   /** Duel only: the round protocol entries (SPEC_multiplayer_pvp.md §2). */
-  | "commit" | "reveal";
+  | "commit" | "reveal"
+  /** Walk up to TRAVEL_MAX_STEPS tiles in (dx, dy) (pvp spec §2e). */
+  | "travel";
+
+/**
+ * Walking steps between consecutive duel participants' spawns, measured
+ * from their entry anchor (pvp spec §2d): 0, 8, 16, ...  Mirrors
+ * DungeonGame::DUEL_SPAWN_SPACING.
+ */
+export const DUEL_SPAWN_SPACING = 8;
+
+/**
+ * The travel action (pvp spec §2e): at most this many steps in one action,
+ * stopping early when a monster, or in a duel an opponent, is within
+ * TRAVEL_VIEW_RADIUS (Euclidean, compared squared) with line of sight.
+ * Mirrors DungeonGame::TRAVEL_MAX_STEPS / TRAVEL_VIEW_RADIUS.
+ */
+export const TRAVEL_MAX_STEPS = 8;
+export const TRAVEL_VIEW_RADIUS = 8;
 
 export interface GameAction {
   type: ActionType;
@@ -102,6 +120,7 @@ export function canonicalActionBody(a: GameAction): string {
     case "unequip": return `unequip ${a.rowid ?? 0}`;
     case "commit":  return `commit ${a.hex ?? ""}`;
     case "reveal":  return `reveal ${a.hex ?? ""}`;
+    case "travel":  return `travel ${a.dx ?? 0} ${a.dy ?? 0}`;
   }
 }
 
@@ -333,6 +352,12 @@ export class DungeonSession {
    */
   static createMulti(seed: string, depth: number, setups: PlayerSetup[],
                      constraints: Gate[] = []): DungeonSession {
+    return DungeonSession.build(seed, depth, setups, constraints, "coop");
+  }
+
+  /** createMulti and createDuel: the mode is needed before placement. */
+  private static build(seed: string, depth: number, setups: PlayerSetup[],
+                       constraints: Gate[], mode: DuelMode): DungeonSession {
     const s: DungeonSession = Object.create(DungeonSession.prototype);
     s.players = [];
     s.curTurn = 0;
@@ -350,7 +375,8 @@ export class DungeonSession {
     // inert in co-op but must not be left undefined (an undefined
     // duelWinner reads as "already decided" and stops the duel ever
     // ending).
-    s.mode = "coop";
+    // Set before placement: a duel places its participants differently.
+    s.mode = mode;
     s.duelVisitId = 0;
     s.phase = "act";
     s.roundIndex = 0;
@@ -384,8 +410,7 @@ export class DungeonSession {
    */
   static createDuel(seed: string, depth: number, setups: PlayerSetup[],
                     visitId: number, constraints: Gate[] = []): DungeonSession {
-    const s = DungeonSession.createMulti(seed, depth, setups, constraints);
-    s.mode = "duel";
+    const s = DungeonSession.build(seed, depth, setups, constraints, "duel");
     s.duelVisitId = visitId;
     s.phase = "commit";
     s.roundIndex = 0;
@@ -508,6 +533,15 @@ export class DungeonSession {
       }
     }
 
+    // A duel spaces its participants out along the way in (pvp spec §2d):
+    // participant i stands DUEL_SPAWN_SPACING * i walking steps from its
+    // anchor, so the duellists still arrive where they walked in but do
+    // not start in contact.  Co-op never takes this path, and neither does
+    // participant 0, whose spot is exactly the co-op one.
+    if (this.mode === "duel" && i > 0
+        && this.placeAlongWayIn(i, cx, cy, DUEL_SPAWN_SPACING * i))
+      return;
+
     // The first participant to claim this spot takes it: for a gate entry
     // that is the gate mouth (solo behaviour, byte-identical, deliberately
     // without a wall check so an existing settled run cannot change its
@@ -542,6 +576,64 @@ export class DungeonSession {
     // Unreachable in practice; keep the anchor as a last resort.
     p.x = cx;
     p.y = cy;
+  }
+
+  /**
+   * Duel spawn spacing (pvp spec §2d): puts participant i on the first
+   * free floor tile, in a fixed breadth-first order, that is `target`
+   * walking steps from the anchor (ax, ay), or the farthest one the
+   * anchor's area holds if none is that far.  Returns false, placing
+   * nothing, only if there is no free floor tile reachable at all.
+   * Mirrors DungeonGame::PlaceAlongWayIn.
+   */
+  private placeAlongWayIn(i: number, ax: number, ay: number,
+                          target: number): boolean {
+    // Breadth-first over walkable floor from the anchor, 8-connected
+    // because moves are, with neighbours visited dy-major then dx-minor so
+    // the order is fixed.  Gate tiles neither pass nor qualify: standing on
+    // one is a keystroke away from conceding.  The anchor itself is always
+    // the start, wall or not, like the anchor rule it extends.
+    const dist = new Int32Array(WIDTH * HEIGHT).fill(-1);
+    const queue: [number, number][] = [[ax, ay]];
+    dist[ay * WIDTH + ax] = 0;
+
+    let bestX = -1, bestY = -1, bestDist = -1;
+    for (let head = 0; head < queue.length; head++) {
+      const [x, y] = queue[head];
+      const d = dist[y * WIDTH + x];
+
+      // The first free floor tile at the greatest distance reached so far;
+      // popping in BFS order makes it the first one at exactly `target`
+      // whenever the anchor's area extends that far.
+      let free = this.dungeon.getTile(x, y) === Tile.Floor;
+      for (let j = 0; j < i && free; j++)
+        if (this.players[j].x === x && this.players[j].y === y) free = false;
+      if (free && d > bestDist) {
+        bestX = x;
+        bestY = y;
+        bestDist = d;
+        if (d === target) break;
+      }
+      if (d === target) continue;
+
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || nx >= WIDTH || ny < 0 || ny >= HEIGHT) continue;
+          if (this.dungeon.getTile(nx, ny) !== Tile.Floor) continue;
+          if (dist[ny * WIDTH + nx] !== -1) continue;
+          dist[ny * WIDTH + nx] = d + 1;
+          queue.push([nx, ny]);
+        }
+      }
+    }
+
+    if (bestDist < 0) return false;
+    this.players[i].x = bestX;
+    this.players[i].y = bestY;
+    return true;
   }
 
   /**
@@ -991,6 +1083,36 @@ export class DungeonSession {
         break;
       }
 
+      case "travel": {
+        // Up to TRAVEL_MAX_STEPS plain steps in one direction (pvp spec
+        // §2e).  It never attacks: a first step into a monster or a
+        // participant is simply not applicable, like a blocked move.  After
+        // each step it stops on a ground item or once something is in view;
+        // the monsters do not act in between.  (Gates need no rule of their
+        // own: they sit on the border, so the next step off one is never
+        // walkable.)  Draws no RNG.  Mirrors the Travel case of
+        // ApplyActionEffects.
+        const dx = action.dx ?? 0;
+        const dy = action.dy ?? 0;
+        if (Math.abs(dx) > 1 || Math.abs(dy) > 1 || (dx === 0 && dy === 0))
+          return false;
+
+        for (let step = 0; step < TRAVEL_MAX_STEPS; step++) {
+          const nx = p.x + dx;
+          const ny = p.y + dy;
+          if (!this.isWalkable(nx, ny, actor)) {
+            if (step === 0) return false;
+            break;
+          }
+          p.x = nx;
+          p.y = ny;
+          if (this.itemAt(nx, ny) !== null || this.travelInterrupted(actor))
+            break;
+        }
+        valid = true;
+        break;
+      }
+
       case "pickup": {
         const item = this.itemAt(p.x, p.y);
         if (!item) return false;
@@ -1295,6 +1417,34 @@ export class DungeonSession {
     for (const gi of this.groundItems)
       if (gi.x === x && gi.y === y) return gi;
     return null;
+  }
+
+  /**
+   * True iff participant `actor` can see something that should stop a
+   * travel action (pvp spec §2e): a living monster, or in a duel another
+   * active participant, within TRAVEL_VIEW_RADIUS with line of sight from
+   * the actor's tile.  Mirrors DungeonGame::TravelInterrupted.
+   */
+  private travelInterrupted(actor: number): boolean {
+    const p = this.players[actor];
+    const r2 = TRAVEL_VIEW_RADIUS * TRAVEL_VIEW_RADIUS;
+    const inView = (x: number, y: number): boolean => {
+      const dx = x - p.x;
+      const dy = y - p.y;
+      return dx * dx + dy * dy <= r2 && this.hasLineOfSight(p.x, p.y, x, y);
+    };
+
+    for (const m of this.monsters)
+      if (m.alive && inView(m.x, m.y)) return true;
+
+    // An ally in view is company, not an interruption.
+    if (this.mode === "duel")
+      for (let i = 0; i < this.players.length; i++)
+        if (i !== actor && this.isActive(i)
+            && inView(this.players[i].x, this.players[i].y))
+          return true;
+
+    return false;
   }
 
   private hasLineOfSight(x1: number, y1: number, x2: number, y2: number): boolean {
